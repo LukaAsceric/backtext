@@ -622,20 +622,25 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
     }
 
     group.wait()
-    let micOk = (try? writeMono16kWav(samples: micSamples, to: micPath)) != nil && !micSamples.isEmpty
-    let sysOk = (try? writeMono16kWav(samples: sysSamples, to: sysPath)) != nil && !sysSamples.isEmpty
-    JSONOut.emit([
+    let micCount: Int = micSamples.count
+    let sysCount: Int = sysSamples.count
+    let micOk = (try? writeMono16kWav(samples: micSamples, to: micPath)) != nil && micCount > 0
+    let sysOk = (try? writeMono16kWav(samples: sysSamples, to: sysPath)) != nil && sysCount > 0
+    let payload: [String: Any] = [
         "mic_wav_path": micOk ? micPath : NSNull(),
-        "mic_samples": micSamples.count,
+        "mic_samples": micCount,
         "system_wav_path": sysOk ? sysPath : NSNull(),
-        "system_samples": sysSamples.count
-    ])
+        "system_samples": sysCount
+    ]
+    JSONOut.emit(payload)
 }
 
 func handleRecordMic(outPath: String, seconds: Double) {
     let samples = recordMicrophoneSamples(durationSecs: seconds)
-    let ok = (try? writeMono16kWav(samples: samples, to: outPath)) != nil && !samples.isEmpty
-    JSONOut.emit(["ok": ok, "wav_path": outPath, "samples": samples.count])
+    let sampleCount: Int = samples.count
+    let ok = (try? writeMono16kWav(samples: samples, to: outPath)) != nil && sampleCount > 0
+    let payload: [String: Any] = ["ok": ok, "wav_path": outPath, "samples": sampleCount]
+    JSONOut.emit(payload)
 }
 
 // Entrypoint CLI Router
