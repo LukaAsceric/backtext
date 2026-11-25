@@ -51,6 +51,19 @@
 
 ---
 
+## Installation auf macOS (Apple Silicon M1–M5 Pro/Max)
+
+Die Release-Binaries werden nativ für **Apple Silicon (`aarch64-apple-darwin` / `arm64`)** gebaut und ad-hoc signiert:
+
+1. Lade unter **GitHub Releases (`v0.1.0`)** die Datei **`backtext_0.1.0_macos_arm64.dmg`** herunter.
+2. Ziehe **`backtext.app`** in deinen `/Applications`-Ordner (`backtext-mcp` ist bereits direkt unter `/Applications/backtext.app/Contents/MacOS/backtext-mcp` integriert).
+3. Da der Build ohne kostenpflichtige Apple-Developer-Notarisierung erstellt wird, setzt macOS beim Browser-Download ein Quarantäne-Attribut (`com.apple.quarantine`). Entferne dieses vor dem ersten Start einmalig im Terminal:
+   ```bash
+   xattr -cr /Applications/backtext.app && open /Applications/backtext.app
+   ```
+
+---
+
 ## Entwicklung & Build
 
 ```bash
@@ -67,6 +80,6 @@ cargo test --workspace
 pnpm tauri dev
 
 # Auf macOS signierbares .app & .dmg + backtext-mcp Binary bauen
-cargo build --release -p backtext-mcp --bin backtext-mcp
-pnpm tauri build
+cargo build --release --target aarch64-apple-darwin -p backtext-mcp --bin backtext-mcp
+pnpm tauri build --target aarch64-apple-darwin
 ```

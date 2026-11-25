@@ -7,6 +7,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   verify-rust-and-ui:
     name: Rust Workspace & Frontend Tests
@@ -44,7 +47,7 @@ jobs:
         run: cargo test --workspace
 
   build-macos-bundle:
-    name: Build macOS .app & .dmg (Apple Silicon)
+    name: Build Signed Apple Silicon (M1–M5) .dmg & .app.zip
     runs-on: macos-15
     needs: verify-rust-and-ui
     steps:
@@ -70,17 +73,120 @@ jobs:
           pnpm install
           pnpm run build
 
-      - name: Build standalone backtext-mcp stdio binary
-        run: cargo build --release -p backtext-mcp --bin backtext-mcp
+      - name: Build Apple Silicon (arm64) backtext-mcp & Tauri .app bundle
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p backtext-mcp --bin backtext-mcp
+          pnpm tauri build --target aarch64-apple-darwin --bundles app
 
-      - name: Build macOS Tauri v2 .app and .dmg bundle
-        run: pnpm tauri build --bundles app,dmg
+      - name: Bundle backtext-mcp inside .app, Ad-hoc Sign & Smoke-Test on Apple Silicon
+        run: |
+          APP_DIR="target/aarch64-apple-darwin/release/bundle/macos/backtext.app"
+          MCP_BIN="target/aarch64-apple-darwin/release/backtext-mcp"
 
-      - name: Upload macOS .dmg, .app & backtext-mcp artifacts
+          cp "$MCP_BIN" "$APP_DIR/Contents/MacOS/backtext-mcp"
+          chmod 755 "$APP_DIR/Contents/MacOS/backtext-desktop" "$APP_DIR/Contents/MacOS/backtext-mcp"
+
+          echo "=== Verifying arm64 Mach-O architecture ==="
+          file "$APP_DIR/Contents/MacOS/backtext-desktop"
+          file "$APP_DIR/Contents/MacOS/backtext-mcp"
+
+          echo "=== Applying deep ad-hoc code signature for Apple Silicon AMFI ==="
+          codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-mcp"
+          codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-desktop"
+          codesign --force --deep --sign - "$APP_DIR"
+          codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+
+          echo "=== Smoke-testing live app startup on Apple Silicon macOS ==="
+          "$APP_DIR/Contents/MacOS/backtext-desktop" &
+          APP_PID=$!
+          HEALTH_OK=0
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:39421/health; then
+              echo ""
+              echo "macOS arm64 startup smoke-test PASSED!"
+              HEALTH_OK=1
+              break
+            fi
+            sleep 1
+          done
+          kill "$APP_PID" 2>/dev/null || true
+          if [ "$HEALTH_OK" -ne 1 ]; then
+            echo "ERROR: backtext-desktop failed to respond on localhost:39421 during smoke test"
+            exit 1
+          fi
+
+      - name: Package permission-preserving .dmg & ditto .app.zip with Gatekeeper helper
+        run: |
+          mkdir -p dist-macos/dmg-staging
+          APP_DIR="target/aarch64-apple-darwin/release/bundle/macos/backtext.app"
+
+          ditto "$APP_DIR" dist-macos/dmg-staging/backtext.app
+          ln -s /Applications dist-macos/dmg-staging/Applications
+
+          HELPER="dist-macos/dmg-staging/Erster Start (Gatekeeper freischalten).command"
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'set -e' \
+            'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"' \
+            'if [ ! -d "/Applications/backtext.app" ] && [ -d "$SCRIPT_DIR/backtext.app" ]; then' \
+            '  echo "Kopiere backtext.app nach /Applications..."' \
+            '  ditto "$SCRIPT_DIR/backtext.app" /Applications/backtext.app' \
+            'fi' \
+            'echo "Entferne macOS Quarantäne-Attribut für backtext.app..."' \
+            'xattr -cr /Applications/backtext.app' \
+            'open /Applications/backtext.app' \
+            'echo "backtext wurde erfolgreich gestartet!"' \
+            > "$HELPER"
+          chmod 755 "$HELPER"
+
+          hdiutil create -volname "backtext" \
+            -srcfolder dist-macos/dmg-staging \
+            -ov -format UDZO \
+            dist-macos/backtext_0.1.0_macos_arm64.dmg
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP_DIR" \
+            dist-macos/backtext_0.1.0_macos_arm64.app.zip
+
+          cp target/aarch64-apple-darwin/release/backtext-mcp dist-macos/backtext-mcp-macos-arm64
+          chmod 755 dist-macos/backtext-mcp-macos-arm64
+
+      - name: Upload macOS Apple Silicon Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtext-macos-arm64
+          name: backtext-macos-apple-silicon-arm64
           path: |
-            target/release/bundle/dmg/*.dmg
-            target/release/bundle/macos/*.app
-            target/release/backtext-mcp
+            dist-macos/backtext_0.1.0_macos_arm64.dmg
+            dist-macos/backtext_0.1.0_macos_arm64.app.zip
+            dist-macos/backtext-mcp-macos-arm64
+
+      - name: Publish / Update GitHub Release v0.1.0
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES=$(printf '%s\n' \
+            'Native **Apple Silicon (`arm64` — M1 / M2 / M3 / M4 / M5 Pro & Max)** Version inkl. integriertem `backtext-mcp` Server und tiefer Ad-hoc-Signatur.' \
+            '' \
+            '### Installation & Start auf macOS (M1–M5 Pro)' \
+            '1. Lade **`backtext_0.1.0_macos_arm64.dmg`** herunter und öffne die Image-Datei.' \
+            '2. Ziehe `backtext.app` in den `Applications`-Ordner.' \
+            '3. **Wichtig beim ersten Start (Gatekeeper-Quarantäne ohne Apple-Notarisierung):** Doppelklicke im DMG mit Rechtsklick -> *Öffnen* auf `Erster Start (Gatekeeper freischalten).command` **oder** führe einmalig im Terminal aus:' \
+            '```bash' \
+            'xattr -cr /Applications/backtext.app && open /Applications/backtext.app' \
+            '```')
+          if gh release view v0.1.0 >/dev/null 2>&1; then
+            gh release upload v0.1.0 \
+              dist-macos/backtext_0.1.0_macos_arm64.dmg \
+              dist-macos/backtext_0.1.0_macos_arm64.app.zip \
+              dist-macos/backtext-mcp-macos-arm64 \
+              --clobber
+            gh release edit v0.1.0 --notes "$NOTES"
+          else
+            gh release create v0.1.0 \
+              dist-macos/backtext_0.1.0_macos_arm64.dmg \
+              dist-macos/backtext_0.1.0_macos_arm64.app.zip \
+              dist-macos/backtext-mcp-macos-arm64 \
+              --title "backtext v0.1.0 — macOS Apple Silicon (M1–M5)" \
+              --notes "$NOTES"
+          fi

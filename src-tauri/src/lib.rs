@@ -41,6 +41,89 @@ fn toggle_hover_overlay(app: tauri::AppHandle) -> Result<bool, String> {
     }
 }
 
+fn setup_menubar_tray(app: &tauri::App, tray_ctrl: AppController) -> tauri::Result<()> {
+    let open_main = MenuItem::with_id(app, "open_main", "backtext öffnen", true, None::<&str>)?;
+    let open_hover = MenuItem::with_id(
+        app,
+        "open_hover",
+        "Hover-Assistent (⌥ Space)",
+        true,
+        None::<&str>,
+    )?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let pause_15 = MenuItem::with_id(
+        app,
+        "pause_15",
+        "Kontexterfassung 15 Min pausieren",
+        true,
+        None::<&str>,
+    )?;
+    let pause_60 = MenuItem::with_id(
+        app,
+        "pause_60",
+        "Kontexterfassung 1 Std pausieren",
+        true,
+        None::<&str>,
+    )?;
+    let resume = MenuItem::with_id(
+        app,
+        "resume",
+        "Kontexterfassung fortsetzen",
+        true,
+        None::<&str>,
+    )?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "backtext beenden", true, None::<&str>)?;
+
+    let tray_menu = Menu::with_items(
+        app,
+        &[
+            &open_main,
+            &open_hover,
+            &sep1,
+            &pause_15,
+            &pause_60,
+            &resume,
+            &sep2,
+            &quit,
+        ],
+    )?;
+
+    let mut builder = TrayIconBuilder::new()
+        .menu(&tray_menu)
+        .tooltip("backtext — Ambient Context & Meeting Memory")
+        .on_menu_event(move |app_handle, event| match event.id.as_ref() {
+            "open_main" => {
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "open_hover" => {
+                let _ = toggle_hover_overlay(app_handle.clone());
+            }
+            "pause_15" => {
+                tray_ctrl.set_capture_pause(Some(15), None);
+            }
+            "pause_60" => {
+                tray_ctrl.set_capture_pause(Some(60), None);
+            }
+            "resume" => {
+                tray_ctrl.set_capture_pause(None, None);
+            }
+            "quit" => {
+                app_handle.exit(0);
+            }
+            _ => {}
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    let _ = builder.build(app)?;
+    Ok(())
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -66,59 +149,16 @@ pub fn run() {
                 .unwrap_or(39421);
             let server_ctrl = http_controller.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = http_server::spawn_local_http_and_mcp_server(server_ctrl, mcp_port).await {
+                if let Err(err) =
+                    http_server::spawn_local_http_and_mcp_server(server_ctrl, mcp_port).await
+                {
                     tracing::warn!("Local HTTP/MCP server already bound or unavailable: {err}");
                 }
             });
 
-            // Build calm macOS Menubar / System Tray menu
-            let open_main = MenuItem::with_id(app, "open_main", "backtext öffnen", true, None::<&str>)?;
-            let open_hover = MenuItem::with_id(app, "open_hover", "Hover-Assistent (⌥ Space)", true, None::<&str>)?;
-            let sep1 = PredefinedMenuItem::separator(app)?;
-            let pause_15 = MenuItem::with_id(app, "pause_15", "Kontexterfassung 15 Min pausieren", true, None::<&str>)?;
-            let pause_60 = MenuItem::with_id(app, "pause_60", "Kontexterfassung 1 Std pausieren", true, None::<&str>)?;
-            let resume = MenuItem::with_id(app, "resume", "Kontexterfassung fortsetzen", true, None::<&str>)?;
-            let sep2 = PredefinedMenuItem::separator(app)?;
-            let quit = MenuItem::with_id(app, "quit", "backtext beenden", true, None::<&str>)?;
-
-            let tray_menu = Menu::with_items(
-                app,
-                &[&open_main, &open_hover, &sep1, &pause_15, &pause_60, &resume, &sep2, &quit],
-            )?;
-
-            let tray_ctrl = http_controller.clone();
-            let mut builder = TrayIconBuilder::new()
-                .menu(&tray_menu)
-                .tooltip("backtext — Ambient Context & Meeting Memory")
-                .on_menu_event(move |app_handle, event| match event.id.as_ref() {
-                    "open_main" => {
-                        if let Some(w) = app_handle.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "open_hover" => {
-                        let _ = toggle_hover_overlay(app_handle.clone());
-                    }
-                    "pause_15" => {
-                        tray_ctrl.set_capture_pause(Some(15), None);
-                    }
-                    "pause_60" => {
-                        tray_ctrl.set_capture_pause(Some(60), None);
-                    }
-                    "resume" => {
-                        tray_ctrl.set_capture_pause(None, None);
-                    }
-                    "quit" => {
-                        app_handle.exit(0);
-                    }
-                    _ => {}
-                });
-
-            if let Some(icon) = app.default_window_icon().cloned() {
-                builder = builder.icon(icon);
+            if let Err(err) = setup_menubar_tray(app, http_controller.clone()) {
+                tracing::warn!("Menubar tray initialization skipped: {err}");
             }
-            let _ = builder.build(app)?;
 
             Ok(())
         })
