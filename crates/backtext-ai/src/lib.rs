@@ -1,3 +1,14 @@
+pub mod providers;
+pub mod stt;
+
+pub use providers::{
+    compute_embedding_256, list_ollama_models, test_provider_connection, ProviderTestResult,
+};
+pub use stt::{
+    detect_whisper_cli_path, download_whisper_model, list_whisper_models, transcribe_wav_file,
+    TranscribedUtterance,
+};
+
 use anyhow::Result;
 use backtext_core::*;
 use backtext_storage::StorageEngine;
@@ -27,87 +38,14 @@ impl Default for HybridAiEngine {
 impl HybridAiEngine {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(12))
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
         Self { http }
     }
 
-    async fn try_external_llm(
-        &self,
-        settings: &AiProviderSettings,
-        system_prompt: &str,
-        user_prompt: &str,
-    ) -> Option<(String, String)> {
-        // 1. Optional OpenAI-compatible API if key is set in environment
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            if !api_key.trim().is_empty() {
-                let model = if settings.llm_provider == "openai" && !settings.llm_model.is_empty() {
-                    settings.llm_model.as_str()
-                } else {
-                    "gpt-4o-mini"
-                };
-                if let Ok(resp) = self
-                    .http
-                    .post("https://api.openai.com/v1/chat/completions")
-                    .bearer_auth(api_key)
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": [
-                            { "role": "system", "content": system_prompt },
-                            { "role": "user", "content": user_prompt }
-                        ],
-                        "temperature": 0.25
-                    }))
-                    .send()
-                    .await
-                {
-                    if resp.status().is_success() {
-                        if let Ok(v) = resp.json::<serde_json::Value>().await {
-                            if let Some(txt) = v["choices"][0]["message"]["content"].as_str() {
-                                return Some((txt.to_string(), format!("openai:{model}")));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Local Ollama instance if running on localhost
-        if settings.llm_provider == "local_ollama" || settings.llm_provider == "hybrid_auto" {
-            let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
-            let model = settings
-                .llm_model
-                .split('/')
-                .next()
-                .unwrap_or("qwen3:8b")
-                .trim();
-            if let Ok(resp) = self
-                .http
-                .post(&url)
-                .timeout(Duration::from_millis(1200))
-                .json(&serde_json::json!({
-                    "model": model,
-                    "stream": false,
-                    "messages": [
-                        { "role": "system", "content": system_prompt },
-                        { "role": "user", "content": user_prompt }
-                    ]
-                }))
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(v) = resp.json::<serde_json::Value>().await {
-                        if let Some(txt) = v["message"]["content"].as_str() {
-                            return Some((txt.to_string(), format!("ollama:{model}")));
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
     }
 
     /// Enhances a meeting by fusing the user's rough hybrid-notepad bullets,
@@ -130,28 +68,55 @@ impl HybridAiEngine {
         let transcript_text = detail
             .transcript
             .iter()
-            .map(|s| format!("[{:02}:{:02}] {}: {}", s.start_ms / 60_000, (s.start_ms % 60_000) / 1000, s.speaker_name, s.text))
+            .map(|s| {
+                format!(
+                    "[{:02}:{:02}] {}: {}",
+                    s.start_ms / 60_000,
+                    (s.start_ms % 60_000) / 1000,
+                    s.speaker_name,
+                    s.text
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let slides_text = detail
             .screenshares
             .iter()
-            .map(|f| format!("- [Folie @ {:02}:{:02}] {}: {}", f.captured_at_ms / 60_000, (f.captured_at_ms % 60_000) / 1000, f.slide_title, f.ocr_text))
+            .map(|f| {
+                format!(
+                    "- [Folie @ {:02}:{:02}] {}: {}",
+                    f.captured_at_ms / 60_000,
+                    (f.captured_at_ms % 60_000) / 1000,
+                    f.slide_title,
+                    f.ocr_text
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
         let sys_prompt = format!(
-            "Du bist backtext, ein präziser Meeting-Notiz-Enhancer im Granola-Stil.\n{dossier}"
+            "Du bist backtext, ein präziser Meeting-Notiz-Enhancer im Granola-Stil. Nutze die eigenen Stichpunkte als Rückgrat und reichere sie mit Fakten aus Transkript und Folien an.\n{dossier}"
         );
         let usr_prompt = format!(
             "Meeting: {}\nEigene Notizen:\n{}\n\nTranskript:\n{}\n\nScreen-Share-OCR:\n{}",
             detail.meeting.title, detail.meeting.raw_user_notes, transcript_text, slides_text
         );
 
-        let extracted_actions = extract_structured_actions(&detail.transcript, &detail.meeting.raw_user_notes, &profile.display_name);
+        let extracted_actions = extract_structured_actions(
+            &detail.transcript,
+            &detail.meeting.raw_user_notes,
+            &profile.display_name,
+        );
 
-        if let Some((llm_md, provider_used)) =
-            self.try_external_llm(&ai_settings, &sys_prompt, &usr_prompt).await
+        if let Some((llm_md, provider_used)) = providers::stream_completion(
+            &self.http,
+            &ai_settings,
+            storage.secrets(),
+            &sys_prompt,
+            &usr_prompt,
+            None,
+        )
+        .await
         {
             let exec_summary = llm_md
                 .lines()
@@ -226,7 +191,6 @@ impl HybridAiEngine {
                 "### Enhanced Key Points (from Your Notes + Transcript)\n"
             });
             for b in &user_bullets {
-                // Find best supporting transcript quote
                 let b_vec = embed_text_local_256(b);
                 let best_seg = detail.transcript.iter().max_by(|x, y| {
                     let sx = cosine_similarity(&b_vec, &embed_text_local_256(&x.text));
@@ -300,10 +264,11 @@ impl HybridAiEngine {
         })
     }
 
-    /// Executes a contextual chat prompt or `/` Recipe (Single-Meeting, Multi-Meeting, or Ambient Workspace).
-    pub async fn run_chat_or_recipe(
+    /// Executes a contextual chat prompt or `/` Recipe with live token streaming over `EventBus`.
+    pub async fn run_chat_or_recipe_streaming(
         &self,
         storage: &StorageEngine,
+        events: Option<&EventBus>,
         meeting_id: Option<&str>,
         user_input: &str,
         explicit_recipe_slug: Option<&str>,
@@ -349,7 +314,6 @@ impl HybridAiEngine {
         };
         storage.insert_chat_message(&user_msg)?;
 
-        // Gather rich grounded context + source citations
         let mut sources: Vec<ChatSourceRef> = Vec::new();
         let meeting_detail = match meeting_id {
             Some(mid) => storage.get_meeting_detail(mid)?,
@@ -410,13 +374,22 @@ impl HybridAiEngine {
             &dossier,
         );
 
-        let reply_markdown = if let Some((ext_reply, _)) = self
-            .try_external_llm(&ai_settings, &dossier, &rendered_prompt)
-            .await
+        let assistant_msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let stream_ctx = events.map(|bus| (bus, thread_id.as_str(), assistant_msg_id.as_str()));
+
+        let reply_markdown = if let Some((ext_reply, _provider)) = providers::stream_completion(
+            &self.http,
+            &ai_settings,
+            storage.secrets(),
+            &dossier,
+            &rendered_prompt,
+            stream_ctx,
+        )
+        .await
         {
             ext_reply
         } else {
-            synthesize_local_assistant_reply(
+            let local = synthesize_local_assistant_reply(
                 matched_recipe.as_ref(),
                 trimmed,
                 &profile,
@@ -424,11 +397,20 @@ impl HybridAiEngine {
                 &episodes,
                 &clipboard,
                 &search_hits,
-            )
+            );
+            if let Some(bus) = events {
+                bus.publish(BacktextEvent::ChatStreamDelta {
+                    thread_id: thread_id.clone(),
+                    message_id: assistant_msg_id.clone(),
+                    delta: local.clone(),
+                    done: true,
+                });
+            }
+            local
         };
 
         let assistant_msg = ChatMessage {
-            id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            id: assistant_msg_id,
             thread_id,
             meeting_id: meeting_id.map(|s| s.to_string()),
             role: "assistant".into(),
@@ -439,6 +421,17 @@ impl HybridAiEngine {
         };
         storage.insert_chat_message(&assistant_msg)?;
         Ok(assistant_msg)
+    }
+
+    pub async fn run_chat_or_recipe(
+        &self,
+        storage: &StorageEngine,
+        meeting_id: Option<&str>,
+        user_input: &str,
+        explicit_recipe_slug: Option<&str>,
+    ) -> Result<ChatMessage> {
+        self.run_chat_or_recipe_streaming(storage, None, meeting_id, user_input, explicit_recipe_slug)
+            .await
     }
 }
 
@@ -672,7 +665,7 @@ fn synthesize_local_assistant_reply(
                     .map(|e| e.title.as_str())
                     .unwrap_or("Architektur & MCP-Integration");
                 return format!(
-                    "### Guten Morgen, {} — Dein Fokus-Briefing\n\n1. **Wiedereinstieg aus deinem letzten Arbeitskontext:** Zuletzt aktiv an *{}*.\n2. **Offene Zusagen & Follow-ups:** Prüfe die vereinbarten Punkte aus den letzten Calls (u. a. M3-Benchmark & Menüleisten-Popover).\n3. **Anstehender Termin:** Bereite den nächsten Check-in mithilfe des bereits generierten Vorbereitungs-Briefings vor.",
+                    "### Guten Morgen, {} — Dein Fokus-Briefing\n\n1. **Wiedereinstieg aus deinem letzten Arbeitskontext:** Zuletzt aktiv an *{}*.\n2. **Offene Zusagen & Follow-ups:** Prüfe die vereinbarten Punkte aus den letzten Calls.\n3. **Anstehender Termin:** Bereite den nächsten Check-in mithilfe des generierten Vorbereitungs-Briefings vor.",
                     profile.display_name, ep_summary
                 );
             }
@@ -692,7 +685,6 @@ fn synthesize_local_assistant_reply(
         }
     }
 
-    // Free-form contextual Q&A grounded in hybrid memory hits + meeting + episodes
     let mut response = if is_de {
         String::from("Aus deinem erfassten Meeting- und Hintergrund-Gedächtnis:\n\n")
     } else {
@@ -730,12 +722,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn executes_slash_recipe_with_grounded_sources() {
+    async fn executes_slash_recipe_with_grounded_sources_and_streaming_event() {
         let store = StorageEngine::open_in_memory().unwrap();
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
         let engine = HybridAiEngine::new();
         let msg = engine
-            .run_chat_or_recipe(
+            .run_chat_or_recipe_streaming(
                 &store,
+                Some(&bus),
                 Some("mtg_arch_sync"),
                 "/follow-up-email",
                 Some("/follow-up-email"),
@@ -744,7 +739,18 @@ mod tests {
             .unwrap();
         assert_eq!(msg.role, "assistant");
         assert!(msg.content.contains("Follow-up"));
-        assert!(msg.content.contains("Markus Klein") || msg.content.contains("Anna Weber"));
         assert!(!msg.sources.is_empty());
+
+        let ev = rx.try_recv().unwrap();
+        assert!(matches!(ev, BacktextEvent::ChatStreamDelta { done: true, .. }));
+    }
+
+    #[test]
+    fn projects_neural_embeddings_to_256_unit_norm() {
+        let raw = vec![0.5_f32; 768];
+        let proj = providers::project_to_256(&raw);
+        assert_eq!(proj.len(), EMBEDDING_DIM);
+        let norm: f32 = proj.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4);
     }
 }

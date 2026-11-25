@@ -4,6 +4,8 @@
   "description": "Default capability for backtext main and hover windows",
   "windows": ["main", "hover"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "global-shortcut:default",
+    "autostart:default"
   ]
 }

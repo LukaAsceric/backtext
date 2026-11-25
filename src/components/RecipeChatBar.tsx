@@ -10,6 +10,7 @@ interface RecipeChatBarProps {
   scopeFilter?: 'single_meeting' | 'all';
   recipes: Recipe[];
   messages: ChatMessage[];
+  streamingText?: string | null;
   busy: boolean;
   onExecute: (input: string, recipeSlug?: string) => Promise<void>;
 }
@@ -19,6 +20,7 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
   scopeFilter = 'all',
   recipes,
   messages,
+  streamingText,
   busy,
   onExecute,
 }) => {
@@ -100,7 +102,7 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
         ))}
       </div>
 
-      {messages.length > 0 && (
+      {(messages.length > 0 || (streamingText && streamingText.length > 0)) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 360, overflowY: 'auto' }}>
           {messages.map((msg) => (
             <div key={msg.id} className={`chat-bubble ${msg.role === 'user' ? 'user' : 'assistant'}`}>
@@ -134,6 +136,16 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
               )}
             </div>
           ))}
+          {streamingText && streamingText.length > 0 && (
+            <div className="chat-bubble assistant">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--accent-sage)' }}>
+                  backtext AI · streaming…
+                </span>
+              </div>
+              <FormattedMarkdown text={streamingText} />
+            </div>
+          )}
         </div>
       )}
 

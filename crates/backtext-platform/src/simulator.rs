@@ -66,6 +66,44 @@ impl SimulatorPlatformSensors {
     }
 }
 
+fn write_synthetic_voice_wav(path: &str, fundamental_hz: f32, duration_secs: u64) -> Result<usize> {
+    let sample_rate = 16_000_u32;
+    let total_samples = (sample_rate as usize) * (duration_secs.clamp(1, 5) as usize);
+    let mut pcm: Vec<i16> = Vec::with_capacity(total_samples);
+    for i in 0..total_samples {
+        let t = (i as f32) / (sample_rate as f32);
+        // Synthetic voiced harmonic signal (fundamental + 2nd/3rd formants) for real DSP tests
+        let val = 0.45 * (2.0 * std::f32::consts::PI * fundamental_hz * t).sin()
+            + 0.25 * (2.0 * std::f32::consts::PI * (fundamental_hz * 2.0) * t).sin()
+            + 0.15 * (2.0 * std::f32::consts::PI * (fundamental_hz * 3.1) * t).sin();
+        pcm.push((val * 16_000.0) as i16);
+    }
+
+    let data_size = (pcm.len() * 2) as u32;
+    let chunk_size = 36 + data_size;
+    let mut buf = Vec::with_capacity(44 + data_size as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&chunk_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVEfmt ");
+    buf.extend_from_slice(&16_u32.to_le_bytes());
+    buf.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    buf.extend_from_slice(&2_u16.to_le_bytes());
+    buf.extend_from_slice(&16_u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    for s in &pcm {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, buf)?;
+    Ok(pcm.len())
+}
+
 #[async_trait]
 impl PlatformSensors for SimulatorPlatformSensors {
     async fn check_permissions(&self) -> PermissionStatus {
@@ -75,15 +113,61 @@ impl PlatformSensors for SimulatorPlatformSensors {
             microphone_granted: true,
             accessibility_granted: true,
             calendar_granted: true,
+            idle_seconds: 0,
+            screen_locked: false,
         }
+    }
+
+    async fn request_permission(&self, _kind: &str) -> Result<PermissionStatus> {
+        Ok(self.check_permissions().await)
+    }
+
+    async fn open_permission_settings(&self, _kind: &str) -> Result<()> {
+        Ok(())
     }
 
     async fn observe_active_window(&self) -> Result<ActiveWindowObservation> {
         Ok(self.state.lock().active_window.clone())
     }
 
+    async fn capture_window_screenshot_ocr(
+        &self,
+        _include_image: bool,
+    ) -> Result<WindowScreenshotOcr> {
+        let w = self.state.lock().active_window.clone();
+        Ok(WindowScreenshotOcr {
+            ok: true,
+            dhash_u64: w.dhash_u64,
+            dhash_hex: format!("{:016x}", w.dhash_u64),
+            ocr_text: w.visible_text,
+            image_data_url: None,
+        })
+    }
+
     async fn observe_audio_environment(&self) -> Result<AudioEnvironmentSignal> {
         Ok(self.state.lock().audio_signal.clone())
+    }
+
+    async fn record_dual_audio_chunk(
+        &self,
+        out_dir: &str,
+        duration_secs: u64,
+    ) -> Result<DualAudioCaptureChunk> {
+        let mic_path = format!("{out_dir}/mic.wav");
+        let sys_path = format!("{out_dir}/system.wav");
+        let mic_samples = write_synthetic_voice_wav(&mic_path, 145.0, duration_secs.min(2))?;
+        let sys_samples = write_synthetic_voice_wav(&sys_path, 210.0, duration_secs.min(2))?;
+        Ok(DualAudioCaptureChunk {
+            mic_wav_path: Some(mic_path),
+            mic_samples,
+            system_wav_path: Some(sys_path),
+            system_samples: sys_samples,
+        })
+    }
+
+    async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> Result<bool> {
+        let _ = write_synthetic_voice_wav(out_path, 138.0, duration_secs.min(2))?;
+        Ok(true)
     }
 
     async fn upcoming_calendar_events(&self) -> Result<Vec<CalendarMeetingEvent>> {
@@ -107,5 +191,9 @@ impl PlatformSensors for SimulatorPlatformSensors {
 
     async fn run_vision_ocr_on_image_path(&self, image_path: &str) -> Result<String> {
         Ok(format!("Simulated Apple Vision OCR output for {image_path}"))
+    }
+
+    async fn send_native_notification(&self, _title: &str, _body: &str) -> Result<()> {
+        Ok(())
     }
 }

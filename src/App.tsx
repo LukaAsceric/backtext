@@ -14,6 +14,7 @@ import {
 import type {
   AiProviderSettings,
   BootstrapPayload,
+  CalendarFeedConfig,
   CaptureStatus,
   ChatMessage,
   Language,
@@ -21,14 +22,24 @@ import type {
   McpGovernancePolicy,
   MeetingDetail,
   MemorySearchHit,
+  PermissionStatus,
   PrivacyRule,
+  ProviderTestResult,
   Recipe,
   ScrubberPreview,
+  UpdateCheckResult,
   UserProfile,
   VocabularyEntry,
   LearnedPreference,
+  WhisperModelInfo,
 } from './types';
-import { callRpc, isTauriRuntime, toggleNativeHoverOverlay } from './lib/ipc';
+import {
+  callRpc,
+  isTauriRuntime,
+  setNativeAutostart,
+  subscribeBacktextEvents,
+  toggleNativeHoverOverlay,
+} from './lib/ipc';
 import { t } from './lib/i18n';
 import { TodayView } from './views/TodayView';
 import { MeetingWorkspace } from './views/MeetingWorkspace';
@@ -53,6 +64,7 @@ export const App: React.FC = () => {
   const [activeNav, setActiveNav] = useState<NavKey>('today');
   const [selectedMeeting, setSelectedMeeting] = useState<MeetingDetail | null>(null);
   const [globalMessages, setGlobalMessages] = useState<ChatMessage[]>([]);
+  const [streamingByThread, setStreamingByThread] = useState<Record<string, string>>({});
   const [hoverOpen, setHoverOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -69,38 +81,111 @@ export const App: React.FC = () => {
     localStorage.setItem('backtext-theme', theme);
   }, [theme]);
 
-  const refreshBootstrap = useCallback(async (preferredMeetingId?: string) => {
-    try {
-      const boot = await callRpc<BootstrapPayload>('get_bootstrap');
-      setData(boot);
-      const globalMsgs = await callRpc<ChatMessage[]>('get_chat_messages', {
-        threadId: 'global:workspace',
-      });
-      setGlobalMessages(globalMsgs);
-
-      const targetId =
-        preferredMeetingId ??
-        selectedMeeting?.meeting.id ??
-        boot.meetings.find((m) => m.status === 'live')?.id ??
-        boot.meetings.find((m) => m.status === 'completed')?.id ??
-        boot.meetings[0]?.id;
-      if (targetId) {
-        const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
-          meetingId: targetId,
+  const refreshBootstrap = useCallback(
+    async (preferredMeetingId?: string) => {
+      try {
+        const boot = await callRpc<BootstrapPayload>('get_bootstrap');
+        setData(boot);
+        const globalMsgs = await callRpc<ChatMessage[]>('get_chat_messages', {
+          threadId: 'global:workspace',
         });
-        setSelectedMeeting(detail);
+        setGlobalMessages(globalMsgs);
+
+        const targetId =
+          preferredMeetingId ??
+          selectedMeeting?.meeting.id ??
+          boot.meetings.find((m) => m.status === 'live')?.id ??
+          boot.meetings.find((m) => m.status === 'completed')?.id ??
+          boot.meetings[0]?.id;
+        if (targetId) {
+          const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+            meetingId: targetId,
+          });
+          setSelectedMeeting(detail);
+        } else {
+          setSelectedMeeting(null);
+        }
+        setErrorMsg(null);
+      } catch (err) {
+        setErrorMsg(err instanceof Error ? err.message : String(err));
       }
-      setErrorMsg(null);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : String(err));
-    }
-  }, [selectedMeeting?.meeting.id]);
+    },
+    [selectedMeeting?.meeting.id],
+  );
 
   useEffect(() => {
     refreshBootstrap();
   }, []);
 
-  // Global keyboard shortcut (Alt+Space / Escape) for Hover Assistant
+  // Subscribe to live backend streaming events (Tauri EventBus / HTTP SSE)
+  useEffect(() => {
+    const unsub = subscribeBacktextEvents((ev) => {
+      if (ev.event === 'chat_stream_delta') {
+        const payload = ev.payload as {
+          thread_id: string;
+          delta: string;
+          done: boolean;
+        };
+        setStreamingByThread((prev) => {
+          if (payload.done) {
+            const copy = { ...prev };
+            delete copy[payload.thread_id];
+            return copy;
+          }
+          return {
+            ...prev,
+            [payload.thread_id]: (prev[payload.thread_id] ?? '') + payload.delta,
+          };
+        });
+      } else if (ev.event === 'daemon_telemetry_updated') {
+        setData((prev) =>
+          prev
+            ? {
+                ...prev,
+                telemetry: ev.payload as BootstrapPayload['telemetry'],
+              }
+            : prev,
+        );
+      } else if (ev.event === 'capture_status_changed') {
+        setData((prev) =>
+          prev
+            ? {
+                ...prev,
+                capture_status: ev.payload as CaptureStatus,
+              }
+            : prev,
+        );
+      } else if (ev.event === 'model_download_progress') {
+        const p = ev.payload as {
+          model_id: string;
+          progress_pct: number;
+          installed: boolean;
+        };
+        setData((prev) =>
+          prev
+            ? {
+                ...prev,
+                whisper_models: prev.whisper_models.map((m) =>
+                  m.id === p.model_id
+                    ? {
+                        ...m,
+                        progress_pct: p.progress_pct,
+                        installed: p.installed,
+                        downloading: !p.installed && p.progress_pct < 100,
+                      }
+                    : m,
+                ),
+              }
+            : prev,
+        );
+      } else if (ev.event === 'calendar_synced' || ev.event === 'context_episode_updated') {
+        refreshBootstrap();
+      }
+    });
+    return unsub;
+  }, [refreshBootstrap]);
+
+  // In-window keyboard shortcut fallback (Alt+Space / Escape)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.altKey && e.code === 'Space') {
@@ -127,6 +212,10 @@ export const App: React.FC = () => {
 
   const lang: Language = data.profile.ui_language ?? 'de';
   const status: CaptureStatus = data.capture_status;
+  const globalStreamText = streamingByThread['global:workspace'] ?? null;
+  const meetingStreamText = selectedMeeting
+    ? (streamingByThread[`meeting:${selectedMeeting.meeting.id}`] ?? null)
+    : null;
 
   const handlePause = async (minutes: number | null) => {
     const next = await callRpc<CaptureStatus>('set_capture_pause', { minutes });
@@ -176,8 +265,7 @@ export const App: React.FC = () => {
         threadId: 'global:workspace',
       });
       setGlobalMessages(updated);
-      const recipes = await callRpc<BootstrapPayload>('get_bootstrap');
-      setData(recipes);
+      await refreshBootstrap();
     } finally {
       setBusy(false);
     }
@@ -192,6 +280,7 @@ export const App: React.FC = () => {
         frontSnapshot={data.snapshots[0]}
         recipes={data.recipes}
         messages={globalMessages}
+        streamingText={globalStreamText}
         busy={busy}
         onClose={() => {}}
         onExecute={handleRunGlobalChat}
@@ -392,10 +481,13 @@ export const App: React.FC = () => {
         {activeNav === 'today' && (
           <TodayView
             lang={lang}
+            permissions={data.permissions}
+            telemetry={data.telemetry}
             meetings={data.meetings}
             episodes={data.episodes}
             recipes={data.recipes}
             globalMessages={globalMessages}
+            streamingText={globalStreamText}
             chatBusy={busy}
             onStartAdhocMeeting={handleStartAdhocMeeting}
             onStartScheduledMeeting={handleStartScheduledMeeting}
@@ -410,6 +502,18 @@ export const App: React.FC = () => {
               callRpc<MemorySearchHit[]>('search_memory', { query })
             }
             onRunGlobalChat={handleRunGlobalChat}
+            onRequestPermission={async (kind) => {
+              const updated = await callRpc<PermissionStatus>('request_permission', { kind });
+              setData((prev) => (prev ? { ...prev, permissions: updated } : prev));
+            }}
+            onClearDemoData={async () => {
+              await callRpc('clear_demo_data');
+              await refreshBootstrap();
+            }}
+            onSyncCalendars={async () => {
+              await callRpc('sync_calendars');
+              await refreshBootstrap();
+            }}
           />
         )}
 
@@ -419,6 +523,7 @@ export const App: React.FC = () => {
             meetings={data.meetings}
             selectedDetail={selectedMeeting}
             recipes={data.recipes}
+            streamingText={meetingStreamText}
             busy={busy}
             onSelectMeeting={async (id) => {
               const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
@@ -432,6 +537,19 @@ export const App: React.FC = () => {
               try {
                 const detail = await callRpc<MeetingDetail>('simulate_live_meeting_activity', {
                   meetingId,
+                });
+                setSelectedMeeting(detail);
+                await refreshBootstrap(meetingId);
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onCaptureRealAudioTurn={async (meetingId) => {
+              setBusy(true);
+              try {
+                const detail = await callRpc<MeetingDetail>('capture_real_dual_audio_turn', {
+                  meetingId,
+                  durationSecs: 6,
                 });
                 setSelectedMeeting(detail);
                 await refreshBootstrap(meetingId);
@@ -602,15 +720,19 @@ export const App: React.FC = () => {
           <PersonalizationView
             lang={lang}
             profile={data.profile}
+            telemetry={data.telemetry}
             vocabulary={data.vocabulary}
             learnedPreferences={data.learned_preferences}
             aiSettings={data.ai_settings}
+            whisperModels={data.whisper_models}
+            ollamaModels={data.ollama_models}
+            calendarFeeds={data.calendar_feeds}
             onSaveProfile={async (profile: UserProfile) => {
               const saved = await callRpc<UserProfile>('save_user_profile', { profile });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
             }}
-            onEnrollSelfVoiceprint={async (samplePhrase: string) => {
-              const saved = await callRpc<UserProfile>('enroll_self_voiceprint', { samplePhrase });
+            onEnrollSelfVoiceprint={async () => {
+              const saved = await callRpc<UserProfile>('enroll_self_voiceprint', { durationSecs: 5 });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
             }}
             onAddVocabulary={async (term, phoneticHint, category, projectTag) => {
@@ -639,6 +761,60 @@ export const App: React.FC = () => {
               });
               setData((prev) => (prev ? { ...prev, ai_settings } : prev));
             }}
+            onSetApiKey={async (provider, apiKey) => {
+              const ai_settings = await callRpc<AiProviderSettings>('set_api_key', {
+                provider,
+                apiKey,
+              });
+              setData((prev) => (prev ? { ...prev, ai_settings } : prev));
+            }}
+            onDeleteApiKey={async (provider) => {
+              const ai_settings = await callRpc<AiProviderSettings>('delete_api_key', { provider });
+              setData((prev) => (prev ? { ...prev, ai_settings } : prev));
+            }}
+            onTestProvider={(provider) =>
+              callRpc<ProviderTestResult>('test_provider_connection', { provider })
+            }
+            onDownloadWhisperModel={async (modelId) => {
+              const info = await callRpc<WhisperModelInfo>('download_whisper_model', { modelId });
+              setData((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      whisper_models: prev.whisper_models.map((m) =>
+                        m.id === info.id ? info : m,
+                      ),
+                    }
+                  : prev,
+              );
+            }}
+            onAddCalendarFeed={async (name, icsUrl) => {
+              const calendar_feeds = await callRpc<CalendarFeedConfig[]>('add_calendar_feed', {
+                name,
+                icsUrl,
+              });
+              setData((prev) => (prev ? { ...prev, calendar_feeds } : prev));
+              await refreshBootstrap();
+            }}
+            onDeleteCalendarFeed={async (id) => {
+              const calendar_feeds = await callRpc<CalendarFeedConfig[]>('delete_calendar_feed', {
+                id,
+              });
+              setData((prev) => (prev ? { ...prev, calendar_feeds } : prev));
+            }}
+            onSyncCalendars={async () => {
+              await callRpc('sync_calendars');
+              await refreshBootstrap();
+            }}
+            onToggleAutostart={async (enabled) => {
+              const active = await setNativeAutostart(enabled);
+              setData((prev) =>
+                prev
+                  ? { ...prev, telemetry: { ...prev.telemetry, autostart_enabled: active } }
+                  : prev,
+              );
+            }}
+            onCheckUpdates={() => callRpc<UpdateCheckResult>('check_for_updates')}
           />
         )}
       </main>
@@ -649,6 +825,7 @@ export const App: React.FC = () => {
         frontSnapshot={data.snapshots[0]}
         recipes={data.recipes}
         messages={globalMessages}
+        streamingText={globalStreamText}
         busy={busy}
         onClose={() => setHoverOpen(false)}
         onExecute={handleRunGlobalChat}

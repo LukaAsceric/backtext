@@ -1,6 +1,6 @@
 use crate::models::{
-    CaptureStatus, ContextEpisode, McpAuditEntry, MeetingParticipant, ScreenShareFrame,
-    TranscriptSegment,
+    CaptureStatus, ContextEpisode, DaemonTelemetry, McpAuditEntry, MeetingParticipant,
+    ScreenShareFrame, TranscriptSegment,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,6 +27,22 @@ pub enum BacktextEvent {
     },
     ContextEpisodeUpdated(ContextEpisode),
     McpToolInvoked(McpAuditEntry),
+    ChatStreamDelta {
+        thread_id: String,
+        message_id: String,
+        delta: String,
+        done: bool,
+    },
+    DaemonTelemetryUpdated(DaemonTelemetry),
+    CalendarSynced {
+        imported_count: usize,
+    },
+    ModelDownloadProgress {
+        model_id: String,
+        progress_pct: u8,
+        installed: bool,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -36,7 +52,7 @@ pub struct EventBus {
 
 impl Default for EventBus {
     fn default() -> Self {
-        Self::new(256)
+        Self::new(512)
     }
 }
 

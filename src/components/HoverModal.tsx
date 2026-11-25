@@ -10,6 +10,7 @@ interface HoverModalProps {
   frontSnapshot: ContextSnapshot | undefined;
   recipes: Recipe[];
   messages: ChatMessage[];
+  streamingText?: string | null;
   busy: boolean;
   onClose: () => void;
   onExecute: (input: string, recipeSlug?: string) => Promise<void>;
@@ -22,6 +23,7 @@ export const HoverModal: React.FC<HoverModalProps> = ({
   frontSnapshot,
   recipes,
   messages,
+  streamingText,
   busy,
   onClose,
   onExecute,
@@ -72,6 +74,7 @@ export const HoverModal: React.FC<HoverModalProps> = ({
         scopeFilter="all"
         recipes={recipes}
         messages={messages}
+        streamingText={streamingText}
         busy={busy}
         onExecute={onExecute}
       />

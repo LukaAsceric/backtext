@@ -19,10 +19,12 @@ interface MeetingWorkspaceProps {
   meetings: Meeting[];
   selectedDetail: MeetingDetail | null;
   recipes: Recipe[];
+  streamingText?: string | null;
   busy: boolean;
   onSelectMeeting: (id: string) => Promise<void>;
   onStartAdhocMeeting: () => Promise<void>;
   onSimulateLiveStep: (meetingId: string) => Promise<void>;
+  onCaptureRealAudioTurn: (meetingId: string) => Promise<void>;
   onStopMeeting: (meetingId: string) => Promise<void>;
   onSaveUserNotes: (meetingId: string, notes: string) => Promise<void>;
   onEnhanceMeeting: (meetingId: string) => Promise<void>;
@@ -36,10 +38,12 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   meetings,
   selectedDetail,
   recipes,
+  streamingText,
   busy,
   onSelectMeeting,
   onStartAdhocMeeting,
   onSimulateLiveStep,
+  onCaptureRealAudioTurn,
   onStopMeeting,
   onSaveUserNotes,
   onEnhanceMeeting,
@@ -161,6 +165,16 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
               <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
                 {current.status === 'live' && (
                   <>
+                    <button
+                      type="button"
+                      id="capture-real-audio-btn"
+                      className="btn btn-sage"
+                      disabled={busy}
+                      onClick={() => onCaptureRealAudioTurn(current.id)}
+                    >
+                      <Mic size={14} />
+                      {lang === 'de' ? 'Echtes Dual-Audio (6s)' : 'Capture Real Dual-Audio (6s)'}
+                    </button>
                     <button
                       type="button"
                       id="simulate-live-step-btn"
@@ -443,6 +457,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
               scopeFilter="single_meeting"
               recipes={recipes}
               messages={selectedDetail.chat_messages}
+              streamingText={streamingText}
               busy={busy}
               onExecute={(inp, slug) => onRunMeetingChat(current.id, inp, slug)}
             />

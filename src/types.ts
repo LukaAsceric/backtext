@@ -11,6 +11,61 @@ export interface PermissionStatus {
   microphone_granted: boolean;
   accessibility_granted: boolean;
   calendar_granted: boolean;
+  idle_seconds?: number;
+  screen_locked?: boolean;
+}
+
+export interface DaemonTelemetry {
+  loop_running: boolean;
+  poll_interval_secs: number;
+  ticks_processed: number;
+  snapshots_accepted: number;
+  snapshots_filtered: number;
+  last_window_app: string | null;
+  last_window_title: string | null;
+  last_tick_at: string | null;
+  meeting_detector_phase: string;
+  db_encrypted: boolean;
+  keychain_backend: string;
+  autostart_enabled: boolean;
+  global_shortcut: string;
+  demo_data_present: boolean;
+  whisper_cli_detected: boolean;
+}
+
+export interface CalendarFeedConfig {
+  id: string;
+  name: string;
+  ics_url: string;
+  enabled: boolean;
+  last_synced_at: string | null;
+}
+
+export interface WhisperModelInfo {
+  id: string;
+  name: string;
+  size_mb: number;
+  language_support: string;
+  download_url: string;
+  installed: boolean;
+  local_path: string | null;
+  downloading: boolean;
+  progress_pct: number;
+}
+
+export interface ProviderTestResult {
+  provider: string;
+  ok: boolean;
+  message: string;
+  latency_ms: number;
+}
+
+export interface UpdateCheckResult {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  release_notes: string;
 }
 
 export interface UserProfile {
@@ -257,13 +312,17 @@ export interface McpAuditEntry {
 export interface AiProviderSettings {
   stt_provider: string;
   stt_model: string;
+  whisper_model_id: string;
   llm_provider: string;
   llm_model: string;
+  embedding_provider: string;
+  embedding_model: string;
   ollama_url: string;
   openai_api_key_set: boolean;
   anthropic_api_key_set: boolean;
   gemini_api_key_set: boolean;
   deepgram_api_key_set: boolean;
+  groq_api_key_set: boolean;
 }
 
 export interface MemorySearchHit {
@@ -289,6 +348,7 @@ export interface ScrubberPreview {
 export interface BootstrapPayload {
   capture_status: CaptureStatus;
   permissions: PermissionStatus;
+  telemetry: DaemonTelemetry;
   profile: UserProfile;
   meetings: Meeting[];
   episodes: ContextEpisode[];
@@ -299,8 +359,25 @@ export interface BootstrapPayload {
   privacy_rules: PrivacyRule[];
   vocabulary: VocabularyEntry[];
   learned_preferences: LearnedPreference[];
+  calendar_feeds: CalendarFeedConfig[];
+  whisper_models: WhisperModelInfo[];
+  ollama_models: string[];
   mcp_policy: McpGovernancePolicy;
   mcp_snippets: McpClientConfigSnippets;
   mcp_audit_logs: McpAuditEntry[];
   ai_settings: AiProviderSettings;
 }
+
+export type BacktextRealtimeEvent =
+  | {
+      event: 'chat_stream_delta';
+      payload: { thread_id: string; message_id: string; delta: string; done: boolean };
+    }
+  | { event: 'daemon_telemetry_updated'; payload: DaemonTelemetry }
+  | {
+      event: 'model_download_progress';
+      payload: { model_id: string; progress_pct: number; installed: boolean; error: string | null };
+    }
+  | { event: 'calendar_synced'; payload: { imported_count: number } }
+  | { event: 'capture_status_changed'; payload: CaptureStatus }
+  | { event: string; payload: unknown };

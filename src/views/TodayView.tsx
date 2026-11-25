@@ -1,11 +1,24 @@
 import React, { useState } from 'react';
-import { Mic, Search, ArrowRight, Layers, Calendar, CheckCircle2 } from 'lucide-react';
+import {
+  Mic,
+  Search,
+  ArrowRight,
+  Layers,
+  Calendar,
+  CheckCircle2,
+  ShieldCheck,
+  RefreshCw,
+  Trash2,
+  Lock,
+} from 'lucide-react';
 import type {
   ChatMessage,
   ContextEpisode,
+  DaemonTelemetry,
   Language,
   Meeting,
   MemorySearchHit,
+  PermissionStatus,
   Recipe,
 } from '../types';
 import { t } from '../lib/i18n';
@@ -14,34 +27,53 @@ import { FormattedMarkdown } from '../components/FormattedMarkdown';
 
 interface TodayViewProps {
   lang: Language;
+  permissions: PermissionStatus;
+  telemetry: DaemonTelemetry;
   meetings: Meeting[];
   episodes: ContextEpisode[];
   recipes: Recipe[];
   globalMessages: ChatMessage[];
+  streamingText?: string | null;
   chatBusy: boolean;
   onStartAdhocMeeting: () => Promise<void>;
   onStartScheduledMeeting: (meetingId: string) => Promise<void>;
   onOpenMeeting: (meetingId: string) => void;
   onSearchMemory: (query: string) => Promise<MemorySearchHit[]>;
   onRunGlobalChat: (input: string, recipeSlug?: string) => Promise<void>;
+  onRequestPermission: (kind: string) => Promise<void>;
+  onClearDemoData: () => Promise<void>;
+  onSyncCalendars: () => Promise<void>;
 }
 
 export const TodayView: React.FC<TodayViewProps> = ({
   lang,
+  permissions,
+  telemetry,
   meetings,
   episodes,
   recipes,
   globalMessages,
+  streamingText,
   chatBusy,
   onStartAdhocMeeting,
   onStartScheduledMeeting,
   onOpenMeeting,
   onSearchMemory,
   onRunGlobalChat,
+  onRequestPermission,
+  onClearDemoData,
+  onSyncCalendars,
 }) => {
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<MemorySearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [syncingCal, setSyncingCal] = useState(false);
+
+  const missingPermissions =
+    !permissions.screen_capture_granted ||
+    !permissions.microphone_granted ||
+    !permissions.accessibility_granted ||
+    !permissions.calendar_granted;
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,6 +100,23 @@ export const TodayView: React.FC<TodayViewProps> = ({
         <div className="header-actions">
           <button
             type="button"
+            id="sync-calendars-btn"
+            className="btn"
+            disabled={syncingCal}
+            onClick={async () => {
+              setSyncingCal(true);
+              try {
+                await onSyncCalendars();
+              } finally {
+                setSyncingCal(false);
+              }
+            }}
+          >
+            <RefreshCw size={14} />
+            {lang === 'de' ? 'Kalender abgleichen' : 'Sync Calendars'}
+          </button>
+          <button
+            type="button"
             id="start-adhoc-meeting-btn"
             className="btn btn-recording"
             onClick={onStartAdhocMeeting}
@@ -77,6 +126,84 @@ export const TodayView: React.FC<TodayViewProps> = ({
           </button>
         </div>
       </header>
+
+      {/* Onboarding Permissions, Daemon Telemetry & Clean-Start Strip */}
+      <section className="surface-sheet" style={{ padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span className="pill pill-sage">
+              <ShieldCheck size={12} />
+              {telemetry.loop_running
+                ? lang === 'de'
+                  ? `Hintergrund-Daemon aktiv (${telemetry.ticks_processed} Ticks)`
+                  : `Background Daemon Active (${telemetry.ticks_processed} ticks)`
+                : 'Daemon bereit'}
+            </span>
+            <span className="pill pill-neutral">
+              <Lock size={11} />
+              {telemetry.db_encrypted ? 'SQLCipher AES-256' : 'SQLite WAL'} · {telemetry.keychain_backend}
+            </span>
+            {telemetry.last_window_app && (
+              <span className="mono-ts">
+                {lang === 'de' ? 'Zuletzt beobachtet:' : 'Last observed:'} {telemetry.last_window_app}
+              </span>
+            )}
+          </div>
+
+          {telemetry.demo_data_present && (
+            <button
+              type="button"
+              id="clear-demo-data-btn"
+              className="mini-btn"
+              onClick={onClearDemoData}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
+            >
+              <Trash2 size={11} />
+              {lang === 'de' ? 'Beispieldaten leeren & sauber starten' : 'Clear Demo Data'}
+            </button>
+          )}
+        </div>
+
+        {missingPermissions && (
+          <div
+            style={{
+              paddingTop: 10,
+              borderTop: '1px solid var(--border-subtle)',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: 10,
+            }}
+          >
+            <span style={{ fontSize: 12.5, fontWeight: 600 }}>
+              {lang === 'de'
+                ? 'macOS Berechtigungen für automatische Kontexterfassung & bot-freie Meetings:'
+                : 'macOS Permissions for Ambient Capture & Bot-Free Calls:'}
+            </span>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {(
+                [
+                  ['screen', 'ScreenCaptureKit', permissions.screen_capture_granted],
+                  ['microphone', 'Mikrofon', permissions.microphone_granted],
+                  ['accessibility', 'Bedienungshilfen', permissions.accessibility_granted],
+                  ['calendar', 'Kalender (EventKit)', permissions.calendar_granted],
+                ] as const
+              ).map(([kind, label, ok]) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className={`mini-btn ${ok ? '' : 'active-choice'}`}
+                  onClick={() => onRequestPermission(kind)}
+                >
+                  {ok ? '✓ ' : '+ '}
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
 
       {/* Hybrid Memory Search */}
       <section className="surface-sheet" style={{ padding: '14px 18px' }}>
@@ -103,7 +230,10 @@ export const TodayView: React.FC<TodayViewProps> = ({
         {hits && (
           <div style={{ marginTop: 12, borderTop: '1px solid var(--border-subtle)', paddingTop: 12 }}>
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-              {hits.length} {lang === 'de' ? 'Treffer (Hybrid BM25 + Vektor-RRF)' : 'results (Hybrid BM25 + Vector RRF)'}
+              {hits.length}{' '}
+              {lang === 'de'
+                ? 'Treffer (Hybrid BM25 + Vektor-RRF)'
+                : 'results (Hybrid BM25 + Vector RRF)'}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {hits.map((h) => (
@@ -135,6 +265,13 @@ export const TodayView: React.FC<TodayViewProps> = ({
           </h2>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {meetings.length === 0 && (
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                {lang === 'de'
+                  ? 'Noch keine Meetings aufgezeichnet. Starte ein Ad-hoc Meeting oder synchronisiere deinen Kalender.'
+                  : 'No meetings yet. Start an ad-hoc call or sync your calendar.'}
+              </div>
+            )}
             {meetings.slice(0, 4).map((m) => (
               <div
                 key={m.id}
@@ -236,6 +373,13 @@ export const TodayView: React.FC<TodayViewProps> = ({
           </h2>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 11 }}>
+            {episodes.length === 0 && (
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                {lang === 'de'
+                  ? 'Der Hintergrund-Daemon verdichtet deine aktiven Fenster automatisch zu Episoden.'
+                  : 'The background daemon automatically compacts active work into episodes.'}
+              </div>
+            )}
             {episodes.slice(0, 5).map((ep) => (
               <div key={ep.id} className="transcript-row">
                 <div className="transcript-meta">
@@ -271,6 +415,7 @@ export const TodayView: React.FC<TodayViewProps> = ({
           scopeFilter="all"
           recipes={recipes}
           messages={globalMessages}
+          streamingText={streamingText}
           busy={chatBusy}
           onExecute={onRunGlobalChat}
         />

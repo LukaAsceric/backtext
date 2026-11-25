@@ -1,3 +1,10 @@
+pub mod audio_dsp;
+
+pub use audio_dsp::{
+    detect_speech_spans, extract_acoustic_voiceprint_256, extract_voiceprint_from_wav,
+    read_wav_pcm16, SpeechSpan,
+};
+
 use anyhow::Result;
 use backtext_context::dhash_hamming_distance;
 use backtext_core::*;

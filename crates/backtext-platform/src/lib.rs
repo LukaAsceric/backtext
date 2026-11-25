@@ -1,14 +1,13 @@
+pub mod ics;
 pub mod simulator;
 pub mod traits;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+pub use ics::{fetch_and_parse_ics_url, parse_ics_events};
 pub use simulator::SimulatorPlatformSensors;
 pub use traits::*;
-
-#[cfg(target_os = "macos")]
-pub use sha2;
 
 use std::sync::Arc;
 

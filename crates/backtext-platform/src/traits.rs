@@ -10,6 +10,10 @@ pub struct PermissionStatus {
     pub microphone_granted: bool,
     pub accessibility_granted: bool,
     pub calendar_granted: bool,
+    #[serde(default)]
+    pub idle_seconds: u64,
+    #[serde(default)]
+    pub screen_locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,12 +33,29 @@ pub struct ActiveWindowObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowScreenshotOcr {
+    pub ok: bool,
+    pub dhash_u64: u64,
+    pub dhash_hex: String,
+    pub ocr_text: String,
+    pub image_data_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioEnvironmentSignal {
     pub microphone_in_use: bool,
     pub system_audio_active: bool,
     pub detected_meeting_app: Option<String>,
     pub detected_meeting_title: Option<String>,
     pub has_call_controls_ui: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DualAudioCaptureChunk {
+    pub mic_wav_path: Option<String>,
+    pub mic_samples: usize,
+    pub system_wav_path: Option<String>,
+    pub system_samples: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,9 +84,22 @@ pub struct SafeClipboardObservation {
 #[async_trait]
 pub trait PlatformSensors: Send + Sync {
     async fn check_permissions(&self) -> PermissionStatus;
+    async fn request_permission(&self, kind: &str) -> anyhow::Result<PermissionStatus>;
+    async fn open_permission_settings(&self, kind: &str) -> anyhow::Result<()>;
     async fn observe_active_window(&self) -> anyhow::Result<ActiveWindowObservation>;
+    async fn capture_window_screenshot_ocr(
+        &self,
+        include_image: bool,
+    ) -> anyhow::Result<WindowScreenshotOcr>;
     async fn observe_audio_environment(&self) -> anyhow::Result<AudioEnvironmentSignal>;
+    async fn record_dual_audio_chunk(
+        &self,
+        out_dir: &str,
+        duration_secs: u64,
+    ) -> anyhow::Result<DualAudioCaptureChunk>;
+    async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> anyhow::Result<bool>;
     async fn upcoming_calendar_events(&self) -> anyhow::Result<Vec<CalendarMeetingEvent>>;
     async fn read_safe_clipboard(&self) -> anyhow::Result<Option<SafeClipboardObservation>>;
     async fn run_vision_ocr_on_image_path(&self, image_path: &str) -> anyhow::Result<String>;
+    async fn send_native_notification(&self, title: &str, body: &str) -> anyhow::Result<()>;
 }

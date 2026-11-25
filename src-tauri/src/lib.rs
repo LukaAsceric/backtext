@@ -1,4 +1,5 @@
 pub mod controller;
+pub mod daemon_loop;
 pub mod http_server;
 
 use controller::AppController;
@@ -6,8 +7,10 @@ use serde_json::Value;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    Manager, State,
+    Emitter, Manager, State,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[tauri::command]
 async fn backtext_rpc(
@@ -39,6 +42,23 @@ fn toggle_hover_overlay(app: tauri::AppHandle) -> Result<bool, String> {
     } else {
         Ok(false)
     }
+}
+
+#[tauri::command]
+fn set_autostart_enabled(
+    app: tauri::AppHandle,
+    controller: State<'_, AppController>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())?;
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())?;
+    }
+    let active = autolaunch.is_enabled().unwrap_or(enabled);
+    controller.update_telemetry(|t| t.autostart_enabled = active);
+    Ok(active)
 }
 
 fn setup_menubar_tray(app: &tauri::App, tray_ctrl: AppController) -> tauri::Result<()> {
@@ -131,9 +151,22 @@ pub fn run() {
         .ok();
 
     let controller = AppController::open_default().expect("Failed to initialize backtext storage");
-    let http_controller = controller.clone();
+    let setup_controller = controller.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--silent-launch"]),
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        let _ = toggle_hover_overlay(app.clone());
+                    }
+                })
+                .build(),
+        )
         .manage(controller)
         .setup(move |app| {
             // Protect Hover assistant from screen capture / screen sharing
@@ -141,13 +174,44 @@ pub fn run() {
                 let _ = hover_win.set_content_protected(true);
             }
 
-            // Spawn embedded Streamable HTTP MCP server on localhost:39421
-            let mcp_port = http_controller
+            // Read initial autostart state cleanly
+            let autostart_active = app.autolaunch().is_enabled().unwrap_or(false);
+            setup_controller.update_telemetry(|t| t.autostart_enabled = autostart_active);
+
+            // Register system-wide Option+Space (Alt+Space) hotkey for Hover Overlay
+            let hover_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+            if let Err(err) = app.global_shortcut().register(hover_shortcut) {
+                tracing::warn!("Could not register global shortcut Alt+Space: {err}");
+            }
+
+            // Forward Rust EventBus events directly into Tauri webview windows for live token streaming
+            let mut rx = setup_controller.events.subscribe();
+            let app_handle_for_events = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            let _ = app_handle_for_events.emit("backtext://event", &ev);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Start autonomous background capture, meeting detector & calendar sync loop
+            let daemon_ctrl = setup_controller.clone();
+            tauri::async_runtime::spawn(async move {
+                daemon_loop::spawn_background_daemon(daemon_ctrl);
+            });
+
+            // Spawn embedded Streamable HTTP MCP & SSE server on localhost:39421
+            let mcp_port = setup_controller
                 .storage
                 .get_mcp_policy()
                 .map(|p| p.http_port)
                 .unwrap_or(39421);
-            let server_ctrl = http_controller.clone();
+            let server_ctrl = setup_controller.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) =
                     http_server::spawn_local_http_and_mcp_server(server_ctrl, mcp_port).await
@@ -156,7 +220,7 @@ pub fn run() {
                 }
             });
 
-            if let Err(err) = setup_menubar_tray(app, http_controller.clone()) {
+            if let Err(err) = setup_menubar_tray(app, setup_controller.clone()) {
                 tracing::warn!("Menubar tray initialization skipped: {err}");
             }
 
@@ -171,7 +235,11 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![backtext_rpc, toggle_hover_overlay])
+        .invoke_handler(tauri::generate_handler![
+            backtext_rpc,
+            toggle_hover_overlay,
+            set_autostart_enabled
+        ])
         .run(tauri::generate_context!())
         .expect("error while running backtext Tauri application");
 }

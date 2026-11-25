@@ -1,3 +1,4 @@
+pub mod secrets;
 pub mod seed;
 
 use anyhow::{Context, Result};
@@ -5,16 +6,21 @@ use backtext_core::*;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
+use secrets::SecretVault;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const SCHEMA_SQL: &str = include_str!("../migrations/0001_initial_schema.sql");
+const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 #[derive(Clone)]
 pub struct StorageEngine {
     db_path: PathBuf,
     conn: Arc<Mutex<Connection>>,
+    secrets: SecretVault,
+    db_encrypted: bool,
 }
 
 fn encode_f32_vec(vec: &[f32]) -> Vec<u8> {
@@ -48,17 +54,68 @@ fn sanitize_fts_query(raw: &str) -> String {
     tokens.join(" OR ")
 }
 
+fn file_is_plaintext_sqlite(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    matches!(f.read_exact(&mut header), Ok(())) && &header == SQLITE_PLAINTEXT_HEADER
+}
+
+fn migrate_plaintext_to_sqlcipher(db_path: &Path, key_hex: &str) -> Result<()> {
+    let migrating_path = db_path.with_extension("db.enc.migrating");
+    let _ = std::fs::remove_file(&migrating_path);
+
+    let plain_conn = Connection::open(db_path)?;
+    let attach_sql = format!(
+        "ATTACH DATABASE '{}' AS encrypted KEY \"x'{key_hex}'\";
+         SELECT sqlcipher_export('encrypted');
+         DETACH DATABASE encrypted;",
+        migrating_path.display().to_string().replace('\'', "''")
+    );
+    plain_conn.execute_batch(&attach_sql)?;
+    drop(plain_conn);
+
+    // Clean up any leftover WAL/SHM files from unencrypted v0.1.0 DB
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    std::fs::rename(&migrating_path, db_path)?;
+    Ok(())
+}
+
 impl StorageEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create storage directory {:?}", parent))?;
-            }
+        let vault_dir = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        std::fs::create_dir_all(&vault_dir)
+            .with_context(|| format!("Failed to create storage directory {:?}", vault_dir))?;
+
+        let secrets = SecretVault::open(&vault_dir);
+        let key_hex = secrets.get_or_create_db_master_key_hex()?;
+
+        // Auto-migrate legacy unencrypted v0.1.0 SQLite DB in place to AES-256 SQLCipher
+        if db_path.exists() && file_is_plaintext_sqlite(&db_path) {
+            let _ = migrate_plaintext_to_sqlcipher(&db_path, &key_hex);
         }
+
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite database at {:?}", db_path))?;
+
+        let db_encrypted = conn
+            .execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+            .is_ok();
+
+        // Verify readability (and check cipher_version)
+        let cipher_active: bool = db_encrypted
+            && conn
+                .query_row("PRAGMA cipher_version;", [], |r| r.get::<_, String>(0))
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -71,6 +128,8 @@ impl StorageEngine {
         let engine = Self {
             db_path,
             conn: Arc::new(Mutex::new(conn)),
+            secrets,
+            db_encrypted: cipher_active,
         };
         engine.ensure_defaults_seeded()?;
         Ok(engine)
@@ -82,6 +141,8 @@ impl StorageEngine {
         let engine = Self {
             db_path: PathBuf::from(":memory:"),
             conn: Arc::new(Mutex::new(conn)),
+            secrets: SecretVault::open_ephemeral(),
+            db_encrypted: false,
         };
         engine.ensure_defaults_seeded()?;
         Ok(engine)
@@ -89,6 +150,14 @@ impl StorageEngine {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.db_encrypted
+    }
+
+    pub fn secrets(&self) -> &SecretVault {
+        &self.secrets
     }
 
     fn ensure_defaults_seeded(&self) -> Result<()> {
@@ -1542,9 +1611,16 @@ impl StorageEngine {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(opt
+        drop(conn);
+        let mut settings: AiProviderSettings = opt
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        settings.openai_api_key_set = self.secrets.has_secret(secrets::KEY_OPENAI);
+        settings.anthropic_api_key_set = self.secrets.has_secret(secrets::KEY_ANTHROPIC);
+        settings.gemini_api_key_set = self.secrets.has_secret(secrets::KEY_GEMINI);
+        settings.deepgram_api_key_set = self.secrets.has_secret(secrets::KEY_DEEPGRAM);
+        settings.groq_api_key_set = self.secrets.has_secret(secrets::KEY_GROQ);
+        Ok(settings)
     }
 
     pub fn save_ai_settings(&self, settings: &AiProviderSettings) -> Result<()> {
@@ -1556,6 +1632,204 @@ impl StorageEngine {
             params![val, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn save_self_voiceprint_embedding(&self, embedding: &[f32]) -> Result<UserProfile> {
+        let mut profile = self.get_user_profile()?;
+        let mut normalized = embedding.to_vec();
+        l2_normalize(&mut normalized);
+        profile.self_voiceprint = Some(normalized);
+        profile.has_self_voiceprint = true;
+        self.save_user_profile(&profile)?;
+        self.get_user_profile()
+    }
+
+    pub fn update_snapshot_dwell(&self, snapshot_id: &str, added_ms: u64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE context_snapshots SET dwell_ms = dwell_ms + ?2 WHERE id = ?1",
+            params![snapshot_id, added_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_memory_vector_embedding(&self, doc_id: &str, embedding: &[f32]) -> Result<()> {
+        if embedding.len() != EMBEDDING_DIM {
+            return Ok(());
+        }
+        let blob = encode_f32_vec(embedding);
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE memory_vectors SET embedding_blob = ?2 WHERE doc_id = ?1",
+            params![doc_id, blob],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_demo_data(&self) -> Result<bool> {
+        let conn = self.conn.lock();
+        let cnt: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(cnt > 0)
+    }
+
+    /// Removes the initial demo dataset while preserving user profile, recipes, vocabulary, and privacy rules.
+    pub fn clear_demo_data(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let mut removed = 0;
+        for sql in [
+            "DELETE FROM transcript_segments WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "DELETE FROM screenshare_frames WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "DELETE FROM meeting_participants WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "DELETE FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "DELETE FROM persons WHERE id IN ('per_anna', 'per_markus', 'per_clara')",
+            "DELETE FROM context_episodes WHERE id IN ('ep_mcp_spec', 'ep_recipes_design')",
+            "DELETE FROM context_snapshots WHERE id IN ('snap_1', 'snap_2')",
+            "DELETE FROM clipboard_items WHERE id IN ('clip_1', 'clip_2')",
+            "DELETE FROM memory_fts WHERE doc_id LIKE 'meeting:mtg_%' OR doc_id LIKE 'transcript:seg_%' OR doc_id LIKE 'screenshare:frame_%' OR doc_id LIKE 'episode:ep_%' OR doc_id LIKE 'snapshot:snap_%' OR doc_id LIKE 'clipboard:clip_%'",
+            "DELETE FROM memory_vectors WHERE doc_id LIKE 'meeting:mtg_%' OR doc_id LIKE 'transcript:seg_%' OR doc_id LIKE 'screenshare:frame_%' OR doc_id LIKE 'episode:ep_%' OR doc_id LIKE 'snapshot:snap_%' OR doc_id LIKE 'clipboard:clip_%'",
+        ] {
+            removed += conn.execute(sql, [])?;
+        }
+        conn.execute(
+            "INSERT INTO kv_settings (key, value_json, updated_at) VALUES ('demo_cleared', 'true', ?1)
+             ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_at = excluded.updated_at",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(removed)
+    }
+
+    pub fn list_calendar_feeds(&self) -> Result<Vec<CalendarFeedConfig>> {
+        let conn = self.conn.lock();
+        let opt: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM kv_settings WHERE key = 'calendar_feeds'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(opt
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_calendar_feeds(&self, feeds: &[CalendarFeedConfig]) -> Result<()> {
+        let val = serde_json::to_string(feeds)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO kv_settings (key, value_json, updated_at) VALUES ('calendar_feeds', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            params![val, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Upserts a real calendar event as a scheduled meeting with an automatically synthesized Pre-Meeting Brief.
+    pub fn upsert_calendar_event_meeting(
+        &self,
+        event_id: &str,
+        title: &str,
+        starts_at: DateTime<Utc>,
+        ends_at: Option<DateTime<Utc>>,
+        conference_app: &str,
+        attendees: &[(String, String)],
+    ) -> Result<bool> {
+        let existing = self
+            .list_meetings()?
+            .into_iter()
+            .find(|m| m.calendar_event_id.as_deref() == Some(event_id));
+        if existing.is_some() {
+            return Ok(false);
+        }
+
+        let profile = self.get_user_profile()?;
+        let known_persons = self.list_persons()?;
+        let recent_eps = self.list_context_episodes(3)?;
+
+        let mut participants = vec![MeetingParticipant {
+            speaker_label: "SELF".into(),
+            display_name: format!("{} (Ich)", profile.display_name),
+            person_id: None,
+            email: profile.email.clone(),
+            is_self: true,
+            identification_source: IdentificationSource::CalendarPrior,
+            confidence: 1.0,
+            talk_time_ms: 0,
+        }];
+
+        let mut brief_lines = vec![format!(
+            "**Vorbereitungs-Briefing (aus Kalender & Gedächtnis):**"
+        )];
+
+        for (idx, (name, email)) in attendees.iter().enumerate() {
+            let matched = known_persons.iter().find(|p| {
+                p.email
+                    .as_deref()
+                    .map(|e| e.eq_ignore_ascii_case(email))
+                    .unwrap_or(false)
+                    || p.full_name.eq_ignore_ascii_case(name)
+            });
+
+            if let Some(p) = matched {
+                if !p.open_commitments.is_empty() {
+                    brief_lines.push(format!(
+                        "- **Offen mit {}:** {}",
+                        p.full_name,
+                        p.open_commitments.join(" · ")
+                    ));
+                } else {
+                    brief_lines.push(format!("- **Teilnehmer {}:** {}", p.full_name, p.role_notes));
+                }
+            }
+
+            participants.push(MeetingParticipant {
+                speaker_label: format!("CAL_{}", idx + 1),
+                display_name: if name.trim().is_empty() {
+                    email.clone()
+                } else {
+                    name.clone()
+                },
+                person_id: matched.map(|p| p.id.clone()),
+                email: if email.is_empty() { None } else { Some(email.clone()) },
+                is_self: false,
+                identification_source: IdentificationSource::CalendarPrior,
+                confidence: 0.95,
+                talk_time_ms: 0,
+            });
+        }
+
+        if let Some(ep) = recent_eps.first() {
+            brief_lines.push(format!(
+                "- **Dein jüngster Arbeitskontext:** *{}* ({})",
+                ep.title,
+                ep.primary_apps.join(", ")
+            ));
+        }
+
+        let meeting = Meeting {
+            id: format!("mtg_cal_{}", uuid::Uuid::new_v4().simple()),
+            title: title.to_string(),
+            calendar_event_id: Some(event_id.to_string()),
+            detected_app: conference_app.to_string(),
+            project_tag: profile.active_projects.first().cloned(),
+            started_at: starts_at,
+            ended_at: ends_at,
+            status: MeetingStatus::Scheduled,
+            template_id: "general".into(),
+            prep_brief: Some(brief_lines.join("\n")),
+            raw_user_notes: String::new(),
+            executive_summary: String::new(),
+            enhanced_markdown: String::new(),
+            action_items: vec![],
+            participants,
+            transcript_count: 0,
+            screenshare_count: 0,
+        };
+        self.save_meeting(&meeting)?;
+        Ok(true)
     }
 
     pub fn record_mcp_audit(&self, entry: &McpAuditEntry) -> Result<()> {
@@ -1641,4 +1915,29 @@ mod tests {
         let meetings = store.list_meetings().unwrap();
         assert!(meetings.len() >= 2, "Meetings should remain intact when purging ambient snapshots");
     }
+
+    #[test]
+    fn sqlcipher_encrypts_database_at_rest_and_clears_demo_data() {
+        let dir = std::env::temp_dir().join(format!("backtext_sqlcipher_{}", uuid::Uuid::new_v4().simple()));
+        let db_path = dir.join("backtext.db");
+        {
+            let store = StorageEngine::open(&db_path).unwrap();
+            assert!(store.is_encrypted(), "Expected SQLCipher AES-256 encryption to be active");
+            assert!(store.has_demo_data().unwrap());
+            let removed = store.clear_demo_data().unwrap();
+            assert!(removed > 0);
+            assert!(!store.has_demo_data().unwrap());
+        }
+        // Raw file bytes on disk MUST NOT start with plaintext SQLite header
+        assert!(
+            !file_is_plaintext_sqlite(&db_path),
+            "Encrypted SQLCipher DB should never expose plaintext SQLite header"
+        );
+        // Reopening with persisted vault key succeeds transparently
+        let reopened = StorageEngine::open(&db_path).unwrap();
+        assert!(reopened.is_encrypted());
+        assert!(!reopened.has_demo_data().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

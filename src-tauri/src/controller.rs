@@ -1,13 +1,21 @@
 use anyhow::Result;
-use backtext_ai::{EnhancedMeetingResult, HybridAiEngine};
+use backtext_ai::{
+    detect_whisper_cli_path, download_whisper_model, list_ollama_models, list_whisper_models,
+    test_provider_connection, transcribe_wav_file, EnhancedMeetingResult, HybridAiEngine,
+};
 use backtext_context::{
     compact_snapshots_to_episode, evaluate_clipboard_capture, evaluate_context_candidate,
     preview_filter_on_sample, FilterDecision, RawContextCandidate, ScrubberPreview,
 };
 use backtext_core::*;
 use backtext_mcp::{McpClientConfigSnippets, McpServer};
-use backtext_meeting::{ScreenShareDeduplicator, SpeakerAttributionSession};
-use backtext_platform::{default_platform_sensors, PermissionStatus, PlatformSensors};
+use backtext_meeting::{
+    extract_voiceprint_from_wav, ScreenShareDeduplicator, SpeakerAttributionSession,
+};
+use backtext_platform::{
+    default_platform_sensors, fetch_and_parse_ics_url, PermissionStatus, PlatformSensors,
+};
+use backtext_storage::secrets::{KEY_ANTHROPIC, KEY_DEEPGRAM, KEY_GEMINI, KEY_GROQ, KEY_OPENAI};
 use backtext_storage::StorageEngine;
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
@@ -28,6 +36,7 @@ struct LiveMeetingRuntime {
 pub struct BootstrapPayload {
     pub capture_status: CaptureStatus,
     pub permissions: PermissionStatus,
+    pub telemetry: DaemonTelemetry,
     pub profile: UserProfile,
     pub meetings: Vec<Meeting>,
     pub episodes: Vec<ContextEpisode>,
@@ -38,6 +47,9 @@ pub struct BootstrapPayload {
     pub privacy_rules: Vec<PrivacyRule>,
     pub vocabulary: Vec<VocabularyEntry>,
     pub learned_preferences: Vec<LearnedPreference>,
+    pub calendar_feeds: Vec<CalendarFeedConfig>,
+    pub whisper_models: Vec<WhisperModelInfo>,
+    pub ollama_models: Vec<String>,
     pub mcp_policy: McpGovernancePolicy,
     pub mcp_snippets: McpClientConfigSnippets,
     pub mcp_audit_logs: Vec<McpAuditEntry>,
@@ -53,6 +65,7 @@ pub struct AppController {
     pub sensors: Arc<dyn PlatformSensors>,
     capture_status: Arc<Mutex<CaptureStatus>>,
     live_sessions: Arc<Mutex<HashMap<String, LiveMeetingRuntime>>>,
+    telemetry: Arc<Mutex<DaemonTelemetry>>,
 }
 
 impl AppController {
@@ -72,6 +85,26 @@ impl AppController {
         let ai = HybridAiEngine::new();
         let mcp = McpServer::new(storage.clone(), events.clone());
         let sensors = default_platform_sensors();
+        let demo_present = storage.has_demo_data().unwrap_or(false);
+
+        let initial_telemetry = DaemonTelemetry {
+            loop_running: false,
+            poll_interval_secs: 4,
+            ticks_processed: 0,
+            snapshots_accepted: 0,
+            snapshots_filtered: 0,
+            last_window_app: None,
+            last_window_title: None,
+            last_tick_at: None,
+            meeting_detector_phase: "idle".into(),
+            db_encrypted: storage.is_encrypted(),
+            keychain_backend: storage.secrets().backend_name().to_string(),
+            autostart_enabled: false,
+            global_shortcut: "Alt+Space (⌥ Space)".into(),
+            demo_data_present: demo_present,
+            whisper_cli_detected: detect_whisper_cli_path().is_some(),
+        };
+
         Ok(Self {
             storage,
             events,
@@ -80,18 +113,37 @@ impl AppController {
             sensors,
             capture_status: Arc::new(Mutex::new(CaptureStatus::Active)),
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
+            telemetry: Arc::new(Mutex::new(initial_telemetry)),
         })
+    }
+
+    pub fn update_telemetry<F: FnOnce(&mut DaemonTelemetry)>(&self, f: F) -> DaemonTelemetry {
+        let mut guard = self.telemetry.lock();
+        f(&mut guard);
+        guard.demo_data_present = self.storage.has_demo_data().unwrap_or(false);
+        guard.clone()
+    }
+
+    pub fn get_telemetry(&self) -> DaemonTelemetry {
+        let mut guard = self.telemetry.lock();
+        guard.demo_data_present = self.storage.has_demo_data().unwrap_or(false);
+        guard.whisper_cli_detected = detect_whisper_cli_path().is_some();
+        guard.clone()
     }
 
     pub async fn bootstrap(&self) -> Result<BootstrapPayload> {
         let permissions = self.sensors.check_permissions().await;
         let status = self.current_capture_status();
+        let ai_settings = self.storage.get_ai_settings()?;
+        let ollama_models =
+            list_ollama_models(self.ai.http_client(), &ai_settings.ollama_url).await;
         let bin_hint = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.join("backtext-mcp").display().to_string()));
         Ok(BootstrapPayload {
             capture_status: status,
             permissions,
+            telemetry: self.get_telemetry(),
             profile: self.storage.get_user_profile()?,
             meetings: self.storage.list_meetings()?,
             episodes: self.storage.list_context_episodes(25)?,
@@ -102,16 +154,23 @@ impl AppController {
             privacy_rules: self.storage.list_privacy_rules()?,
             vocabulary: self.storage.list_vocabulary()?,
             learned_preferences: self.storage.list_learned_preferences()?,
+            calendar_feeds: self.storage.list_calendar_feeds()?,
+            whisper_models: list_whisper_models(),
+            ollama_models,
             mcp_policy: self.storage.get_mcp_policy()?,
             mcp_snippets: self.mcp.client_config_snippets(bin_hint.as_deref())?,
             mcp_audit_logs: self.storage.list_mcp_audit_logs(40)?,
-            ai_settings: self.storage.get_ai_settings()?,
+            ai_settings,
         })
     }
 
     pub fn current_capture_status(&self) -> CaptureStatus {
         let mut guard = self.capture_status.lock();
-        if let CaptureStatus::Paused { until: Some(until_dt), .. } = &*guard {
+        if let CaptureStatus::Paused {
+            until: Some(until_dt),
+            ..
+        } = &*guard
+        {
             if Utc::now() >= *until_dt {
                 *guard = CaptureStatus::Active;
             }
@@ -245,8 +304,166 @@ impl AppController {
             .ok_or_else(|| anyhow::anyhow!("Failed to load started meeting"))
     }
 
-    /// Feeds either a real dictated/transcribed audio chunk OR a realistic multi-modal simulation step
-    /// (Mic Self, Voiceprint Recognition, Visual Active-Speaker Recognition, and Screen-Share OCR Slide).
+    /// Captures a real macOS ScreenCaptureKit screenshot during a live meeting, checks dHash
+    /// stability via `ScreenShareDeduplicator`, runs Apple Vision OCR, and persists new slides.
+    pub async fn capture_live_screenshare_if_changed(&self, meeting_id: &str) -> Result<bool> {
+        let shot = self.sensors.capture_window_screenshot_ocr(true).await?;
+        if !shot.ok || shot.ocr_text.trim().len() < 12 {
+            return Ok(false);
+        }
+
+        let elapsed_ms = {
+            let mut sessions = self.live_sessions.lock();
+            let Some(rt) = sessions.get_mut(meeting_id) else {
+                return Ok(false);
+            };
+            rt.elapsed_ms = rt.elapsed_ms.saturating_add(4_000);
+            let _ = rt.screenshare_dedup.should_capture_frame(shot.dhash_u64, rt.elapsed_ms);
+            if !rt
+                .screenshare_dedup
+                .should_capture_frame(shot.dhash_u64, rt.elapsed_ms + 1_600)
+            {
+                return Ok(false);
+            }
+            rt.elapsed_ms
+        };
+
+        let first_line = shot
+            .ocr_text
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| l.len() >= 4)
+            .unwrap_or("Geteilter Bildschirm")
+            .chars()
+            .take(72)
+            .collect::<String>();
+
+        let frame = ScreenShareFrame {
+            id: format!("frame_{}", uuid::Uuid::new_v4().simple()),
+            meeting_id: meeting_id.to_string(),
+            captured_at_ms: elapsed_ms,
+            presenter_name: Some("Screen Share (macOS Vision OCR)".into()),
+            dhash_hex: shot.dhash_hex,
+            image_data_url: shot.image_data_url,
+            ocr_text: shot.ocr_text,
+            slide_title: first_line,
+        };
+        self.storage.insert_screenshare_frame(&frame)?;
+        self.events.publish(BacktextEvent::ScreenShareCaptured(frame));
+        Ok(true)
+    }
+
+    /// Records a real dual-channel audio chunk (Mic + ScreenCaptureKit System Audio),
+    /// extracts 256-dim acoustic MFCC/pitch voiceprints, runs configured Whisper/Deepgram/OpenAI STT,
+    /// and attributes speakers into the live meeting transcript.
+    pub async fn capture_real_dual_audio_turn(
+        &self,
+        meeting_id: &str,
+        duration_secs: u64,
+    ) -> Result<MeetingDetail> {
+        let chunk_dir = std::env::temp_dir().join(format!(
+            "backtext_chunk_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let capture = self
+            .sensors
+            .record_dual_audio_chunk(&chunk_dir.display().to_string(), duration_secs.clamp(3, 15))
+            .await?;
+
+        let profile = self.storage.get_user_profile()?;
+        let vocab = self.storage.list_vocabulary()?;
+        let ai_settings = self.storage.get_ai_settings()?;
+        let attendee_names: Vec<String> = self
+            .storage
+            .get_meeting_detail(meeting_id)?
+            .map(|d| d.meeting.participants.into_iter().map(|p| p.display_name).collect())
+            .unwrap_or_default();
+        let vocab_prompt = build_stt_vocabulary_prompt(&profile, &vocab, &attendee_names);
+
+        let visual_speaker_hint = self
+            .sensors
+            .observe_active_window()
+            .await
+            .ok()
+            .and_then(|w| w.detected_active_speaker_tile);
+
+        for (channel, maybe_wav) in [
+            (AudioChannel::Microphone, capture.mic_wav_path),
+            (AudioChannel::System, capture.system_wav_path),
+        ] {
+            let Some(wav_path_str) = maybe_wav else {
+                continue;
+            };
+            let wav_path = PathBuf::from(&wav_path_str);
+            let Ok((acoustic_vp, spans)) = extract_voiceprint_from_wav(&wav_path) else {
+                continue;
+            };
+            if spans.is_empty() {
+                continue;
+            }
+            let utterances = transcribe_wav_file(
+                self.ai.http_client(),
+                &wav_path,
+                &vocab_prompt,
+                &ai_settings,
+                self.storage.secrets(),
+            )
+            .await
+            .unwrap_or_default();
+
+            for utt in utterances {
+                let mut sessions = self.live_sessions.lock();
+                let rt = sessions
+                    .entry(meeting_id.to_string())
+                    .or_insert_with(|| LiveMeetingRuntime {
+                        attribution: SpeakerAttributionSession::new(
+                            meeting_id,
+                            &profile.display_name,
+                            vec![],
+                        ),
+                        screenshare_dedup: ScreenShareDeduplicator::default(),
+                        sim_step: 0,
+                        elapsed_ms: 0,
+                    });
+
+                let base_ms = rt.elapsed_ms;
+                let start_ms = base_ms + utt.start_ms;
+                let end_ms = base_ms + utt.end_ms.max(utt.start_ms + 1000);
+                rt.elapsed_ms = end_ms;
+
+                let hint = utt.speaker_hint.as_deref().or(visual_speaker_hint.as_deref());
+                let (seg, participant) = rt.attribution.attribute_segment(
+                    &self.storage,
+                    channel,
+                    start_ms,
+                    end_ms,
+                    &utt.text,
+                    &acoustic_vp,
+                    hint,
+                )?;
+                drop(sessions);
+
+                self.storage.insert_transcript_segment(&seg)?;
+                self.events.publish(BacktextEvent::TranscriptSegmentAdded(seg));
+                if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
+                    upsert_participant_vec(&mut detail.meeting.participants, participant.clone());
+                    self.storage.save_meeting(&detail.meeting)?;
+                    self.events.publish(BacktextEvent::ParticipantUpdated {
+                        meeting_id: meeting_id.to_string(),
+                        participant,
+                    });
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&chunk_dir);
+        self.storage
+            .get_meeting_detail(meeting_id)?
+            .ok_or_else(|| anyhow::anyhow!("Meeting not found"))
+    }
+
+    /// Feeds a realistic multi-modal simulation step (Mic Self, Voiceprint Recognition,
+    /// Visual Active-Speaker Recognition, and Screen-Share OCR Slide).
     pub fn simulate_live_meeting_activity(&self, meeting_id: &str) -> Result<MeetingDetail> {
         let profile = self.storage.get_user_profile()?;
         let mut sessions = self.live_sessions.lock();
@@ -318,7 +535,6 @@ impl AppController {
             ),
         };
 
-        // Trigger twice across settle threshold so ScreenShareDeduplicator validates stability
         if let Some((dhash, slide_title, ocr_lines, presenter)) = maybe_slide {
             let _ = rt.screenshare_dedup.should_capture_frame(dhash, start_ms);
             if rt
@@ -347,7 +563,6 @@ impl AppController {
             &emb,
             visual_hint,
         )?;
-        // Repeat second vote for visual speaker promotion if new speaker
         if let Some(vh) = visual_hint {
             let (_, promoted_part) = rt.attribution.attribute_segment(
                 &self.storage,
@@ -392,7 +607,12 @@ impl AppController {
         self.events
             .publish(BacktextEvent::CaptureStatusChanged(CaptureStatus::Active));
 
-        let _ = self.ai.enhance_meeting_summary(&self.storage, meeting_id).await?;
+        let res = self.ai.enhance_meeting_summary(&self.storage, meeting_id).await?;
+        self.events.publish(BacktextEvent::MeetingSummarized {
+            meeting_id: meeting_id.to_string(),
+            executive_summary: res.executive_summary,
+        });
+
         self.storage
             .get_meeting_detail(meeting_id)?
             .ok_or_else(|| anyhow::anyhow!("Meeting not found after summary"))
@@ -400,6 +620,122 @@ impl AppController {
 
     pub async fn enhance_meeting(&self, meeting_id: &str) -> Result<EnhancedMeetingResult> {
         self.ai.enhance_meeting_summary(&self.storage, meeting_id).await
+    }
+
+    /// Synchronizes macOS EventKit calendars + configured external `.ics` feeds into scheduled meetings.
+    pub async fn sync_calendars(&self) -> Result<usize> {
+        let mut all_events = self
+            .sensors
+            .upcoming_calendar_events()
+            .await
+            .unwrap_or_default();
+
+        let mut feeds = self.storage.list_calendar_feeds()?;
+        for feed in feeds.iter_mut().filter(|f| f.enabled && !f.ics_url.is_empty()) {
+            if let Ok(ics_events) = fetch_and_parse_ics_url(&feed.ics_url).await {
+                all_events.extend(ics_events);
+                feed.last_synced_at = Some(Utc::now());
+            }
+        }
+        let _ = self.storage.save_calendar_feeds(&feeds);
+
+        let mut imported = 0_usize;
+        for ev in all_events {
+            let app_label = match ev.conference_url.as_deref() {
+                Some(u) if u.contains("zoom.us") => "Zoom (Kalender)",
+                Some(u) if u.contains("meet.google.com") => "Google Meet (Kalender)",
+                Some(u) if u.contains("teams.microsoft") => "Microsoft Teams (Kalender)",
+                _ => "Kalender-Termin (EventKit / ICS)",
+            };
+            let attendees: Vec<(String, String)> = ev
+                .attendees
+                .into_iter()
+                .map(|a| (a.name, a.email))
+                .collect();
+            if self.storage.upsert_calendar_event_meeting(
+                &ev.event_id,
+                &ev.title,
+                ev.starts_at,
+                Some(ev.ends_at),
+                app_label,
+                &attendees,
+            )? {
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
+    /// Records real microphone audio (5s on macOS / synthetic fallback on Linux), extracts a
+    /// genuine 256-dim acoustic MFCC/pitch voiceprint, and stores it in `user_profile`.
+    pub async fn calibrate_real_voiceprint(&self, duration_secs: u64) -> Result<UserProfile> {
+        let wav_path = std::env::temp_dir().join(format!(
+            "backtext_self_vp_{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let recorded = self
+            .sensors
+            .record_mic_wav(&wav_path.display().to_string(), duration_secs.clamp(3, 15))
+            .await
+            .unwrap_or(false);
+
+        if recorded && wav_path.exists() {
+            if let Ok((embedding, _spans)) = extract_voiceprint_from_wav(&wav_path) {
+                let _ = std::fs::remove_file(&wav_path);
+                let norm_sq: f32 = embedding.iter().map(|x| x * x).sum();
+                if norm_sq > 0.1 {
+                    return self.storage.save_self_voiceprint_embedding(&embedding);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&wav_path);
+        self.storage
+            .enroll_self_voiceprint("Kalibriertes Stimmprofil in backtext")
+    }
+
+    pub async fn check_for_updates(&self) -> Result<UpdateCheckResult> {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let resp = self
+            .ai
+            .http_client()
+            .get("https://api.github.com/repos/LukaAsceric/backtext/releases/latest")
+            .header("User-Agent", "backtext-desktop")
+            .timeout(std::time::Duration::from_secs(6))
+            .send()
+            .await;
+
+        if let Ok(r) = resp {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    let latest = v["tag_name"]
+                        .as_str()
+                        .unwrap_or(&current)
+                        .trim_start_matches('v')
+                        .to_string();
+                    let url = v["html_url"]
+                        .as_str()
+                        .unwrap_or("https://github.com/LukaAsceric/backtext/releases")
+                        .to_string();
+                    let notes = v["body"].as_str().unwrap_or("").to_string();
+                    let update_available = latest != current && !latest.is_empty();
+                    return Ok(UpdateCheckResult {
+                        current_version: current,
+                        latest_version: latest,
+                        update_available,
+                        release_url: url,
+                        release_notes: notes,
+                    });
+                }
+            }
+        }
+
+        Ok(UpdateCheckResult {
+            current_version: current.clone(),
+            latest_version: current,
+            update_available: false,
+            release_url: "https://github.com/LukaAsceric/backtext/releases".into(),
+            release_notes: "Kein neueres Release gefunden (oder privates Repo ohne Token).".into(),
+        })
     }
 
     pub fn toggle_action_item(&self, meeting_id: &str, action_id: &str) -> Result<MeetingDetail> {
@@ -508,6 +844,22 @@ impl AppController {
     pub async fn dispatch_rpc(&self, cmd: &str, args: Value) -> Result<Value> {
         match cmd {
             "get_bootstrap" => Ok(serde_json::to_value(self.bootstrap().await?)?),
+            "get_daemon_telemetry" => Ok(serde_json::to_value(self.get_telemetry())?),
+            "check_permissions" => Ok(serde_json::to_value(self.sensors.check_permissions().await)?),
+            "request_permission" => {
+                let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("screen");
+                Ok(serde_json::to_value(self.sensors.request_permission(kind).await?)?)
+            }
+            "open_permission_settings" => {
+                let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("screen");
+                self.sensors.open_permission_settings(kind).await?;
+                Ok(serde_json::json!({ "ok": true }))
+            }
+            "clear_demo_data" => {
+                let removed = self.storage.clear_demo_data()?;
+                self.update_telemetry(|t| t.demo_data_present = false);
+                Ok(serde_json::json!({ "removed": removed }))
+            }
             "set_capture_pause" => {
                 let minutes = args.get("minutes").and_then(|v| v.as_i64());
                 let reason = args.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -534,6 +886,13 @@ impl AppController {
             "simulate_live_meeting_activity" => {
                 let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
                 Ok(serde_json::to_value(self.simulate_live_meeting_activity(id)?)?)
+            }
+            "capture_real_dual_audio_turn" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let secs = args.get("durationSecs").and_then(|v| v.as_u64()).unwrap_or(6);
+                Ok(serde_json::to_value(
+                    self.capture_real_dual_audio_turn(id, secs).await?,
+                )?)
             }
             "stop_and_summarize_meeting" => {
                 let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
@@ -571,7 +930,7 @@ impl AppController {
                 let slug = args.get("recipeSlug").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 let reply = self
                     .ai
-                    .run_chat_or_recipe(&self.storage, mid, input, slug)
+                    .run_chat_or_recipe_streaming(&self.storage, Some(&self.events), mid, input, slug)
                     .await?;
                 Ok(serde_json::to_value(reply)?)
             }
@@ -631,14 +990,98 @@ impl AppController {
                 Ok(serde_json::to_value(self.storage.get_user_profile()?)?)
             }
             "enroll_self_voiceprint" => {
-                let phrase = args
-                    .get("samplePhrase")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Hallo, hier spricht Luka in backtext.");
+                let secs = args.get("durationSecs").and_then(|v| v.as_u64()).unwrap_or(5);
                 Ok(serde_json::to_value(
-                    self.storage.enroll_self_voiceprint(phrase)?,
+                    self.calibrate_real_voiceprint(secs).await?,
                 )?)
             }
+            "set_api_key" => {
+                let provider = args.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+                let value = args.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+                let key_name = match provider {
+                    "openai" => KEY_OPENAI,
+                    "anthropic" => KEY_ANTHROPIC,
+                    "gemini" => KEY_GEMINI,
+                    "deepgram" => KEY_DEEPGRAM,
+                    "groq" => KEY_GROQ,
+                    _ => anyhow::bail!("Unknown API key provider: {provider}"),
+                };
+                self.storage.secrets().set_secret(key_name, value)?;
+                Ok(serde_json::to_value(self.storage.get_ai_settings()?)?)
+            }
+            "delete_api_key" => {
+                let provider = args.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+                let key_name = match provider {
+                    "openai" => KEY_OPENAI,
+                    "anthropic" => KEY_ANTHROPIC,
+                    "gemini" => KEY_GEMINI,
+                    "deepgram" => KEY_DEEPGRAM,
+                    "groq" => KEY_GROQ,
+                    _ => anyhow::bail!("Unknown API key provider: {provider}"),
+                };
+                self.storage.secrets().delete_secret(key_name)?;
+                Ok(serde_json::to_value(self.storage.get_ai_settings()?)?)
+            }
+            "test_provider_connection" => {
+                let provider = args.get("provider").and_then(|v| v.as_str()).unwrap_or("ollama");
+                let settings = self.storage.get_ai_settings()?;
+                let res = test_provider_connection(
+                    self.ai.http_client(),
+                    provider,
+                    &settings,
+                    self.storage.secrets(),
+                )
+                .await;
+                Ok(serde_json::to_value(res)?)
+            }
+            "list_ollama_models" => {
+                let settings = self.storage.get_ai_settings()?;
+                let models = list_ollama_models(self.ai.http_client(), &settings.ollama_url).await;
+                Ok(serde_json::to_value(models)?)
+            }
+            "list_whisper_models" => Ok(serde_json::to_value(list_whisper_models())?),
+            "download_whisper_model" => {
+                let model_id = args
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ggml-base");
+                let info =
+                    download_whisper_model(self.ai.http_client(), model_id, &self.events).await?;
+                Ok(serde_json::to_value(info)?)
+            }
+            "sync_calendars" => {
+                let imported = self.sync_calendars().await?;
+                Ok(serde_json::json!({
+                    "imported": imported,
+                    "meetings": self.storage.list_meetings()?,
+                    "feeds": self.storage.list_calendar_feeds()?
+                }))
+            }
+            "add_calendar_feed" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Mein Kalender");
+                let ics_url = args.get("icsUrl").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !ics_url.is_empty() {
+                    let mut feeds = self.storage.list_calendar_feeds()?;
+                    feeds.push(CalendarFeedConfig {
+                        id: format!("calfeed_{}", uuid::Uuid::new_v4().simple()),
+                        name: name.to_string(),
+                        ics_url: ics_url.to_string(),
+                        enabled: true,
+                        last_synced_at: None,
+                    });
+                    self.storage.save_calendar_feeds(&feeds)?;
+                }
+                let _ = self.sync_calendars().await;
+                Ok(serde_json::to_value(self.storage.list_calendar_feeds()?)?)
+            }
+            "delete_calendar_feed" => {
+                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let mut feeds = self.storage.list_calendar_feeds()?;
+                feeds.retain(|f| f.id != id);
+                self.storage.save_calendar_feeds(&feeds)?;
+                Ok(serde_json::to_value(feeds)?)
+            }
+            "check_for_updates" => Ok(serde_json::to_value(self.check_for_updates().await?)?),
             "upsert_vocabulary" => {
                 let term = args.get("term").and_then(|v| v.as_str()).unwrap_or("").trim();
                 let hint = args.get("phoneticHint").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());

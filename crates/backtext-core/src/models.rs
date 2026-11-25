@@ -477,27 +477,51 @@ pub struct McpAuditEntry {
 pub struct AiProviderSettings {
     pub stt_provider: String,
     pub stt_model: String,
+    #[serde(default = "default_whisper_model_id")]
+    pub whisper_model_id: String,
     pub llm_provider: String,
     pub llm_model: String,
+    #[serde(default = "default_embedding_provider")]
+    pub embedding_provider: String,
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
     pub ollama_url: String,
     pub openai_api_key_set: bool,
     pub anthropic_api_key_set: bool,
     pub gemini_api_key_set: bool,
     pub deepgram_api_key_set: bool,
+    #[serde(default)]
+    pub groq_api_key_set: bool,
+}
+
+fn default_whisper_model_id() -> String {
+    "ggml-large-v3-turbo-q5_0".to_string()
+}
+
+fn default_embedding_provider() -> String {
+    "local_hybrid".to_string()
+}
+
+fn default_embedding_model() -> String {
+    "nomic-embed-text".to_string()
 }
 
 impl Default for AiProviderSettings {
     fn default() -> Self {
         Self {
             stt_provider: "local_whisper".to_string(),
-            stt_model: "whisper-large-v3-turbo (CoreML / Metal)".to_string(),
+            stt_model: "whisper-large-v3-turbo (Apple Metal)".to_string(),
+            whisper_model_id: default_whisper_model_id(),
             llm_provider: "hybrid_auto".to_string(),
-            llm_model: "qwen3:8b / claude-sonnet-4".to_string(),
+            llm_model: "claude-sonnet-4-20250514".to_string(),
+            embedding_provider: default_embedding_provider(),
+            embedding_model: default_embedding_model(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             openai_api_key_set: false,
             anthropic_api_key_set: false,
             gemini_api_key_set: false,
             deepgram_api_key_set: false,
+            groq_api_key_set: false,
         }
     }
 }
@@ -513,3 +537,54 @@ pub struct MemorySearchHit {
     pub project_tag: Option<String>,
     pub metadata: serde_json::Value,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarFeedConfig {
+    pub id: String,
+    pub name: String,
+    pub ics_url: String,
+    pub enabled: bool,
+    pub last_synced_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhisperModelInfo {
+    pub id: String,
+    pub name: String,
+    pub size_mb: u32,
+    pub language_support: String,
+    pub download_url: String,
+    pub installed: bool,
+    pub local_path: Option<String>,
+    pub downloading: bool,
+    pub progress_pct: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonTelemetry {
+    pub loop_running: bool,
+    pub poll_interval_secs: u64,
+    pub ticks_processed: u64,
+    pub snapshots_accepted: u64,
+    pub snapshots_filtered: u64,
+    pub last_window_app: Option<String>,
+    pub last_window_title: Option<String>,
+    pub last_tick_at: Option<DateTime<Utc>>,
+    pub meeting_detector_phase: String,
+    pub db_encrypted: bool,
+    pub keychain_backend: String,
+    pub autostart_enabled: bool,
+    pub global_shortcut: String,
+    pub demo_data_present: bool,
+    pub whisper_cli_detected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub release_url: String,
+    pub release_notes: String,
+}
+

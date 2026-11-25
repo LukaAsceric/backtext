@@ -13,4 +13,5 @@ chrono.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
 sha2.workspace = true
+reqwest.workspace = true
 backtext-core.workspace = true
