@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Local runtime vaults & sockets
+.backtext-data/
+*.db
+*.db-shm
+*.db-wal
+*.sock
+
+# OS & Editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log

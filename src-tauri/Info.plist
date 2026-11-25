@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>backtext nutzt dein Mikrofon ausschließlich während erkannter oder gestarteter Meetings, um deine eigene Stimme ohne Meeting-Bot lokal zu transkribieren.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>backtext nutzt ScreenCaptureKit für bot-freies System-Audio in Meetings, geteilte Präsentationsfolien und lokale Texterkennung aktiver Arbeitsfenster.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>backtext gleicht anstehende Termine und Teilnehmerlisten ab, um Meetings automatisch zuzuordnen und Vorbereitungs-Briefings zu erstellen.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>backtext liest den aktiven Fenstertitel und Browser-Tab (ohne private Fenster), um relevanten Arbeitskontext für deine KI-Agenten bereitzustellen.</string>
+</dict>
+</plist>

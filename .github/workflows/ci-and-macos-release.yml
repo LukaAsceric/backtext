@@ -1,0 +1,86 @@
+name: CI & macOS Bundle
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  verify-rust-and-ui:
+    name: Rust Workspace & Frontend Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux Tauri WebKitGTK build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config build-essential libsqlite3-dev libssl-dev \
+            libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Frontend install, typecheck, Vitest & Vite build
+        run: |
+          pnpm install
+          pnpm run typecheck
+          pnpm run test
+          pnpm run build
+
+      - name: Run full Cargo workspace test suite
+        run: cargo test --workspace
+
+  build-macos-bundle:
+    name: Build macOS .app & .dmg (Apple Silicon)
+    runs-on: macos-15
+    needs: verify-rust-and-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies & build UI
+        run: |
+          pnpm install
+          pnpm run build
+
+      - name: Build standalone backtext-mcp stdio binary
+        run: cargo build --release -p backtext-mcp --bin backtext-mcp
+
+      - name: Build macOS Tauri v2 .app and .dmg bundle
+        run: pnpm tauri build --bundles app,dmg
+
+      - name: Upload macOS .dmg, .app & backtext-mcp artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtext-macos-arm64
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app
+            target/release/backtext-mcp

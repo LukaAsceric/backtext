@@ -1,0 +1,16 @@
+[package]
+name = "backtext-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+backtext-core.workspace = true
+backtext-storage.workspace = true

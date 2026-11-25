@@ -1,0 +1,658 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  Calendar,
+  FileText,
+  Layers,
+  Users,
+  Sparkles,
+  ShieldCheck,
+  Sliders,
+  Sun,
+  Moon,
+  Command,
+} from 'lucide-react';
+import type {
+  AiProviderSettings,
+  BootstrapPayload,
+  CaptureStatus,
+  ChatMessage,
+  Language,
+  McpAuditEntry,
+  McpGovernancePolicy,
+  MeetingDetail,
+  MemorySearchHit,
+  PrivacyRule,
+  Recipe,
+  ScrubberPreview,
+  UserProfile,
+  VocabularyEntry,
+  LearnedPreference,
+} from './types';
+import { callRpc, isTauriRuntime, toggleNativeHoverOverlay } from './lib/ipc';
+import { t } from './lib/i18n';
+import { TodayView } from './views/TodayView';
+import { MeetingWorkspace } from './views/MeetingWorkspace';
+import { ContextTimelineView } from './views/ContextTimelineView';
+import { PeopleAndProjectsView } from './views/PeopleAndProjectsView';
+import { RecipesStudioView } from './views/RecipesStudioView';
+import { McpAndPrivacyView } from './views/McpAndPrivacyView';
+import { PersonalizationView } from './views/PersonalizationView';
+import { HoverModal } from './components/HoverModal';
+
+type NavKey =
+  | 'today'
+  | 'meetings'
+  | 'context'
+  | 'people'
+  | 'recipes'
+  | 'mcp'
+  | 'personalization';
+
+export const App: React.FC = () => {
+  const [data, setData] = useState<BootstrapPayload | null>(null);
+  const [activeNav, setActiveNav] = useState<NavKey>('today');
+  const [selectedMeeting, setSelectedMeeting] = useState<MeetingDetail | null>(null);
+  const [globalMessages, setGlobalMessages] = useState<ChatMessage[]>([]);
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
+    (localStorage.getItem('backtext-theme') as 'light' | 'dark') || 'light',
+  );
+
+  const isHoverStandalone =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('window') === 'hover';
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('backtext-theme', theme);
+  }, [theme]);
+
+  const refreshBootstrap = useCallback(async (preferredMeetingId?: string) => {
+    try {
+      const boot = await callRpc<BootstrapPayload>('get_bootstrap');
+      setData(boot);
+      const globalMsgs = await callRpc<ChatMessage[]>('get_chat_messages', {
+        threadId: 'global:workspace',
+      });
+      setGlobalMessages(globalMsgs);
+
+      const targetId =
+        preferredMeetingId ??
+        selectedMeeting?.meeting.id ??
+        boot.meetings.find((m) => m.status === 'live')?.id ??
+        boot.meetings.find((m) => m.status === 'completed')?.id ??
+        boot.meetings[0]?.id;
+      if (targetId) {
+        const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+          meetingId: targetId,
+        });
+        setSelectedMeeting(detail);
+      }
+      setErrorMsg(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    }
+  }, [selectedMeeting?.meeting.id]);
+
+  useEffect(() => {
+    refreshBootstrap();
+  }, []);
+
+  // Global keyboard shortcut (Alt+Space / Escape) for Hover Assistant
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey && e.code === 'Space') {
+        e.preventDefault();
+        setHoverOpen((prev) => !prev);
+      } else if (e.key === 'Escape') {
+        setHoverOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  if (!data) {
+    return (
+      <div style={{ padding: 48, fontFamily: 'var(--font-sans)' }}>
+        <strong>backtext</strong> wird initialisiert…
+        {errorMsg && (
+          <div style={{ marginTop: 12, color: 'var(--accent-terracotta)' }}>{errorMsg}</div>
+        )}
+      </div>
+    );
+  }
+
+  const lang: Language = data.profile.ui_language ?? 'de';
+  const status: CaptureStatus = data.capture_status;
+
+  const handlePause = async (minutes: number | null) => {
+    const next = await callRpc<CaptureStatus>('set_capture_pause', { minutes });
+    setData((prev) => (prev ? { ...prev, capture_status: next } : prev));
+  };
+
+  const handleStartAdhocMeeting = async () => {
+    setBusy(true);
+    try {
+      const detail = await callRpc<MeetingDetail>('start_live_meeting', {
+        title:
+          lang === 'de'
+            ? 'Ad-hoc Produkt- & Agenten-Sync'
+            : 'Ad-hoc Product & Agent Sync',
+        detectedApp: 'Google Meet (ScreenCaptureKit Dual-Audio)',
+      });
+      setSelectedMeeting(detail);
+      setActiveNav('meetings');
+      await refreshBootstrap(detail.meeting.id);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleStartScheduledMeeting = async (meetingId: string) => {
+    setBusy(true);
+    try {
+      const detail = await callRpc<MeetingDetail>('start_live_meeting', {
+        existingMeetingId: meetingId,
+      });
+      setSelectedMeeting(detail);
+      setActiveNav('meetings');
+      await refreshBootstrap(detail.meeting.id);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRunGlobalChat = async (input: string, recipeSlug?: string) => {
+    setBusy(true);
+    try {
+      await callRpc<ChatMessage>('run_chat_or_recipe', {
+        input,
+        recipeSlug,
+      });
+      const updated = await callRpc<ChatMessage[]>('get_chat_messages', {
+        threadId: 'global:workspace',
+      });
+      setGlobalMessages(updated);
+      const recipes = await callRpc<BootstrapPayload>('get_bootstrap');
+      setData(recipes);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (isHoverStandalone) {
+    return (
+      <HoverModal
+        open
+        standaloneWindow
+        lang={lang}
+        frontSnapshot={data.snapshots[0]}
+        recipes={data.recipes}
+        messages={globalMessages}
+        busy={busy}
+        onClose={() => {}}
+        onExecute={handleRunGlobalChat}
+      />
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      {/* Left Navigation Rail */}
+      <aside className="sidebar">
+        <div className="brand-row">
+          <div className="brand-mark">
+            <span className="brand-glyph">bt</span>
+            <span>backtext</span>
+          </div>
+          <button
+            type="button"
+            id="theme-toggle-btn"
+            className="mini-btn"
+            onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
+            title="Theme wechseln"
+          >
+            {theme === 'light' ? <Moon size={12} /> : <Sun size={12} />}
+          </button>
+        </div>
+
+        {/* Littlebird-inspired Live Context & Pause Control Pill */}
+        <div className="status-box">
+          <div className="status-indicator-row">
+            <div className="status-dot-label">
+              <span
+                className={`status-dot ${
+                  status.mode === 'recording_meeting'
+                    ? 'recording'
+                    : status.mode === 'paused'
+                      ? 'paused'
+                      : 'active'
+                }`}
+              />
+              <span>
+                {status.mode === 'recording_meeting'
+                  ? t(lang, 'statusRecording')
+                  : status.mode === 'paused'
+                    ? t(lang, 'statusPaused')
+                    : t(lang, 'statusActive')}
+              </span>
+            </div>
+            <span className="mono-ts">MCP :{data.mcp_policy.http_port}</span>
+          </div>
+
+          <div className="pause-pills">
+            {status.mode === 'paused' ? (
+              <button
+                type="button"
+                id="resume-capture-btn"
+                className="mini-btn active-choice"
+                onClick={() => handlePause(null)}
+              >
+                {t(lang, 'resume')}
+              </button>
+            ) : (
+              <>
+                <button type="button" className="mini-btn" onClick={() => handlePause(15)}>
+                  Pause 15m
+                </button>
+                <button type="button" className="mini-btn" onClick={() => handlePause(60)}>
+                  Pause 1h
+                </button>
+                <button type="button" className="mini-btn" onClick={() => handlePause(0)}>
+                  Pause ∞
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="nav-section-label">{t(lang, 'navWorkspace')}</div>
+        <nav className="nav-list">
+          <button
+            type="button"
+            id="nav-today"
+            className={`nav-item ${activeNav === 'today' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('today')}
+          >
+            <span className="nav-item-left">
+              <Calendar size={15} />
+              {t(lang, 'today')}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-meetings"
+            className={`nav-item ${activeNav === 'meetings' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('meetings')}
+          >
+            <span className="nav-item-left">
+              <FileText size={15} />
+              {t(lang, 'meetings')}
+            </span>
+            <span className="nav-badge">{data.meetings.length}</span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-context"
+            className={`nav-item ${activeNav === 'context' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('context')}
+          >
+            <span className="nav-item-left">
+              <Layers size={15} />
+              {t(lang, 'context')}
+            </span>
+            <span className="nav-badge">{data.episodes.length}</span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-people"
+            className={`nav-item ${activeNav === 'people' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('people')}
+          >
+            <span className="nav-item-left">
+              <Users size={15} />
+              {t(lang, 'people')}
+            </span>
+            <span className="nav-badge">{data.persons.length}</span>
+          </button>
+        </nav>
+
+        <div className="nav-section-label">{t(lang, 'navSystem')}</div>
+        <nav className="nav-list">
+          <button
+            type="button"
+            id="nav-recipes"
+            className={`nav-item ${activeNav === 'recipes' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('recipes')}
+          >
+            <span className="nav-item-left">
+              <Sparkles size={15} />
+              {t(lang, 'recipes')}
+            </span>
+            <span className="nav-badge">{data.recipes.length}</span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-mcp"
+            className={`nav-item ${activeNav === 'mcp' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('mcp')}
+          >
+            <span className="nav-item-left">
+              <ShieldCheck size={15} />
+              {t(lang, 'mcpPrivacy')}
+            </span>
+            <span className="nav-badge">10</span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-personalization"
+            className={`nav-item ${activeNav === 'personalization' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('personalization')}
+          >
+            <span className="nav-item-left">
+              <Sliders size={15} />
+              {t(lang, 'personalization')}
+            </span>
+            <span className="nav-badge">{lang.toUpperCase()}</span>
+          </button>
+        </nav>
+
+        <div className="sidebar-footer">
+          <button
+            type="button"
+            id="open-hover-assistant-btn"
+            className="hover-launch-btn"
+            onClick={async () => {
+              if (isTauriRuntime()) {
+                await toggleNativeHoverOverlay();
+              } else {
+                setHoverOpen(true);
+              }
+            }}
+          >
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+              <Command size={13} />
+              {t(lang, 'hoverBtn')}
+            </span>
+            <span className="kbd">⌥ Space</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main View Canvas */}
+      <main className="workspace-main">
+        {activeNav === 'today' && (
+          <TodayView
+            lang={lang}
+            meetings={data.meetings}
+            episodes={data.episodes}
+            recipes={data.recipes}
+            globalMessages={globalMessages}
+            chatBusy={busy}
+            onStartAdhocMeeting={handleStartAdhocMeeting}
+            onStartScheduledMeeting={handleStartScheduledMeeting}
+            onOpenMeeting={async (id) => {
+              const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+                meetingId: id,
+              });
+              setSelectedMeeting(detail);
+              setActiveNav('meetings');
+            }}
+            onSearchMemory={(query) =>
+              callRpc<MemorySearchHit[]>('search_memory', { query })
+            }
+            onRunGlobalChat={handleRunGlobalChat}
+          />
+        )}
+
+        {activeNav === 'meetings' && (
+          <MeetingWorkspace
+            lang={lang}
+            meetings={data.meetings}
+            selectedDetail={selectedMeeting}
+            recipes={data.recipes}
+            busy={busy}
+            onSelectMeeting={async (id) => {
+              const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+                meetingId: id,
+              });
+              setSelectedMeeting(detail);
+            }}
+            onStartAdhocMeeting={handleStartAdhocMeeting}
+            onSimulateLiveStep={async (meetingId) => {
+              setBusy(true);
+              try {
+                const detail = await callRpc<MeetingDetail>('simulate_live_meeting_activity', {
+                  meetingId,
+                });
+                setSelectedMeeting(detail);
+                await refreshBootstrap(meetingId);
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onStopMeeting={async (meetingId) => {
+              setBusy(true);
+              try {
+                const detail = await callRpc<MeetingDetail>('stop_and_summarize_meeting', {
+                  meetingId,
+                });
+                setSelectedMeeting(detail);
+                await refreshBootstrap(meetingId);
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onSaveUserNotes={async (meetingId, rawNotes) => {
+              await callRpc('update_meeting_notes', { meetingId, rawNotes });
+              await refreshBootstrap(meetingId);
+            }}
+            onEnhanceMeeting={async (meetingId) => {
+              setBusy(true);
+              try {
+                await callRpc('enhance_meeting', { meetingId });
+                await refreshBootstrap(meetingId);
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onToggleActionItem={async (meetingId, actionId) => {
+              const detail = await callRpc<MeetingDetail>('toggle_action_item', {
+                meetingId,
+                actionId,
+              });
+              setSelectedMeeting(detail);
+            }}
+            onAssignSpeaker={async (meetingId, speakerLabel, personName) => {
+              const detail = await callRpc<MeetingDetail>('assign_speaker', {
+                meetingId,
+                speakerLabel,
+                personName,
+              });
+              setSelectedMeeting(detail);
+              await refreshBootstrap(meetingId);
+            }}
+            onRunMeetingChat={async (meetingId, input, recipeSlug) => {
+              setBusy(true);
+              try {
+                await callRpc<ChatMessage>('run_chat_or_recipe', {
+                  meetingId,
+                  input,
+                  recipeSlug,
+                });
+                await refreshBootstrap(meetingId);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
+
+        {activeNav === 'context' && (
+          <ContextTimelineView
+            lang={lang}
+            episodes={data.episodes}
+            snapshots={data.snapshots}
+            clipboard={data.clipboard}
+            onPurgeRecent={async (minutes) => {
+              await callRpc('purge_recent_context', { minutes });
+              await refreshBootstrap();
+            }}
+            onCaptureSample={async (appName, windowTitle, browserUrl, visibleText, clipboardText) => {
+              const res = await callRpc('capture_ambient_sample', {
+                appName,
+                windowTitle,
+                browserUrl,
+                visibleText,
+                clipboardText,
+              });
+              await refreshBootstrap();
+              return res;
+            }}
+            onPreviewScrubber={(appName, windowTitle, browserUrl, rawText) =>
+              callRpc<ScrubberPreview>('preview_privacy_filter', {
+                appName,
+                windowTitle,
+                browserUrl,
+                rawText,
+              })
+            }
+          />
+        )}
+
+        {activeNav === 'people' && (
+          <PeopleAndProjectsView
+            lang={lang}
+            persons={data.persons}
+            projects={data.profile.active_projects}
+            meetings={data.meetings}
+            episodes={data.episodes}
+          />
+        )}
+
+        {activeNav === 'recipes' && (
+          <RecipesStudioView
+            lang={lang}
+            recipes={data.recipes}
+            onSaveRecipe={async (recipe: Recipe) => {
+              const recipes = await callRpc<Recipe[]>('save_recipe', { recipe });
+              setData((prev) => (prev ? { ...prev, recipes } : prev));
+            }}
+            onDeleteRecipe={async (id: string) => {
+              const recipes = await callRpc<Recipe[]>('delete_recipe', { id });
+              setData((prev) => (prev ? { ...prev, recipes } : prev));
+            }}
+            onRunRecipeInToday={async (slug: string) => {
+              setActiveNav('today');
+              await handleRunGlobalChat(slug, slug);
+            }}
+          />
+        )}
+
+        {activeNav === 'mcp' && (
+          <McpAndPrivacyView
+            lang={lang}
+            policy={data.mcp_policy}
+            snippets={data.mcp_snippets}
+            auditLogs={data.mcp_audit_logs}
+            privacyRules={data.privacy_rules}
+            onSavePolicy={async (policy: McpGovernancePolicy) => {
+              const saved = await callRpc<McpGovernancePolicy>('save_mcp_policy', { policy });
+              setData((prev) => (prev ? { ...prev, mcp_policy: saved } : prev));
+            }}
+            onInvokeInspector={async (toolName, args) => {
+              const res = await callRpc<{ result: unknown; audit_logs: McpAuditEntry[] }>(
+                'invoke_mcp_inspector',
+                { toolName, arguments: args, clientName: 'backtext-ui-inspector' },
+              );
+              setData((prev) =>
+                prev ? { ...prev, mcp_audit_logs: res.audit_logs } : prev,
+              );
+              await refreshBootstrap();
+              return res;
+            }}
+            onTogglePrivacyRule={async (id, isEnabled) => {
+              const rules = await callRpc<PrivacyRule[]>('toggle_privacy_rule', { id, isEnabled });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
+            }}
+            onAddPrivacyRule={async (kind, pattern, description) => {
+              const rules = await callRpc<PrivacyRule[]>('upsert_privacy_rule', {
+                kind,
+                pattern,
+                description,
+              });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
+            }}
+            onDeletePrivacyRule={async (id) => {
+              const rules = await callRpc<PrivacyRule[]>('delete_privacy_rule', { id });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
+            }}
+          />
+        )}
+
+        {activeNav === 'personalization' && (
+          <PersonalizationView
+            lang={lang}
+            profile={data.profile}
+            vocabulary={data.vocabulary}
+            learnedPreferences={data.learned_preferences}
+            aiSettings={data.ai_settings}
+            onSaveProfile={async (profile: UserProfile) => {
+              const saved = await callRpc<UserProfile>('save_user_profile', { profile });
+              setData((prev) => (prev ? { ...prev, profile: saved } : prev));
+            }}
+            onEnrollSelfVoiceprint={async (samplePhrase: string) => {
+              const saved = await callRpc<UserProfile>('enroll_self_voiceprint', { samplePhrase });
+              setData((prev) => (prev ? { ...prev, profile: saved } : prev));
+            }}
+            onAddVocabulary={async (term, phoneticHint, category, projectTag) => {
+              const vocabulary = await callRpc<VocabularyEntry[]>('upsert_vocabulary', {
+                term,
+                phoneticHint,
+                category,
+                projectTag,
+              });
+              setData((prev) => (prev ? { ...prev, vocabulary } : prev));
+            }}
+            onDeleteVocabulary={async (id) => {
+              const vocabulary = await callRpc<VocabularyEntry[]>('delete_vocabulary', { id });
+              setData((prev) => (prev ? { ...prev, vocabulary } : prev));
+            }}
+            onToggleLearnedPref={async (id, isActive) => {
+              const learned_preferences = await callRpc<LearnedPreference[]>(
+                'toggle_learned_preference',
+                { id, isActive },
+              );
+              setData((prev) => (prev ? { ...prev, learned_preferences } : prev));
+            }}
+            onSaveAiSettings={async (settings: AiProviderSettings) => {
+              const ai_settings = await callRpc<AiProviderSettings>('save_ai_settings', {
+                settings,
+              });
+              setData((prev) => (prev ? { ...prev, ai_settings } : prev));
+            }}
+          />
+        )}
+      </main>
+
+      <HoverModal
+        open={hoverOpen}
+        lang={lang}
+        frontSnapshot={data.snapshots[0]}
+        recipes={data.recipes}
+        messages={globalMessages}
+        busy={busy}
+        onClose={() => setHoverOpen(false)}
+        onExecute={handleRunGlobalChat}
+      />
+    </div>
+  );
+};
