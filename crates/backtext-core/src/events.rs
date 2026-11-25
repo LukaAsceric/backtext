@@ -43,6 +43,17 @@ pub enum BacktextEvent {
         installed: bool,
         error: Option<String>,
     },
+    RecordingAudioLevel {
+        meeting_id: String,
+        mic_level: f32,
+        system_level: f32,
+        mic_active: bool,
+        system_active: bool,
+        elapsed_secs: u64,
+        stt_ready: bool,
+        stt_status: String,
+        warning: Option<String>,
+    },
 }
 
 #[derive(Clone)]

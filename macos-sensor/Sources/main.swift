@@ -18,10 +18,19 @@ struct JSONOut {
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: []),
            let str = String(data: data, encoding: .utf8) {
             print(str)
+            fflush(stdout)
         } else {
             print("{}")
+            fflush(stdout)
         }
     }
+}
+
+func jsonNullable(_ value: String?) -> Any {
+    if let v = value {
+        return v
+    }
+    return NSNull()
 }
 
 func isDefaultMicRunning() -> Bool {
@@ -207,7 +216,7 @@ func handlePermissions() {
     let sessionDict = CGSessionCopyCurrentDictionary() as? [String: Any]
     let screenLocked = (sessionDict?["CGSSessionScreenIsLocked"] as? Bool) ?? false
 
-    JSONOut.emit([
+    let payload: [String: Any] = [
         "platform": "macos",
         "screen_capture_granted": sck,
         "microphone_granted": mic,
@@ -215,7 +224,8 @@ func handlePermissions() {
         "calendar_granted": cal,
         "idle_seconds": Int(idleSecs),
         "screen_locked": screenLocked
-    ])
+    ]
+    JSONOut.emit(payload)
 }
 
 func handleOpenSettings(_ kind: String) {
@@ -319,19 +329,20 @@ func handleActiveWindow() {
         }
     }
 
-    JSONOut.emit([
+    let payload: [String: Any] = [
         "window_id": Int(pid),
         "app_bundle_id": bundleID,
         "app_name": appName,
         "window_title": windowTitle,
-        "browser_url": browserURL as Any,
-        "visible_text": secureFocused || isPrivate ? "" : (joinedText.isEmpty ? "\(appName) — \(windowTitle)" : joinedText),
+        "browser_url": jsonNullable(browserURL),
+        "visible_text": secureFocused || isPrivate ? "" : (joinedText.isEmpty ? "" : joinedText),
         "is_private_browsing": isPrivate,
         "is_secure_field_focused": secureFocused,
-        "detected_screen_share_presenter": presenter as Any,
-        "detected_active_speaker_tile": activeSpeaker as Any,
+        "detected_screen_share_presenter": jsonNullable(presenter),
+        "detected_active_speaker_tile": jsonNullable(activeSpeaker),
         "mic_running": isDefaultMicRunning()
-    ])
+    ]
+    JSONOut.emit(payload)
 }
 
 @available(macOS 14.0, *)
@@ -376,13 +387,14 @@ func handleCaptureWindowOCR(includeImage: Bool) {
     let ocr = runVisionOCR(on: img)
     let dataURL = includeImage ? jpegBase64(from: img) : nil
 
-    JSONOut.emit([
+    let payload: [String: Any] = [
         "ok": true,
         "dhash_u64": dhash,
         "dhash_hex": String(format: "%016llx", dhash),
         "ocr_text": ocr,
-        "image_data_url": dataURL as Any
-    ])
+        "image_data_url": jsonNullable(dataURL)
+    ]
+    JSONOut.emit(payload)
 }
 
 func handleClipboard() {
@@ -395,12 +407,13 @@ func handleClipboard() {
         || types.contains("com.bitwarden.desktop")
     let text = concealed ? "" : (pb.string(forType: .string) ?? "")
     let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "macOS"
-    JSONOut.emit([
+    let payload: [String: Any] = [
         "change_count": pb.changeCount,
         "source_app": front,
         "text": text,
         "is_concealed": concealed
-    ])
+    ]
+    JSONOut.emit(payload)
 }
 
 func extractConferenceURL(from texts: [String?]) -> String? {
@@ -452,7 +465,7 @@ func handleCalendar() {
             "title": ev.title ?? "Meeting",
             "starts_at": iso.string(from: ev.startDate),
             "ends_at": iso.string(from: ev.endDate),
-            "conference_url": confURL as Any,
+            "conference_url": jsonNullable(confURL),
             "attendees": attendees
         ]
     }
@@ -460,11 +473,12 @@ func handleCalendar() {
 }
 
 func writeMono16kWav(samples: [Int16], to path: String) throws {
+    let sampleCount: Int = samples.count
     var data = Data()
     let sampleRate: UInt32 = 16000
     let numChannels: UInt16 = 1
     let bitsPerSample: UInt16 = 16
-    let dataSize = UInt32(samples.count * 2)
+    let dataSize = UInt32(sampleCount * 2)
     let chunkSize = 36 + dataSize
     let byteRate = sampleRate * UInt32(numChannels) * UInt32(bitsPerSample / 8)
     let blockAlign = numChannels * (bitsPerSample / 8)
@@ -487,85 +501,177 @@ func writeMono16kWav(samples: [Int16], to path: String) throws {
     appendLE(bitsPerSample)
     data.append("data".data(using: .ascii)!)
     appendLE(dataSize)
-    samples.withUnsafeBufferPointer { buf in
-        data.append(UnsafeBufferPointer(start: UnsafeRawPointer(buf.baseAddress!).assumingMemoryBound(to: UInt8.self), count: samples.count * 2))
+    if sampleCount > 0 {
+        samples.withUnsafeBufferPointer { buf in
+            if let base = buf.baseAddress {
+                data.append(UnsafeBufferPointer(start: UnsafeRawPointer(base).assumingMemoryBound(to: UInt8.self), count: sampleCount * 2))
+            }
+        }
     }
     try data.write(to: URL(fileURLWithPath: path))
 }
 
-func recordMicrophoneSamples(durationSecs: Double) -> [Int16] {
-    let engine = AVAudioEngine()
-    let input = engine.inputNode
-    let inputFmt = input.outputFormat(forBus: 0)
-    guard let targetFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
-          let converter = AVAudioConverter(from: inputFmt, to: targetFmt) else {
-        return []
+func computeRmsNormalized(_ samples: [Int16]) -> Double {
+    let n: Int = samples.count
+    if n == 0 { return 0.0 }
+    var sumSq: Double = 0.0
+    for s in samples {
+        let f = Double(s) / 32768.0
+        sumSq += f * f
     }
+    let rms = sqrt(sumSq / Double(n))
+    return min(1.0, rms * 3.5)
+}
 
-    var collected: [Int16] = []
-    let lock = NSLock()
+final class ContinuousMicRecorder {
+    private let engine = AVAudioEngine()
+    private let lock = NSLock()
+    private var buffer: [Int16] = []
+    private var latestRms: Double = 0.0
+    private(set) var isRunning: Bool = false
+    private(set) var errorMessage: String? = nil
 
-    input.installTap(onBus: 0, bufferSize: 2048, format: inputFmt) { buffer, _ in
-        let ratio = 16000.0 / max(1.0, inputFmt.sampleRate)
-        let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
-        guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFmt, frameCapacity: outFrames) else { return }
-        var consumed = false
-        var err: NSError?
-        converter.convert(to: outBuf, error: &err) { _, outStatus in
-            if consumed {
-                outStatus.pointee = .noDataNow
-                return nil
+    func start() {
+        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
+        if auth == .denied || auth == .restricted {
+            errorMessage = "Mikrofon-Berechtigung in macOS Systemeinstellungen nicht erteilt."
+            return
+        }
+        let input = engine.inputNode
+        let inputFmt = input.outputFormat(forBus: 0)
+        if inputFmt.sampleRate <= 0 || inputFmt.channelCount == 0 {
+            errorMessage = "Kein aktives Mikrofon-Eingabegerät gefunden."
+            return
+        }
+        guard let targetFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
+              let converter = AVAudioConverter(from: inputFmt, to: targetFmt) else {
+            errorMessage = "Audio-Konverter konnte nicht initialisiert werden."
+            return
+        }
+
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFmt) { [weak self] pcmBuf, _ in
+            guard let self = self else { return }
+            let ratio = 16000.0 / max(1.0, inputFmt.sampleRate)
+            let outFrames = AVAudioFrameCount(Double(pcmBuf.frameLength) * ratio) + 64
+            guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFmt, frameCapacity: outFrames) else { return }
+            var consumed = false
+            var err: NSError?
+            converter.convert(to: outBuf, error: &err) { _, outStatus in
+                if consumed {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                consumed = true
+                outStatus.pointee = .haveData
+                return pcmBuf
             }
-            consumed = true
-            outStatus.pointee = .haveData
-            return buffer
+            if err == nil, let ptr = outBuf.int16ChannelData?[0] {
+                let count = Int(outBuf.frameLength)
+                let slice = Array(UnsafeBufferPointer(start: ptr, count: count))
+                let rms = computeRmsNormalized(slice)
+                self.lock.lock()
+                self.buffer.append(contentsOf: slice)
+                self.latestRms = rms
+                self.lock.unlock()
+            }
         }
-        if err == nil, let ptr = outBuf.int16ChannelData?[0] {
-            let count = Int(outBuf.frameLength)
-            lock.lock()
-            collected.append(contentsOf: UnsafeBufferPointer(start: ptr, count: count))
-            lock.unlock()
+
+        do {
+            try engine.start()
+            isRunning = true
+        } catch {
+            errorMessage = "Mikrofon-Start fehlgeschlagen: \(error.localizedDescription)"
+            isRunning = false
         }
     }
 
-    do {
-        try engine.start()
-        Thread.sleep(forTimeInterval: durationSecs)
-        input.removeTap(onBus: 0)
-        engine.stop()
-    } catch {
-        return []
+    func stop() {
+        if isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            isRunning = false
+        }
     }
-    return collected
+
+    func currentRms() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestRms
+    }
+
+    func drainSamples() -> [Int16] {
+        lock.lock()
+        let out = buffer
+        buffer.removeAll(keepingCapacity: true)
+        lock.unlock()
+        return out
+    }
 }
 
 @available(macOS 13.0, *)
 final class SystemAudioCollector: NSObject, SCStreamOutput {
     private let lock = NSLock()
     private var samples: [Int16] = []
+    private var latestRms: Double = 0.0
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sampleBuffer.isValid else { return }
         guard let blockBuf = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+
+        var sampleRate: Double = 48000.0
+        var channels: Int = 1
+        var isNonInterleaved: Bool = false
+        if let fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc) {
+            let asbd = asbdPtr.pointee
+            if asbd.mSampleRate > 1000.0 {
+                sampleRate = asbd.mSampleRate
+            }
+            channels = max(1, Int(asbd.mChannelsPerFrame))
+            isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        }
+
         var totalLen = 0
         var dataPtr: UnsafeMutablePointer<Int8>?
         guard CMBlockBufferGetDataPointer(blockBuf, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLen, dataPointerOut: &dataPtr) == kCMBlockBufferNoErr,
               let ptr = dataPtr else { return }
 
-        // ScreenCaptureKit delivers 32-bit float PCM at configured 48kHz/16kHz -> downsample cleanly to 16kHz mono Int16
         let floatCount = totalLen / MemoryLayout<Float>.size
         let floatPtr = UnsafeRawPointer(ptr).assumingMemoryBound(to: Float.self)
+        let decimate = max(1, Int(round(sampleRate / 16000.0)))
+        let frameCount = floatCount / channels
+        let strideStep = isNonInterleaved ? decimate : (decimate * channels)
+
         var chunk: [Int16] = []
-        chunk.reserveCapacity(floatCount / 3)
+        chunk.reserveCapacity(max(1, frameCount / decimate))
         var i = 0
-        while i < floatCount {
-            let clamped = max(-1.0, min(1.0, floatPtr[i]))
+        let limit = isNonInterleaved ? frameCount : floatCount
+        while i < limit {
+            let sampleVal = floatPtr[i]
+            let clamped = max(-1.0, min(1.0, sampleVal))
             chunk.append(Int16(clamped * 32767.0))
-            i += 3 // 48kHz -> 16kHz decimation
+            i += strideStep
         }
+
+        let rms = computeRmsNormalized(chunk)
         lock.lock()
         samples.append(contentsOf: chunk)
+        latestRms = rms
         lock.unlock()
+    }
+
+    func currentRms() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestRms
+    }
+
+    func drainSamples() -> [Int16] {
+        lock.lock()
+        let out = samples
+        samples.removeAll(keepingCapacity: true)
+        lock.unlock()
+        return out
     }
 
     func snapshot() -> [Int16] {
@@ -573,6 +679,15 @@ final class SystemAudioCollector: NSObject, SCStreamOutput {
         defer { lock.unlock() }
         return samples
     }
+}
+
+func recordMicrophoneSamples(durationSecs: Double) -> [Int16] {
+    let rec = ContinuousMicRecorder()
+    rec.start()
+    guard rec.isRunning else { return [] }
+    Thread.sleep(forTimeInterval: durationSecs)
+    rec.stop()
+    return rec.drainSamples()
 }
 
 func handleRecordDualAudio(outDir: String, seconds: Double) {
@@ -584,14 +699,12 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
     var sysSamples: [Int16] = []
     let group = DispatchGroup()
 
-    // Channel 0: Own Microphone
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
         micSamples = recordMicrophoneSamples(durationSecs: seconds)
         group.leave()
     }
 
-    // Channel 1: ScreenCaptureKit System Audio (Bot-free!)
     if #available(macOS 13.0, *), CGPreflightScreenCaptureAccess() {
         group.enter()
         Task {
@@ -615,7 +728,7 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
                     sysSamples = collector.snapshot()
                 }
             } catch {
-                // Non-fatal fallback if audio tap unavailable
+                // Non-fatal fallback
             }
             group.leave()
         }
@@ -627,12 +740,167 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
     let micOk = (try? writeMono16kWav(samples: micSamples, to: micPath)) != nil && micCount > 0
     let sysOk = (try? writeMono16kWav(samples: sysSamples, to: sysPath)) != nil && sysCount > 0
     let payload: [String: Any] = [
-        "mic_wav_path": micOk ? micPath : NSNull(),
+        "mic_wav_path": jsonNullable(micOk ? micPath : nil),
         "mic_samples": micCount,
-        "system_wav_path": sysOk ? sysPath : NSNull(),
+        "system_wav_path": jsonNullable(sysOk ? sysPath : nil),
         "system_samples": sysCount
     ]
     JSONOut.emit(payload)
+}
+
+func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
+    try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+    let effectiveChunkSecs = max(3.0, min(30.0, chunkSecs))
+
+    let stopLock = NSLock()
+    var shouldStop = false
+    func requestStop() {
+        stopLock.lock()
+        shouldStop = true
+        stopLock.unlock()
+    }
+    func isStopping() -> Bool {
+        stopLock.lock()
+        defer { stopLock.unlock() }
+        return shouldStop
+    }
+
+    // Listen for stdin EOF or "stop" command from parent Rust process
+    DispatchQueue.global(qos: .utility).async {
+        while true {
+            let data = FileHandle.standardInput.availableData
+            if data.isEmpty {
+                requestStop()
+                break
+            }
+            if let text = String(data: data, encoding: .utf8), text.lowercased().contains("stop") {
+                requestStop()
+                break
+            }
+        }
+    }
+
+    // Handle SIGTERM cleanly so final audio chunk is flushed
+    signal(SIGTERM, SIG_IGN)
+    let sigTermSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: DispatchQueue.global())
+    sigTermSrc.setEventHandler { requestStop() }
+    sigTermSrc.resume()
+
+    let micRec = ContinuousMicRecorder()
+    micRec.start()
+
+    var sysCollector: AnyObject? = nil
+    var sysStream: AnyObject? = nil
+    var sysActive = false
+    var sysError: String? = nil
+
+    if #available(macOS 13.0, *) {
+        if CGPreflightScreenCaptureAccess() {
+            let sem = DispatchSemaphore(value: 0)
+            Task {
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                    if let display = content.displays.first {
+                        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+                        let cfg = SCStreamConfiguration()
+                        cfg.capturesAudio = true
+                        cfg.excludesCurrentProcessAudio = true
+                        cfg.sampleRate = 48000
+                        cfg.channelCount = 1
+                        cfg.width = 2
+                        cfg.height = 2
+                        let collector = SystemAudioCollector()
+                        let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
+                        try stream.addStreamOutput(collector, type: .audio, sampleHandlerQueue: DispatchQueue(label: "ai.backtext.sck.stream"))
+                        try await stream.startCapture()
+                        sysCollector = collector
+                        sysStream = stream
+                        sysActive = true
+                    }
+                } catch {
+                    sysError = "System-Audio (ScreenCaptureKit): \(error.localizedDescription)"
+                }
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 4)
+        } else {
+            sysError = "System-Audio benötigt Bildschirmaufnahme-Berechtigung."
+        }
+    }
+
+    let startTime = Date()
+    var lastFlush = Date()
+    var chunkSeq: Int = 0
+
+    func emitChunk(forceFinal: Bool) {
+        let micSamples = micRec.drainSamples()
+        var sysSamples: [Int16] = []
+        if #available(macOS 13.0, *), let collector = sysCollector as? SystemAudioCollector {
+            sysSamples = collector.drainSamples()
+        }
+        let micCount: Int = micSamples.count
+        let sysCount: Int = sysSamples.count
+        if forceFinal && micCount < 8000 && sysCount < 8000 {
+            return
+        }
+        if micCount == 0 && sysCount == 0 {
+            return
+        }
+        chunkSeq += 1
+        let micPath = (outDir as NSString).appendingPathComponent("chunk_\(chunkSeq)_mic.wav")
+        let sysPath = (outDir as NSString).appendingPathComponent("chunk_\(chunkSeq)_system.wav")
+        let micOk = micCount > 0 && (try? writeMono16kWav(samples: micSamples, to: micPath)) != nil
+        let sysOk = sysCount > 0 && (try? writeMono16kWav(samples: sysSamples, to: sysPath)) != nil
+
+        let payload: [String: Any] = [
+            "type": "chunk",
+            "seq": chunkSeq,
+            "mic_wav_path": jsonNullable(micOk ? micPath : nil),
+            "mic_samples": micCount,
+            "system_wav_path": jsonNullable(sysOk ? sysPath : nil),
+            "system_samples": sysCount
+        ]
+        JSONOut.emit(payload)
+    }
+
+    while !isStopping() {
+        Thread.sleep(forTimeInterval: 0.5)
+        let elapsed = Int(Date().timeIntervalSince(startTime))
+        let micRms = micRec.currentRms()
+        var sysRms = 0.0
+        if #available(macOS 13.0, *), let collector = sysCollector as? SystemAudioCollector {
+            sysRms = collector.currentRms()
+        }
+        let combinedErr: String? = micRec.errorMessage ?? sysError
+        let levelPayload: [String: Any] = [
+            "type": "level",
+            "mic_rms": micRms,
+            "system_rms": sysRms,
+            "mic_active": micRec.isRunning,
+            "system_active": sysActive,
+            "elapsed_secs": elapsed,
+            "error": jsonNullable(combinedErr)
+        ]
+        JSONOut.emit(levelPayload)
+
+        if Date().timeIntervalSince(lastFlush) >= effectiveChunkSecs {
+            lastFlush = Date()
+            emitChunk(forceFinal: false)
+        }
+    }
+
+    // Final flush & clean shutdown
+    micRec.stop()
+    if #available(macOS 13.0, *), let stream = sysStream as? SCStream {
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            try? await stream.stopCapture()
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 2)
+    }
+    emitChunk(forceFinal: true)
+    sigTermSrc.cancel()
 }
 
 func handleRecordMic(outPath: String, seconds: Double) {
@@ -667,6 +935,10 @@ case "record-dual-audio":
     let outDir = args.count > 2 ? args[2] : "/tmp/backtext-audio"
     let secs = args.count > 3 ? (Double(args[3]) ?? 8.0) : 8.0
     handleRecordDualAudio(outDir: outDir, seconds: secs)
+case "stream-dual-audio":
+    let outDir = args.count > 2 ? args[2] : "/tmp/backtext-audio"
+    let secs = args.count > 3 ? (Double(args[3]) ?? 8.0) : 8.0
+    handleStreamDualAudio(outDir: outDir, chunkSecs: secs)
 case "record-mic":
     let outWav = args.count > 2 ? args[2] : "/tmp/backtext-self.wav"
     let secs = args.count > 3 ? (Double(args[3]) ?? 6.0) : 6.0

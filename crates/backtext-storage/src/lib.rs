@@ -936,6 +936,68 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn update_meeting_title(&self, meeting_id: &str, title: &str) -> Result<()> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE meetings SET title = ?2 WHERE id = ?1",
+                params![meeting_id, trimmed],
+            )?;
+        }
+        if let Some(detail) = self.get_meeting_detail(meeting_id)? {
+            self.save_meeting(&detail.meeting)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_meeting(&self, meeting_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let thread_id = format!("meeting:{meeting_id}");
+        let seg_ids: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM transcript_segments WHERE meeting_id = ?1")?;
+            let rows = stmt
+                .query_map(params![meeting_id], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        let frame_ids: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM screenshare_frames WHERE meeting_id = ?1")?;
+            let rows = stmt
+                .query_map(params![meeting_id], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        for sid in seg_ids {
+            let doc_id = format!("transcript:{sid}");
+            let _ = conn.execute("DELETE FROM memory_fts WHERE doc_id = ?1", params![doc_id]);
+            let _ = conn.execute("DELETE FROM memory_vectors WHERE doc_id = ?1", params![doc_id]);
+        }
+        for fid in frame_ids {
+            let doc_id = format!("screenshare:{fid}");
+            let _ = conn.execute("DELETE FROM memory_fts WHERE doc_id = ?1", params![doc_id]);
+            let _ = conn.execute("DELETE FROM memory_vectors WHERE doc_id = ?1", params![doc_id]);
+        }
+        let mtg_doc = format!("meeting:{meeting_id}");
+        let _ = conn.execute("DELETE FROM memory_fts WHERE doc_id = ?1", params![mtg_doc]);
+        let _ = conn.execute("DELETE FROM memory_vectors WHERE doc_id = ?1", params![mtg_doc]);
+
+        let _ = conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1 OR meeting_id = ?2", params![thread_id, meeting_id]);
+        let _ = conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", params![meeting_id]);
+        let _ = conn.execute("DELETE FROM screenshare_frames WHERE meeting_id = ?1", params![meeting_id]);
+        let _ = conn.execute("DELETE FROM meeting_participants WHERE meeting_id = ?1", params![meeting_id]);
+        let affected = conn.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
+        Ok(affected > 0)
+    }
+
     pub fn insert_transcript_segment(&self, seg: &TranscriptSegment) -> Result<()> {
         {
             let conn = self.conn.lock();
@@ -1618,6 +1680,8 @@ impl StorageEngine {
         settings.openai_api_key_set = self.secrets.has_secret(secrets::KEY_OPENAI);
         settings.anthropic_api_key_set = self.secrets.has_secret(secrets::KEY_ANTHROPIC);
         settings.gemini_api_key_set = self.secrets.has_secret(secrets::KEY_GEMINI);
+        settings.openrouter_api_key_set = self.secrets.has_secret(secrets::KEY_OPENROUTER);
+        settings.primalabs_api_key_set = self.secrets.has_secret(secrets::KEY_PRIMALABS);
         settings.deepgram_api_key_set = self.secrets.has_secret(secrets::KEY_DEEPGRAM);
         settings.groq_api_key_set = self.secrets.has_secret(secrets::KEY_GROQ);
         Ok(settings)
@@ -1938,6 +2002,32 @@ mod tests {
         assert!(reopened.is_encrypted());
         assert!(!reopened.has_demo_data().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_delete_meeting_and_provider_keys_work() {
+        let store = StorageEngine::open_in_memory().unwrap();
+        let meetings = store.list_meetings().unwrap();
+        let first_id = meetings[0].id.clone();
+
+        store.update_meeting_title(&first_id, "Q4 Launch Sync").unwrap();
+        let renamed = store.get_meeting_detail(&first_id).unwrap().unwrap();
+        assert_eq!(renamed.meeting.title, "Q4 Launch Sync");
+
+        store.secrets().set_secret(secrets::KEY_OPENROUTER, "sk-or-test").unwrap();
+        store.secrets().set_secret(secrets::KEY_PRIMALABS, "pl-test-key").unwrap();
+        let mut cfg = store.get_ai_settings().unwrap();
+        assert!(cfg.openrouter_api_key_set);
+        assert!(cfg.primalabs_api_key_set);
+        cfg.hover_shortcut = "CommandOrControl+Shift+Space".into();
+        store.save_ai_settings(&cfg).unwrap();
+        assert_eq!(
+            store.get_ai_settings().unwrap().hover_shortcut,
+            "CommandOrControl+Shift+Space"
+        );
+
+        assert!(store.delete_meeting(&first_id).unwrap());
+        assert!(store.get_meeting_detail(&first_id).unwrap().is_none());
     }
 }
 

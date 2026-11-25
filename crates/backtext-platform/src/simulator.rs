@@ -165,6 +165,62 @@ impl PlatformSensors for SimulatorPlatformSensors {
         })
     }
 
+    async fn start_dual_audio_stream(
+        &self,
+        out_dir: &str,
+        chunk_secs: u64,
+    ) -> Result<DualAudioStreamSession> {
+        let out_dir_owned = out_dir.to_string();
+        let interval_ticks = (chunk_secs.clamp(4, 20) * 2) as usize; // 500ms ticks
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut tick = 0usize;
+            let mut seq = 0u64;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = ticker.tick() => {
+                        tick += 1;
+                        let phase = tick as f32 * 0.7;
+                        let mic_rms = ((phase.sin().abs() * 0.55) + 0.08).min(0.95);
+                        let sys_rms = (((phase * 0.5).cos().abs() * 0.40) + 0.04).min(0.85);
+                        if tx.send(DualAudioStreamEvent::Level {
+                            mic_rms,
+                            system_rms: sys_rms,
+                            mic_active: true,
+                            system_active: true,
+                            elapsed_secs: (tick / 2) as u64,
+                            error: None,
+                        }).is_err() {
+                            break;
+                        }
+                        if tick % interval_ticks == 0 {
+                            seq += 1;
+                            let mic_path = format!("{out_dir_owned}/chunk_{seq}_mic.wav");
+                            let sys_path = format!("{out_dir_owned}/chunk_{seq}_system.wav");
+                            let mic_samples = write_synthetic_voice_wav(&mic_path, 145.0, 2).unwrap_or(0);
+                            let sys_samples = write_synthetic_voice_wav(&sys_path, 210.0, 2).unwrap_or(0);
+                            if tx.send(DualAudioStreamEvent::Chunk {
+                                seq,
+                                mic_wav_path: if mic_samples > 0 { Some(mic_path) } else { None },
+                                mic_samples,
+                                system_wav_path: if sys_samples > 0 { Some(sys_path) } else { None },
+                                system_samples: sys_samples,
+                            }).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(DualAudioStreamSession::new(rx, stop_tx))
+    }
+
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> Result<bool> {
         let _ = write_synthetic_voice_wav(out_path, 138.0, duration_secs.min(2))?;
         Ok(true)

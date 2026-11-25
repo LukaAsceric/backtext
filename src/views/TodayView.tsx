@@ -41,6 +41,7 @@ interface TodayViewProps {
   onSearchMemory: (query: string) => Promise<MemorySearchHit[]>;
   onRunGlobalChat: (input: string, recipeSlug?: string) => Promise<void>;
   onRequestPermission: (kind: string) => Promise<void>;
+  onRefreshPermissions: () => Promise<void>;
   onClearDemoData: () => Promise<void>;
   onSyncCalendars: () => Promise<void>;
 }
@@ -61,6 +62,7 @@ export const TodayView: React.FC<TodayViewProps> = ({
   onSearchMemory,
   onRunGlobalChat,
   onRequestPermission,
+  onRefreshPermissions,
   onClearDemoData,
   onSyncCalendars,
 }) => {
@@ -68,6 +70,7 @@ export const TodayView: React.FC<TodayViewProps> = ({
   const [hits, setHits] = useState<MemorySearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [syncingCal, setSyncingCal] = useState(false);
+  const [checkingPerms, setCheckingPerms] = useState(false);
 
   const missingPermissions =
     !permissions.screen_capture_granted ||
@@ -181,7 +184,7 @@ export const TodayView: React.FC<TodayViewProps> = ({
                 ? 'macOS Berechtigungen für automatische Kontexterfassung & bot-freie Meetings:'
                 : 'macOS Permissions for Ambient Capture & Bot-Free Calls:'}
             </span>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
               {(
                 [
                   ['screen', 'ScreenCaptureKit', permissions.screen_capture_granted],
@@ -200,6 +203,22 @@ export const TodayView: React.FC<TodayViewProps> = ({
                   {label}
                 </button>
               ))}
+              <button
+                type="button"
+                className="mini-btn"
+                disabled={checkingPerms}
+                onClick={async () => {
+                  setCheckingPerms(true);
+                  try {
+                    await onRefreshPermissions();
+                  } finally {
+                    setCheckingPerms(false);
+                  }
+                }}
+              >
+                <RefreshCw size={10} style={{ marginRight: 4, verticalAlign: 'middle' }} />
+                {checkingPerms ? '…' : lang === 'de' ? 'Neu prüfen' : 'Re-check'}
+              </button>
             </div>
           </div>
         )}

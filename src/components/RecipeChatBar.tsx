@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { Send, Sparkles, BookOpen } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Send, Sparkles, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
 import type { ChatMessage, Language, Recipe } from '../types';
 import { t } from '../lib/i18n';
 import { FormattedMarkdown } from './FormattedMarkdown';
@@ -8,6 +8,7 @@ interface RecipeChatBarProps {
   lang: Language;
   meetingId?: string | null;
   scopeFilter?: 'single_meeting' | 'all';
+  compact?: boolean;
   recipes: Recipe[];
   messages: ChatMessage[];
   streamingText?: string | null;
@@ -18,6 +19,7 @@ interface RecipeChatBarProps {
 export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
   lang,
   scopeFilter = 'all',
+  compact = false,
   recipes,
   messages,
   streamingText,
@@ -26,6 +28,22 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
 }) => {
   const [input, setInput] = useState('');
   const [showSlash, setShowSlash] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const hasHistory = messages.length > 0 || Boolean(streamingText && streamingText.length > 0);
+
+  useEffect(() => {
+    if (streamingText && streamingText.length > 0) {
+      setDrawerOpen(true);
+    }
+  }, [streamingText]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages.length, streamingText, drawerOpen]);
 
   const availableRecipes = useMemo(() => {
     const base =
@@ -48,8 +66,8 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
         .filter((r) =>
           scopeFilter === 'single_meeting' ? r.scope === 'single_meeting' : r.is_favorite,
         )
-        .slice(0, 5),
-    [recipes, scopeFilter],
+        .slice(0, compact ? 4 : 5),
+    [recipes, scopeFilter, compact],
   );
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -58,52 +76,52 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
     const val = input.trim();
     setInput('');
     setShowSlash(false);
+    setDrawerOpen(true);
     await onExecute(val, val.startsWith('/') ? val.split(/\s+/)[0] : undefined);
   };
 
   const handleSelectRecipe = async (rec: Recipe) => {
     setShowSlash(false);
     setInput('');
+    setDrawerOpen(true);
     await onExecute(rec.slug, rec.slug);
   };
 
+  const showMessages = compact ? hasHistory && drawerOpen : hasHistory;
+
   return (
-    <div className="chat-panel">
-      <div className="section-heading" style={{ marginBottom: 4 }}>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-          <Sparkles size={15} />
-          {lang === 'de'
-            ? 'KI-Assistent & Granola-Recipes (/ tippen)'
-            : 'AI Assistant & Granola Recipes (type /)'}
-        </span>
-        <button
-          type="button"
-          className="mini-btn"
-          id="toggle-slash-recipes-btn"
-          onClick={() => setShowSlash((prev) => !prev)}
-        >
-          / Recipes ({recipes.length})
-        </button>
-      </div>
-
-      <div className="recipe-chips-row">
-        {quickChips.map((rec) => (
+    <div className={compact ? 'chat-panel chat-panel-compact' : 'chat-panel'}>
+      {!compact && (
+        <div className="section-heading" style={{ marginBottom: 4 }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+            <Sparkles size={15} />
+            {lang === 'de'
+              ? 'KI-Assistent & Granola-Recipes (/ tippen)'
+              : 'AI Assistant & Granola Recipes (type /)'}
+          </span>
           <button
-            key={rec.id}
             type="button"
-            className="recipe-chip"
-            disabled={busy}
-            onClick={() => handleSelectRecipe(rec)}
-            title={lang === 'de' ? rec.description_de : rec.description_en}
+            className="mini-btn"
+            id="toggle-slash-recipes-btn"
+            onClick={() => setShowSlash((prev) => !prev)}
           >
-            <span className="recipe-slug">{rec.slug}</span>
-            <span>{lang === 'de' ? rec.name_de : rec.name_en}</span>
+            / Recipes ({recipes.length})
           </button>
-        ))}
-      </div>
+        </div>
+      )}
 
-      {(messages.length > 0 || (streamingText && streamingText.length > 0)) && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 360, overflowY: 'auto' }}>
+      {showMessages && (
+        <div
+          ref={scrollRef}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+            maxHeight: compact ? 300 : 360,
+            overflowY: 'auto',
+            paddingRight: 2,
+          }}
+        >
           {messages.map((msg) => (
             <div key={msg.id} className={`chat-bubble ${msg.role === 'user' ? 'user' : 'assistant'}`}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -149,6 +167,56 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
         </div>
       )}
 
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div className="recipe-chips-row">
+          {quickChips.map((rec) => (
+            <button
+              key={rec.id}
+              type="button"
+              className="recipe-chip"
+              disabled={busy}
+              onClick={() => handleSelectRecipe(rec)}
+              title={lang === 'de' ? rec.description_de : rec.description_en}
+            >
+              <span className="recipe-slug">{rec.slug}</span>
+              <span>{lang === 'de' ? rec.name_de : rec.name_en}</span>
+            </button>
+          ))}
+        </div>
+
+        {compact && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <button
+              type="button"
+              className="mini-btn"
+              id="toggle-slash-recipes-btn"
+              onClick={() => setShowSlash((prev) => !prev)}
+            >
+              / Recipes
+            </button>
+            {hasHistory && (
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => setDrawerOpen((prev) => !prev)}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+              >
+                {drawerOpen ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+                Chat ({messages.length})
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
       <form className="chat-input-wrap" onSubmit={handleSubmit}>
         {(showSlash || input.startsWith('/')) && availableRecipes.length > 0 && (
           <div className="slash-menu" role="listbox">
@@ -184,7 +252,9 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
             setInput(e.target.value);
             if (e.target.value.startsWith('/')) setShowSlash(true);
           }}
-          placeholder={t(lang, 'chatPlaceholder')}
+          placeholder={
+            compact ? t(lang, 'meetingChatPlaceholder') : t(lang, 'chatPlaceholder')
+          }
           disabled={busy}
         />
         <button type="submit" id="recipe-chat-submit" className="btn btn-primary" disabled={busy || !input.trim()}>

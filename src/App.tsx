@@ -7,6 +7,7 @@ import {
   Sparkles,
   ShieldCheck,
   Sliders,
+  Settings,
   Sun,
   Moon,
   Command,
@@ -20,13 +21,18 @@ import type {
   Language,
   McpAuditEntry,
   McpGovernancePolicy,
+  Meeting,
   MeetingDetail,
+  MeetingParticipant,
   MemorySearchHit,
   PermissionStatus,
   PrivacyRule,
   ProviderTestResult,
   Recipe,
+  RecordingAudioLevel,
+  ScreenShareFrame,
   ScrubberPreview,
+  TranscriptSegment,
   UpdateCheckResult,
   UserProfile,
   VocabularyEntry,
@@ -37,6 +43,7 @@ import {
   callRpc,
   isTauriRuntime,
   setNativeAutostart,
+  setNativeGlobalShortcut,
   subscribeBacktextEvents,
   toggleNativeHoverOverlay,
 } from './lib/ipc';
@@ -48,6 +55,7 @@ import { PeopleAndProjectsView } from './views/PeopleAndProjectsView';
 import { RecipesStudioView } from './views/RecipesStudioView';
 import { McpAndPrivacyView } from './views/McpAndPrivacyView';
 import { PersonalizationView } from './views/PersonalizationView';
+import { SettingsView } from './views/SettingsView';
 import { HoverModal } from './components/HoverModal';
 
 type NavKey =
@@ -57,12 +65,14 @@ type NavKey =
   | 'people'
   | 'recipes'
   | 'mcp'
-  | 'personalization';
+  | 'personalization'
+  | 'settings';
 
 export const App: React.FC = () => {
   const [data, setData] = useState<BootstrapPayload | null>(null);
   const [activeNav, setActiveNav] = useState<NavKey>('today');
   const [selectedMeeting, setSelectedMeeting] = useState<MeetingDetail | null>(null);
+  const [recordingLevel, setRecordingLevel] = useState<RecordingAudioLevel | null>(null);
   const [globalMessages, setGlobalMessages] = useState<ChatMessage[]>([]);
   const [streamingByThread, setStreamingByThread] = useState<Record<string, string>>({});
   const [hoverOpen, setHoverOpen] = useState(false);
@@ -80,6 +90,15 @@ export const App: React.FC = () => {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('backtext-theme', theme);
   }, [theme]);
+
+  const refreshPermissions = useCallback(async () => {
+    try {
+      const perms = await callRpc<PermissionStatus>('check_permissions');
+      setData((prev) => (prev ? { ...prev, permissions: perms } : prev));
+    } catch {
+      // ignore transient errors
+    }
+  }, []);
 
   const refreshBootstrap = useCallback(
     async (preferredMeetingId?: string) => {
@@ -117,6 +136,15 @@ export const App: React.FC = () => {
     refreshBootstrap();
   }, []);
 
+  // Auto-recheck macOS permissions whenever the user returns from System Settings
+  useEffect(() => {
+    const onFocus = () => {
+      refreshPermissions();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshPermissions]);
+
   // Subscribe to live backend streaming events (Tauri EventBus / HTTP SSE)
   useEffect(() => {
     const unsub = subscribeBacktextEvents((ev) => {
@@ -137,6 +165,63 @@ export const App: React.FC = () => {
             [payload.thread_id]: (prev[payload.thread_id] ?? '') + payload.delta,
           };
         });
+      } else if (ev.event === 'recording_audio_level') {
+        setRecordingLevel(ev.payload as RecordingAudioLevel);
+      } else if (ev.event === 'transcript_segment_added') {
+        const seg = ev.payload as TranscriptSegment;
+        setSelectedMeeting((prev) => {
+          if (!prev || prev.meeting.id !== seg.meeting_id) return prev;
+          if (prev.transcript.some((t) => t.id === seg.id)) return prev;
+          return {
+            ...prev,
+            meeting: {
+              ...prev.meeting,
+              transcript_count: prev.transcript.length + 1,
+            },
+            transcript: [...prev.transcript, seg],
+          };
+        });
+        setData((prev) =>
+          prev
+            ? {
+                ...prev,
+                meetings: prev.meetings.map((m) =>
+                  m.id === seg.meeting_id
+                    ? { ...m, transcript_count: m.transcript_count + 1 }
+                    : m,
+                ),
+              }
+            : prev,
+        );
+      } else if (ev.event === 'screenshare_captured') {
+        const frame = ev.payload as ScreenShareFrame;
+        setSelectedMeeting((prev) => {
+          if (!prev || prev.meeting.id !== frame.meeting_id) return prev;
+          if (prev.screenshares.some((f) => f.id === frame.id)) return prev;
+          return {
+            ...prev,
+            meeting: {
+              ...prev.meeting,
+              screenshare_count: prev.screenshares.length + 1,
+            },
+            screenshares: [...prev.screenshares, frame],
+          };
+        });
+      } else if (ev.event === 'participant_updated') {
+        const p = ev.payload as { meeting_id: string; participant: MeetingParticipant };
+        setSelectedMeeting((prev) => {
+          if (!prev || prev.meeting.id !== p.meeting_id) return prev;
+          const idx = prev.meeting.participants.findIndex(
+            (x) => x.speaker_label === p.participant.speaker_label,
+          );
+          const nextParts = [...prev.meeting.participants];
+          if (idx >= 0) nextParts[idx] = p.participant;
+          else nextParts.push(p.participant);
+          return {
+            ...prev,
+            meeting: { ...prev.meeting, participants: nextParts },
+          };
+        });
       } else if (ev.event === 'daemon_telemetry_updated') {
         setData((prev) =>
           prev
@@ -147,14 +232,11 @@ export const App: React.FC = () => {
             : prev,
         );
       } else if (ev.event === 'capture_status_changed') {
-        setData((prev) =>
-          prev
-            ? {
-                ...prev,
-                capture_status: ev.payload as CaptureStatus,
-              }
-            : prev,
-        );
+        const nextStatus = ev.payload as CaptureStatus;
+        if (nextStatus.mode !== 'recording_meeting') {
+          setRecordingLevel(null);
+        }
+        setData((prev) => (prev ? { ...prev, capture_status: nextStatus } : prev));
       } else if (ev.event === 'model_download_progress') {
         const p = ev.payload as {
           model_id: string;
@@ -178,7 +260,11 @@ export const App: React.FC = () => {
               }
             : prev,
         );
-      } else if (ev.event === 'calendar_synced' || ev.event === 'context_episode_updated') {
+      } else if (
+        ev.event === 'calendar_synced' ||
+        ev.event === 'context_episode_updated' ||
+        ev.event === 'meeting_summarized'
+      ) {
         refreshBootstrap();
       }
     });
@@ -225,12 +311,13 @@ export const App: React.FC = () => {
   const handleStartAdhocMeeting = async () => {
     setBusy(true);
     try {
+      const nowLabel = new Date().toLocaleTimeString(lang === 'de' ? 'de-DE' : 'en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
       const detail = await callRpc<MeetingDetail>('start_live_meeting', {
-        title:
-          lang === 'de'
-            ? 'Ad-hoc Produkt- & Agenten-Sync'
-            : 'Ad-hoc Product & Agent Sync',
-        detectedApp: 'Google Meet (ScreenCaptureKit Dual-Audio)',
+        title: lang === 'de' ? `Neues Meeting (${nowLabel})` : `New Meeting (${nowLabel})`,
+        detectedApp: 'Dual-Audio (Mikrofon + System-Audio)',
       });
       setSelectedMeeting(detail);
       setActiveNav('meetings');
@@ -452,6 +539,18 @@ export const App: React.FC = () => {
             </span>
             <span className="nav-badge">{lang.toUpperCase()}</span>
           </button>
+
+          <button
+            type="button"
+            id="nav-settings"
+            className={`nav-item ${activeNav === 'settings' ? 'selected' : ''}`}
+            onClick={() => setActiveNav('settings')}
+          >
+            <span className="nav-item-left">
+              <Settings size={15} />
+              {t(lang, 'settings')}
+            </span>
+          </button>
         </nav>
 
         <div className="sidebar-footer">
@@ -471,13 +570,13 @@ export const App: React.FC = () => {
               <Command size={13} />
               {t(lang, 'hoverBtn')}
             </span>
-            <span className="kbd">⌥ Space</span>
+            <span className="kbd">{data.telemetry.global_shortcut.replace('Alt+Space (', '').replace(')', '')}</span>
           </button>
         </div>
       </aside>
 
       {/* Main View Canvas */}
-      <main className="workspace-main">
+      <main className={activeNav === 'meetings' ? 'workspace-main workspace-main-flush' : 'workspace-main'}>
         {activeNav === 'today' && (
           <TodayView
             lang={lang}
@@ -506,6 +605,7 @@ export const App: React.FC = () => {
               const updated = await callRpc<PermissionStatus>('request_permission', { kind });
               setData((prev) => (prev ? { ...prev, permissions: updated } : prev));
             }}
+            onRefreshPermissions={refreshPermissions}
             onClearDemoData={async () => {
               await callRpc('clear_demo_data');
               await refreshBootstrap();
@@ -520,8 +620,10 @@ export const App: React.FC = () => {
         {activeNav === 'meetings' && (
           <MeetingWorkspace
             lang={lang}
+            platform={data.permissions.platform}
             meetings={data.meetings}
             selectedDetail={selectedMeeting}
+            recordingLevel={recordingLevel}
             recipes={data.recipes}
             streamingText={meetingStreamText}
             busy={busy}
@@ -532,24 +634,49 @@ export const App: React.FC = () => {
               setSelectedMeeting(detail);
             }}
             onStartAdhocMeeting={handleStartAdhocMeeting}
+            onStartScheduledMeeting={handleStartScheduledMeeting}
+            onDeleteMeeting={async (meetingId) => {
+              const res = await callRpc<{ deleted: boolean; meetings: Meeting[] }>(
+                'delete_meeting',
+                { meetingId },
+              );
+              setData((prev) => (prev ? { ...prev, meetings: res.meetings } : prev));
+              if (selectedMeeting?.meeting.id === meetingId) {
+                const nextId = res.meetings[0]?.id;
+                if (nextId) {
+                  const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+                    meetingId: nextId,
+                  });
+                  setSelectedMeeting(detail);
+                } else {
+                  setSelectedMeeting(null);
+                }
+              }
+            }}
+            onRenameMeeting={async (meetingId, title) => {
+              const detail = await callRpc<MeetingDetail | null>('update_meeting_title', {
+                meetingId,
+                title,
+              });
+              if (detail) {
+                setSelectedMeeting(detail);
+                setData((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        meetings: prev.meetings.map((m) =>
+                          m.id === meetingId ? { ...m, title: detail.meeting.title } : m,
+                        ),
+                      }
+                    : prev,
+                );
+              }
+            }}
             onSimulateLiveStep={async (meetingId) => {
               setBusy(true);
               try {
                 const detail = await callRpc<MeetingDetail>('simulate_live_meeting_activity', {
                   meetingId,
-                });
-                setSelectedMeeting(detail);
-                await refreshBootstrap(meetingId);
-              } finally {
-                setBusy(false);
-              }
-            }}
-            onCaptureRealAudioTurn={async (meetingId) => {
-              setBusy(true);
-              try {
-                const detail = await callRpc<MeetingDetail>('capture_real_dual_audio_turn', {
-                  meetingId,
-                  durationSecs: 6,
                 });
                 setSelectedMeeting(detail);
                 await refreshBootstrap(meetingId);
@@ -564,6 +691,7 @@ export const App: React.FC = () => {
                   meetingId,
                 });
                 setSelectedMeeting(detail);
+                setRecordingLevel(null);
                 await refreshBootstrap(meetingId);
               } finally {
                 setBusy(false);
@@ -571,7 +699,11 @@ export const App: React.FC = () => {
             }}
             onSaveUserNotes={async (meetingId, rawNotes) => {
               await callRpc('update_meeting_notes', { meetingId, rawNotes });
-              await refreshBootstrap(meetingId);
+              setSelectedMeeting((prev) =>
+                prev && prev.meeting.id === meetingId
+                  ? { ...prev, meeting: { ...prev.meeting, raw_user_notes: rawNotes } }
+                  : prev,
+              );
             }}
             onEnhanceMeeting={async (meetingId) => {
               setBusy(true);
@@ -611,6 +743,7 @@ export const App: React.FC = () => {
                 setBusy(false);
               }
             }}
+            onOpenSettings={() => setActiveNav('settings')}
           />
         )}
 
@@ -720,13 +853,8 @@ export const App: React.FC = () => {
           <PersonalizationView
             lang={lang}
             profile={data.profile}
-            telemetry={data.telemetry}
             vocabulary={data.vocabulary}
             learnedPreferences={data.learned_preferences}
-            aiSettings={data.ai_settings}
-            whisperModels={data.whisper_models}
-            ollamaModels={data.ollama_models}
-            calendarFeeds={data.calendar_feeds}
             onSaveProfile={async (profile: UserProfile) => {
               const saved = await callRpc<UserProfile>('save_user_profile', { profile });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
@@ -755,6 +883,23 @@ export const App: React.FC = () => {
               );
               setData((prev) => (prev ? { ...prev, learned_preferences } : prev));
             }}
+          />
+        )}
+
+        {activeNav === 'settings' && (
+          <SettingsView
+            lang={lang}
+            profile={data.profile}
+            permissions={data.permissions}
+            telemetry={data.telemetry}
+            aiSettings={data.ai_settings}
+            whisperModels={data.whisper_models}
+            ollamaModels={data.ollama_models}
+            calendarFeeds={data.calendar_feeds}
+            onSaveProfile={async (profile: UserProfile) => {
+              const saved = await callRpc<UserProfile>('save_user_profile', { profile });
+              setData((prev) => (prev ? { ...prev, profile: saved } : prev));
+            }}
             onSaveAiSettings={async (settings: AiProviderSettings) => {
               const ai_settings = await callRpc<AiProviderSettings>('save_ai_settings', {
                 settings,
@@ -775,6 +920,9 @@ export const App: React.FC = () => {
             onTestProvider={(provider) =>
               callRpc<ProviderTestResult>('test_provider_connection', { provider })
             }
+            onFetchProviderModels={(provider) =>
+              callRpc<string[]>('list_provider_models', { provider })
+            }
             onDownloadWhisperModel={async (modelId) => {
               const info = await callRpc<WhisperModelInfo>('download_whisper_model', { modelId });
               setData((prev) =>
@@ -787,6 +935,19 @@ export const App: React.FC = () => {
                     }
                   : prev,
               );
+            }}
+            onSetGlobalShortcut={async (shortcut) => {
+              const display = await setNativeGlobalShortcut(shortcut);
+              setData((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      ai_settings: { ...prev.ai_settings, hover_shortcut: shortcut },
+                      telemetry: { ...prev.telemetry, global_shortcut: display },
+                    }
+                  : prev,
+              );
+              return display;
             }}
             onAddCalendarFeed={async (name, icsUrl) => {
               const calendar_feeds = await callRpc<CalendarFeedConfig[]>('add_calendar_feed', {
@@ -809,16 +970,24 @@ export const App: React.FC = () => {
             onToggleAutostart={async (enabled) => {
               const active = await setNativeAutostart(enabled);
               setData((prev) =>
-                prev
-                  ? { ...prev, telemetry: { ...prev.telemetry, autostart_enabled: active } }
-                  : prev,
+                prev ? { ...prev, telemetry: { ...prev.telemetry, autostart_enabled: active } } : prev,
               );
             }}
             onCheckUpdates={() => callRpc<UpdateCheckResult>('check_for_updates')}
+            onRequestPermission={async (kind) => {
+              const updated = await callRpc<PermissionStatus>('request_permission', { kind });
+              setData((prev) => (prev ? { ...prev, permissions: updated } : prev));
+            }}
+            onRefreshPermissions={refreshPermissions}
+            onClearDemoData={async () => {
+              await callRpc('clear_demo_data');
+              await refreshBootstrap();
+            }}
           />
         )}
       </main>
 
+      {/* In-window Hover Overlay Modal (for Web Preview & In-Window ⌥ Space) */}
       <HoverModal
         open={hoverOpen}
         lang={lang}

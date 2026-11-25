@@ -47,7 +47,7 @@ jobs:
         run: cargo test --workspace
 
   build-macos-bundle:
-    name: Build Signed Apple Silicon (M1–M5) v0.2.0 .dmg & .app.zip
+    name: Build Signed Apple Silicon (M1–M5) v0.3.0 .dmg & .app.zip
     runs-on: macos-15
     needs: verify-rust-and-ui
     steps:
@@ -73,7 +73,7 @@ jobs:
           pnpm install
           pnpm run build
 
-      - name: Compile Native Swift macOS Sensor (ScreenCaptureKit, Vision OCR, AX, EventKit)
+      - name: Compile Native Swift macOS Sensor (ScreenCaptureKit Stream, Vision OCR, AX, EventKit)
         run: |
           mkdir -p macos-sensor/build
           swiftc -O \
@@ -92,37 +92,62 @@ jobs:
           file macos-sensor/build/backtext-macos-sensor
           ./macos-sensor/build/backtext-macos-sensor permissions
 
+      - name: Build Self-Contained Apple Silicon Metal whisper-cli (Static, Embedded Metal)
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp
+          cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build /tmp/whisper.cpp/build --target whisper-cli -j
+          mkdir -p macos-sensor/build
+          cp /tmp/whisper.cpp/build/bin/whisper-cli macos-sensor/build/whisper-cli
+          chmod 755 macos-sensor/build/whisper-cli
+          file macos-sensor/build/whisper-cli
+          otool -L macos-sensor/build/whisper-cli
+          ./macos-sensor/build/whisper-cli --help | head -n 5
+
       - name: Build Apple Silicon (arm64) backtext-mcp & Tauri .app bundle
         run: |
           cargo build --release --target aarch64-apple-darwin -p backtext-mcp --bin backtext-mcp
           pnpm tauri build --target aarch64-apple-darwin --bundles app
 
-      - name: Bundle macOS Helpers, Deep Ad-hoc Sign & Smoke-Test on Apple Silicon
+      - name: Bundle macOS Helpers + Metal whisper-cli, Deep Sign & Smoke-Test on Apple Silicon
         run: |
           APP_DIR="target/aarch64-apple-darwin/release/bundle/macos/backtext.app"
           MCP_BIN="target/aarch64-apple-darwin/release/backtext-mcp"
           SENSOR_BIN="macos-sensor/build/backtext-macos-sensor"
+          WHISPER_BIN="macos-sensor/build/whisper-cli"
 
           cp "$MCP_BIN" "$APP_DIR/Contents/MacOS/backtext-mcp"
           cp "$SENSOR_BIN" "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
+          cp "$WHISPER_BIN" "$APP_DIR/Contents/MacOS/whisper-cli"
           chmod 755 \
             "$APP_DIR/Contents/MacOS/backtext-desktop" \
             "$APP_DIR/Contents/MacOS/backtext-mcp" \
-            "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
+            "$APP_DIR/Contents/MacOS/backtext-macos-sensor" \
+            "$APP_DIR/Contents/MacOS/whisper-cli"
 
           echo "=== Verifying arm64 Mach-O architectures ==="
           file "$APP_DIR/Contents/MacOS/backtext-desktop"
           file "$APP_DIR/Contents/MacOS/backtext-mcp"
           file "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
+          file "$APP_DIR/Contents/MacOS/whisper-cli"
 
           echo "=== Applying deep ad-hoc code signature for Apple Silicon AMFI ==="
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-mcp"
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
+          codesign --force --sign - "$APP_DIR/Contents/MacOS/whisper-cli"
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-desktop"
           codesign --force --deep --sign - "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
-          echo "=== Smoke-testing live app startup, SQLCipher encryption & daemon loop on arm64 ==="
+          echo "=== Smoke-testing live app startup, SQLCipher encryption & bundled whisper-cli on arm64 ==="
           CI=true "$APP_DIR/Contents/MacOS/backtext-desktop" &
           APP_PID=$!
           HEALTH_OK=0
@@ -130,7 +155,10 @@ jobs:
             if HEALTH=$(curl -fsS http://127.0.0.1:39421/health); then
               echo "Health response: $HEALTH"
               echo "$HEALTH" | grep -q '"db_encrypted":true'
-              echo "macOS arm64 startup + SQLCipher smoke-test PASSED!"
+              TEL=$(curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:39421/api/invoke/get_daemon_telemetry)
+              echo "Telemetry: $TEL"
+              echo "$TEL" | grep -q '"whisper_cli_detected":true'
+              echo "macOS arm64 startup + SQLCipher + bundled Metal whisper-cli smoke-test PASSED!"
               HEALTH_OK=1
               break
             fi
@@ -163,18 +191,18 @@ jobs:
             'echo "Entferne macOS Quarantäne-Attribut für backtext.app..."' \
             'xattr -cr /Applications/backtext.app' \
             'open /Applications/backtext.app' \
-            'echo "backtext v0.2.0 wurde erfolgreich gestartet!"' \
+            'echo "backtext v0.3.0 wurde erfolgreich gestartet!"' \
             > "$HELPER"
           chmod 755 "$HELPER"
 
           hdiutil create -volname "backtext" \
             -srcfolder dist-macos/dmg-staging \
             -ov -format UDZO \
-            dist-macos/backtext_0.2.0_macos_arm64.dmg
+            dist-macos/backtext_0.3.0_macos_arm64.dmg
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$APP_DIR" \
-            dist-macos/backtext_0.2.0_macos_arm64.app.zip
+            dist-macos/backtext_0.3.0_macos_arm64.app.zip
 
           cp target/aarch64-apple-darwin/release/backtext-mcp dist-macos/backtext-mcp-macos-arm64
           chmod 755 dist-macos/backtext-mcp-macos-arm64
@@ -182,44 +210,47 @@ jobs:
       - name: Upload macOS Apple Silicon Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtext-macos-apple-silicon-arm64-v0.2.0
+          name: backtext-macos-apple-silicon-arm64-v0.3.0
           path: |
-            dist-macos/backtext_0.2.0_macos_arm64.dmg
-            dist-macos/backtext_0.2.0_macos_arm64.app.zip
+            dist-macos/backtext_0.3.0_macos_arm64.dmg
+            dist-macos/backtext_0.3.0_macos_arm64.app.zip
             dist-macos/backtext-mcp-macos-arm64
 
-      - name: Publish / Update GitHub Release v0.2.0
+      - name: Publish / Update GitHub Release v0.3.0
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NOTES=$(printf '%s\n' \
-            '## backtext v0.2.0 — Alle Phasen (3–6) für Apple Silicon (`arm64` · M1–M5 Pro/Max)' \
+            '## backtext v0.3.0 — Produktiv-Release für Apple Silicon (`arm64` · M1–M5 Pro/Max)' \
             '' \
-            '### Neu in v0.2.0' \
-            '- **Phase 3 (Autonomer Hintergrund & nativer Swift-Sensor):** Kompilierter `backtext-macos-sensor` (`ScreenCaptureKit` Dual-Audio & Screenshots, `Apple Vision` OCR, `AXUIElement`, `NSPasteboard`), 4s-Daemon-Loop mit Fokus-/Verweildauer-Tracking, Onboarding-Berechtigungs-Check & 1-Klick Beispieldaten-Reset.' \
-            '- **Phase 4 (Akustische Voiceprints, Whisper & STT):** Echte 16kHz PCM VAD & 256-dim MFCC/Pitch-Stimmprofile, In-App Whisper GGML Modell-Downloader (Apple Metal), Cloud-STT (Deepgram Nova-3 Diarisierung, OpenAI Whisper, Groq) sowie neuronale Ollama-/OpenAI-Embeddings.' \
-            '- **Phase 5 (Keychain, SQLCipher & Live-Streaming):** AES-256 SQLCipher At-Rest-Verschlüsselung, macOS Keychain API-Tresor + Live-Token-Streaming für Anthropic Claude, OpenAI, Google Gemini & Ollama.' \
-            '- **Phase 6 (macOS Polish):** Systemweiter `⌥ Space` Global Shortcut für das Hover-Overlay (`NSWindowSharingNone`), nativer `EventKit`- + `.ics`-Kalender-Sync mit Vorbereitungs-Briefings, Login-Autostart & Update-Prüfung.' \
+            '### Neu in v0.3.0' \
+            '- **Echte kontinuierliche Meeting-Aufzeichnung:** Starten eines Meetings startet sofort den lückenlosen Dual-Channel-Stream (Mikrofon + ScreenCaptureKit System-Audio) mit Live-Audio-Pegel, Timer, lokalem WAV-Backup und fortlaufender Live-Transkription.' \
+            '- **Gebündeltes Apple-Metal `whisper-cli`:** Statisches `whisper-cli` mit eingebetteten Metal-Shadern direkt in `backtext.app` enthalten — kein Homebrew nötig; einfach Modell in *Einstellungen → Lokale Modelle* laden.' \
+            '- **macOS Bedienungshilfen (Accessibility) Fix:** `AXIsProcessTrusted` & `AXUIElement` laufen jetzt direkt In-Process im Hauptprozess (`backtext-desktop`), inklusive automatischem Permission-Refresh beim Zurückwechseln aus den Systemeinstellungen.' \
+            '- **OpenRouter & PrimaLabs LLM-Provider:** Erstklassiges Live-Streaming für OpenRouter & PrimaLabs (Zero Data Retention, inkl. `DeepSeek-V4.1-Flash`, `Kimi-K3.1-Pro`, `MiMo-V2.6-Pro`, `GLM-5.3-Flash`) mit Live-Modellabruf, Verbindungstest und transparenten Fehlerhinweisen.' \
+            '- **Neuer Bereich „Einstellungen“ & entschlackte „Personalisierung“:** Saubere Trennung zwischen persönlichem Profil/Stimmprofil/Glossar und Technik (KI-Router, API-Tresor, Lokale Modelle, frei konfigurierbarer Hover-Shortcut, Kalender, System & Updates).' \
+            '- **Granola-inspiriertes Meetings-UI:** Einklappbare Sidebar, inline editierbarer Titel, vollflächige Notizfläche mit Debounce-Auto-Save, kompakte Teilnehmer-Auswahl und schlanke KI-Chat- & `/`-Recipe-Leiste unten.' \
             '' \
-            '### Installation auf macOS (M1–M5 Pro)' \
-            '1. Lade **`backtext_0.2.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
+            '### Installation / Update auf macOS (M1–M5 Pro)' \
+            '1. Lade **`backtext_0.3.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
             '2. Entferne einmalig die Browser-Quarantäne im Terminal:' \
             '```bash' \
             'xattr -cr /Applications/backtext.app && open /Applications/backtext.app' \
-            '```')
-          if gh release view v0.2.0 >/dev/null 2>&1; then
-            gh release upload v0.2.0 \
-              dist-macos/backtext_0.2.0_macos_arm64.dmg \
-              dist-macos/backtext_0.2.0_macos_arm64.app.zip \
+            '```' \
+            '3. Falls du von `v0.2.0` updatest: In macOS *Systemeinstellungen → Datenschutz → Bedienungshilfen / Bildschirmaufnahme* `backtext` ggf. einmal aus- und wieder einschalten (wegen ad-hoc Signatur-Wechsel).')
+          if gh release view v0.3.0 >/dev/null 2>&1; then
+            gh release upload v0.3.0 \
+              dist-macos/backtext_0.3.0_macos_arm64.dmg \
+              dist-macos/backtext_0.3.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
               --clobber
-            gh release edit v0.2.0 --notes "$NOTES"
+            gh release edit v0.3.0 --notes "$NOTES"
           else
-            gh release create v0.2.0 \
-              dist-macos/backtext_0.2.0_macos_arm64.dmg \
-              dist-macos/backtext_0.2.0_macos_arm64.app.zip \
+            gh release create v0.3.0 \
+              dist-macos/backtext_0.3.0_macos_arm64.dmg \
+              dist-macos/backtext_0.3.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
-              --title "backtext v0.2.0 — macOS Apple Silicon (M1–M5)" \
+              --title "backtext v0.3.0 — macOS Apple Silicon (M1–M5) Productive Release" \
               --notes "$NOTES"
           fi

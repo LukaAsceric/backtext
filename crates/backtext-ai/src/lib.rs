@@ -2,11 +2,12 @@ pub mod providers;
 pub mod stt;
 
 pub use providers::{
-    compute_embedding_256, list_ollama_models, test_provider_connection, ProviderTestResult,
+    compute_embedding_256, list_ollama_models, list_provider_models, test_provider_connection,
+    ProviderTestResult,
 };
 pub use stt::{
-    detect_whisper_cli_path, download_whisper_model, list_whisper_models, transcribe_wav_file,
-    TranscribedUtterance,
+    detect_whisper_cli_path, download_whisper_model, list_whisper_models, stt_readiness_status,
+    transcribe_wav_file, TranscribedUtterance,
 };
 
 use anyhow::Result;
@@ -108,7 +109,7 @@ impl HybridAiEngine {
             &profile.display_name,
         );
 
-        if let Some((llm_md, provider_used)) = providers::stream_completion(
+        let outcome = providers::stream_completion(
             &self.http,
             &ai_settings,
             storage.secrets(),
@@ -116,8 +117,9 @@ impl HybridAiEngine {
             &usr_prompt,
             None,
         )
-        .await
-        {
+        .await;
+
+        if let Some((llm_md, provider_used)) = outcome.result {
             let exec_summary = llm_md
                 .lines()
                 .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
@@ -138,6 +140,10 @@ impl HybridAiEngine {
                 provider_used,
             });
         }
+
+        let provider_error_banner = outcome.last_error.map(|err| {
+            format!("*Hinweis ({err}) — lokale Offline-Synthese verwendet.*\n\n")
+        });
 
         // Local deterministic synthesis when offline (Granola Hybrid Notepad Fusion)
         let participant_names: Vec<String> = detail
@@ -183,7 +189,7 @@ impl HybridAiEngine {
             )
         };
 
-        let mut md = String::new();
+        let mut md = provider_error_banner.unwrap_or_default();
         if !user_bullets.is_empty() {
             md.push_str(if is_de {
                 "### Angereicherte Kernpunkte (aus deinen Notizen + Transkript)\n"
@@ -377,7 +383,7 @@ impl HybridAiEngine {
         let assistant_msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let stream_ctx = events.map(|bus| (bus, thread_id.as_str(), assistant_msg_id.as_str()));
 
-        let reply_markdown = if let Some((ext_reply, _provider)) = providers::stream_completion(
+        let outcome = providers::stream_completion(
             &self.http,
             &ai_settings,
             storage.secrets(),
@@ -385,11 +391,12 @@ impl HybridAiEngine {
             &rendered_prompt,
             stream_ctx,
         )
-        .await
-        {
+        .await;
+
+        let reply_markdown = if let Some((ext_reply, _provider)) = outcome.result {
             ext_reply
         } else {
-            let local = synthesize_local_assistant_reply(
+            let mut local = synthesize_local_assistant_reply(
                 matched_recipe.as_ref(),
                 trimmed,
                 &profile,
@@ -398,6 +405,11 @@ impl HybridAiEngine {
                 &clipboard,
                 &search_hits,
             );
+            if let Some(err) = outcome.last_error {
+                local = format!(
+                    "*KI-Provider Hinweis ({err}) — lokaler Offline-Assistent genutzt.*\n\n{local}"
+                );
+            }
             if let Some(bus) = events {
                 bus.publish(BacktextEvent::ChatStreamDelta {
                     thread_id: thread_id.clone(),

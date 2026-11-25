@@ -318,11 +318,26 @@ export interface AiProviderSettings {
   embedding_provider: string;
   embedding_model: string;
   ollama_url: string;
+  hover_shortcut: string;
   openai_api_key_set: boolean;
   anthropic_api_key_set: boolean;
   gemini_api_key_set: boolean;
+  openrouter_api_key_set: boolean;
+  primalabs_api_key_set: boolean;
   deepgram_api_key_set: boolean;
   groq_api_key_set: boolean;
+}
+
+export interface RecordingAudioLevel {
+  meeting_id: string;
+  mic_level: number;
+  system_level: number;
+  mic_active: boolean;
+  system_active: boolean;
+  elapsed_secs: number;
+  stt_ready: boolean;
+  stt_status: string;
+  warning: string | null;
 }
 
 export interface MemorySearchHit {
@@ -380,4 +395,12 @@ export type BacktextRealtimeEvent =
     }
   | { event: 'calendar_synced'; payload: { imported_count: number } }
   | { event: 'capture_status_changed'; payload: CaptureStatus }
+  | { event: 'recording_audio_level'; payload: RecordingAudioLevel }
+  | { event: 'transcript_segment_added'; payload: TranscriptSegment }
+  | { event: 'screenshare_captured'; payload: ScreenShareFrame }
+  | {
+      event: 'participant_updated';
+      payload: { meeting_id: string; participant: MeetingParticipant };
+    }
+  | { event: 'meeting_summarized'; payload: { meeting_id: string; executive_summary: string } }
   | { event: string; payload: unknown };

@@ -14,6 +14,8 @@ pub const KEY_DB_MASTER: &str = "db_master_key";
 pub const KEY_OPENAI: &str = "openai_api_key";
 pub const KEY_ANTHROPIC: &str = "anthropic_api_key";
 pub const KEY_GEMINI: &str = "gemini_api_key";
+pub const KEY_OPENROUTER: &str = "openrouter_api_key";
+pub const KEY_PRIMALABS: &str = "primalabs_api_key";
 pub const KEY_DEEPGRAM: &str = "deepgram_api_key";
 pub const KEY_GROQ: &str = "groq_api_key";
 
@@ -204,6 +206,8 @@ impl SecretVault {
             KEY_OPENAI => Some("OPENAI_API_KEY"),
             KEY_ANTHROPIC => Some("ANTHROPIC_API_KEY"),
             KEY_GEMINI => Some("GEMINI_API_KEY"),
+            KEY_OPENROUTER => Some("OPENROUTER_API_KEY"),
+            KEY_PRIMALABS => Some("PRIMALABS_API_KEY"),
             KEY_DEEPGRAM => Some("DEEPGRAM_API_KEY"),
             KEY_GROQ => Some("GROQ_API_KEY"),
             _ => None,

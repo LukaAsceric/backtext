@@ -2,8 +2,10 @@ pub mod controller;
 pub mod daemon_loop;
 pub mod http_server;
 
-use controller::AppController;
+use backtext_core::BacktextEvent;
+use controller::{format_shortcut_display, AppController};
 use serde_json::Value;
+use std::str::FromStr;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -61,12 +63,49 @@ fn set_autostart_enabled(
     Ok(active)
 }
 
-fn setup_menubar_tray(app: &tauri::App, tray_ctrl: AppController) -> tauri::Result<()> {
+#[tauri::command]
+fn set_global_shortcut(
+    app: tauri::AppHandle,
+    controller: State<'_, AppController>,
+    shortcut: String,
+) -> Result<String, String> {
+    let trimmed = shortcut.trim();
+    if trimmed.is_empty() {
+        return Err("Shortcut darf nicht leer sein.".into());
+    }
+    let parsed = Shortcut::from_str(trimmed)
+        .map_err(|e| format!("Ungültiges Shortcut-Format '{trimmed}': {e}"))?;
+
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+    gs.register(parsed).map_err(|e| {
+        format!(
+            "Shortcut '{trimmed}' konnte nicht registriert werden (evtl. bereits durch macOS oder eine andere App belegt): {e}"
+        )
+    })?;
+
+    if let Ok(mut ai) = controller.storage.get_ai_settings() {
+        ai.hover_shortcut = trimmed.to_string();
+        let _ = controller.storage.save_ai_settings(&ai);
+    }
+    let display = format_shortcut_display(trimmed);
+    let tel = controller.update_telemetry(|t| t.global_shortcut = display.clone());
+    controller
+        .events
+        .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
+    Ok(display)
+}
+
+fn setup_menubar_tray(
+    app: &tauri::App,
+    tray_ctrl: AppController,
+    shortcut_label: &str,
+) -> tauri::Result<()> {
     let open_main = MenuItem::with_id(app, "open_main", "backtext öffnen", true, None::<&str>)?;
     let open_hover = MenuItem::with_id(
         app,
         "open_hover",
-        "Hover-Assistent (⌥ Space)",
+        &format!("Hover-Assistent ({shortcut_label})"),
         true,
         None::<&str>,
     )?;
@@ -178,13 +217,24 @@ pub fn run() {
             let autostart_active = app.autolaunch().is_enabled().unwrap_or(false);
             setup_controller.update_telemetry(|t| t.autostart_enabled = autostart_active);
 
-            // Register system-wide Option+Space (Alt+Space) hotkey for Hover Overlay
-            let hover_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-            if let Err(err) = app.global_shortcut().register(hover_shortcut) {
-                tracing::warn!("Could not register global shortcut Alt+Space: {err}");
+            // Register user-configured global hotkey for Hover Overlay (default: Alt+Space)
+            let saved_shortcut_spec = setup_controller
+                .storage
+                .get_ai_settings()
+                .map(|s| s.hover_shortcut)
+                .unwrap_or_else(|_| "Alt+Space".into());
+            let parsed_shortcut = Shortcut::from_str(&saved_shortcut_spec)
+                .unwrap_or_else(|_| Shortcut::new(Some(Modifiers::ALT), Code::Space));
+            if let Err(err) = app.global_shortcut().register(parsed_shortcut) {
+                tracing::warn!(
+                    "Could not register global shortcut '{}': {err}",
+                    saved_shortcut_spec
+                );
             }
+            let display_shortcut = format_shortcut_display(&saved_shortcut_spec);
+            setup_controller.update_telemetry(|t| t.global_shortcut = display_shortcut.clone());
 
-            // Forward Rust EventBus events directly into Tauri webview windows for live token streaming
+            // Forward Rust EventBus events directly into Tauri webview windows for live token & audio streaming
             let mut rx = setup_controller.events.subscribe();
             let app_handle_for_events = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -220,7 +270,9 @@ pub fn run() {
                 }
             });
 
-            if let Err(err) = setup_menubar_tray(app, setup_controller.clone()) {
+            if let Err(err) =
+                setup_menubar_tray(app, setup_controller.clone(), &display_shortcut)
+            {
                 tracing::warn!("Menubar tray initialization skipped: {err}");
             }
 
@@ -238,7 +290,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backtext_rpc,
             toggle_hover_overlay,
-            set_autostart_enabled
+            set_autostart_enabled,
+            set_global_shortcut
         ])
         .run(tauri::generate_context!())
         .expect("error while running backtext Tauri application");

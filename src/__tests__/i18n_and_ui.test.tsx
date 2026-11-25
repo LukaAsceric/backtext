@@ -19,4 +19,11 @@ describe('backtext i18n and formatting utilities', () => {
     expect(sourceBadgeLabel('voiceprint', 'de')).toContain('Voiceprint');
     expect(sourceBadgeLabel('visual_active_speaker', 'en')).toContain('Active Speaker OCR');
   });
+
+  it('exposes Settings navigation and clean Granola meeting labels', () => {
+    expect(t('de', 'settings')).toBe('Einstellungen');
+    expect(t('en', 'settings')).toBe('Settings');
+    expect(t('de', 'notepadTab')).toBe('Notizen');
+    expect(t('de', 'enhancedTab')).toBe('KI-Notizen');
+  });
 });

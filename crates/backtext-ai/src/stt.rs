@@ -25,7 +25,18 @@ pub fn models_directory() -> PathBuf {
 }
 
 pub fn detect_whisper_cli_path() -> Option<PathBuf> {
+    // 1. Prefer bundled Apple Silicon Metal whisper-cli shipped inside backtext.app/Contents/MacOS/
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("whisper-cli");
+            if bundled.exists() {
+                return Some(bundled);
+            }
+        }
+    }
+
     let candidates = [
+        "/Applications/backtext.app/Contents/MacOS/whisper-cli",
         "/opt/homebrew/bin/whisper-cli",
         "/usr/local/bin/whisper-cli",
         "/opt/homebrew/bin/whisper-cpp",
@@ -39,15 +50,67 @@ pub fn detect_whisper_cli_path() -> Option<PathBuf> {
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            for name in ["whisper-cli", "whisper-cpp", "main"] {
+            for name in ["whisper-cli", "whisper-cpp"] {
                 let candidate = dir.join(name);
-                if candidate.exists() && name != "main" {
+                if candidate.exists() {
                     return Some(candidate);
                 }
             }
         }
     }
     None
+}
+
+/// Returns `(ready, human_status)` describing which live STT engine will transcribe recorded audio.
+pub fn stt_readiness_status(settings: &AiProviderSettings, vault: &SecretVault) -> (bool, String) {
+    match settings.stt_provider.as_str() {
+        "deepgram" if vault.has_secret(KEY_DEEPGRAM) => {
+            return (true, "Deepgram Nova-3 (Live + Diarisierung)".into());
+        }
+        "openai_audio" if vault.has_secret(KEY_OPENAI) => {
+            return (true, "OpenAI Whisper".into());
+        }
+        "groq_whisper" if vault.has_secret(KEY_GROQ) => {
+            return (true, "Groq Whisper Large-v3-Turbo".into());
+        }
+        _ => {}
+    }
+
+    let cli_ok = detect_whisper_cli_path().is_some();
+    let model_path = models_directory().join(format!("{}.bin", settings.whisper_model_id));
+    let model_ok = model_path.exists()
+        && std::fs::metadata(&model_path)
+            .map(|m| m.len() > 1_000_000)
+            .unwrap_or(false);
+
+    if cli_ok && model_ok {
+        return (
+            true,
+            format!("Lokal: {} (Apple Metal)", settings.whisper_model_id),
+        );
+    }
+
+    if vault.has_secret(KEY_DEEPGRAM) {
+        return (true, "Deepgram Nova-3 (Fallback)".into());
+    }
+    if vault.has_secret(KEY_OPENAI) {
+        return (true, "OpenAI Whisper (Fallback)".into());
+    }
+    if vault.has_secret(KEY_GROQ) {
+        return (true, "Groq Whisper (Fallback)".into());
+    }
+
+    if cli_ok && !model_ok {
+        return (
+            false,
+            "Audio wird mitgeschnitten · Lade in Einstellungen → Lokale Modelle ein Whisper-Modell (oder hinterlege Deepgram/OpenAI/Groq).".into(),
+        );
+    }
+
+    (
+        false,
+        "Audio wird lokal gespeichert · Für Live-Transkription bitte Whisper-Modell in Einstellungen laden oder Deepgram/OpenAI/Groq-Key hinterlegen.".into(),
+    )
 }
 
 pub fn list_whisper_models() -> Vec<WhisperModelInfo> {

@@ -59,6 +59,54 @@ pub struct DualAudioCaptureChunk {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DualAudioStreamEvent {
+    Level {
+        mic_rms: f32,
+        system_rms: f32,
+        mic_active: bool,
+        system_active: bool,
+        elapsed_secs: u64,
+        error: Option<String>,
+    },
+    Chunk {
+        seq: u64,
+        mic_wav_path: Option<String>,
+        mic_samples: usize,
+        system_wav_path: Option<String>,
+        system_samples: usize,
+    },
+}
+
+pub struct DualAudioStreamSession {
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<DualAudioStreamEvent>,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl DualAudioStreamSession {
+    pub fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<DualAudioStreamEvent>,
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            rx,
+            stop_tx: Some(stop_tx),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for DualAudioStreamSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalendarAttendee {
     pub name: String,
     pub email: String,
@@ -97,6 +145,11 @@ pub trait PlatformSensors: Send + Sync {
         out_dir: &str,
         duration_secs: u64,
     ) -> anyhow::Result<DualAudioCaptureChunk>;
+    async fn start_dual_audio_stream(
+        &self,
+        out_dir: &str,
+        chunk_secs: u64,
+    ) -> anyhow::Result<DualAudioStreamSession>;
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> anyhow::Result<bool>;
     async fn upcoming_calendar_events(&self) -> anyhow::Result<Vec<CalendarMeetingEvent>>;
     async fn read_safe_clipboard(&self) -> anyhow::Result<Option<SafeClipboardObservation>>;

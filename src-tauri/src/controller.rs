@@ -1,7 +1,8 @@
 use anyhow::Result;
 use backtext_ai::{
-    detect_whisper_cli_path, download_whisper_model, list_ollama_models, list_whisper_models,
-    test_provider_connection, transcribe_wav_file, EnhancedMeetingResult, HybridAiEngine,
+    detect_whisper_cli_path, download_whisper_model, list_ollama_models, list_provider_models,
+    list_whisper_models, stt_readiness_status, test_provider_connection, transcribe_wav_file,
+    EnhancedMeetingResult, HybridAiEngine,
 };
 use backtext_context::{
     compact_snapshots_to_episode, evaluate_clipboard_capture, evaluate_context_candidate,
@@ -13,9 +14,12 @@ use backtext_meeting::{
     extract_voiceprint_from_wav, ScreenShareDeduplicator, SpeakerAttributionSession,
 };
 use backtext_platform::{
-    default_platform_sensors, fetch_and_parse_ics_url, PermissionStatus, PlatformSensors,
+    default_platform_sensors, fetch_and_parse_ics_url, DualAudioStreamEvent, PermissionStatus,
+    PlatformSensors,
 };
-use backtext_storage::secrets::{KEY_ANTHROPIC, KEY_DEEPGRAM, KEY_GEMINI, KEY_GROQ, KEY_OPENAI};
+use backtext_storage::secrets::{
+    KEY_ANTHROPIC, KEY_DEEPGRAM, KEY_GEMINI, KEY_GROQ, KEY_OPENAI, KEY_OPENROUTER, KEY_PRIMALABS,
+};
 use backtext_storage::StorageEngine;
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
@@ -65,7 +69,20 @@ pub struct AppController {
     pub sensors: Arc<dyn PlatformSensors>,
     capture_status: Arc<Mutex<CaptureStatus>>,
     live_sessions: Arc<Mutex<HashMap<String, LiveMeetingRuntime>>>,
+    active_recorders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     telemetry: Arc<Mutex<DaemonTelemetry>>,
+}
+
+pub fn format_shortcut_display(shortcut: &str) -> String {
+    match shortcut {
+        "Alt+Space" => "Alt+Space (⌥ Space)".to_string(),
+        "CommandOrControl+Shift+Space" => "⌘⇧ Space".to_string(),
+        "Alt+Shift+Space" => "⌥⇧ Space".to_string(),
+        "CommandOrControl+Shift+B" => "⌘⇧ B".to_string(),
+        "CommandOrControl+Shift+K" => "⌘⇧ K".to_string(),
+        "Control+Space" => "⌃ Space".to_string(),
+        other => other.to_string(),
+    }
 }
 
 impl AppController {
@@ -86,6 +103,10 @@ impl AppController {
         let mcp = McpServer::new(storage.clone(), events.clone());
         let sensors = default_platform_sensors();
         let demo_present = storage.has_demo_data().unwrap_or(false);
+        let saved_shortcut = storage
+            .get_ai_settings()
+            .map(|s| s.hover_shortcut)
+            .unwrap_or_else(|_| "Alt+Space".into());
 
         let initial_telemetry = DaemonTelemetry {
             loop_running: false,
@@ -100,7 +121,7 @@ impl AppController {
             db_encrypted: storage.is_encrypted(),
             keychain_backend: storage.secrets().backend_name().to_string(),
             autostart_enabled: false,
-            global_shortcut: "Alt+Space (⌥ Space)".into(),
+            global_shortcut: format_shortcut_display(&saved_shortcut),
             demo_data_present: demo_present,
             whisper_cli_detected: detect_whisper_cli_path().is_some(),
         };
@@ -113,6 +134,7 @@ impl AppController {
             sensors,
             capture_status: Arc::new(Mutex::new(CaptureStatus::Active)),
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_recorders: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Arc::new(Mutex::new(initial_telemetry)),
         })
     }
@@ -299,9 +321,154 @@ impl AppController {
         *self.capture_status.lock() = status.clone();
         self.events.publish(BacktextEvent::CaptureStatusChanged(status));
 
+        // Immediately start continuous dual-channel audio recording (Mic + ScreenCaptureKit System Audio)
+        self.start_continuous_recorder_for_meeting(&meeting.id);
+
         self.storage
             .get_meeting_detail(&meeting.id)?
             .ok_or_else(|| anyhow::anyhow!("Failed to load started meeting"))
+    }
+
+    pub fn stop_recorder_for_meeting(&self, meeting_id: &str) {
+        if let Some(tx) = self.active_recorders.lock().remove(meeting_id) {
+            let _ = tx.send(());
+        }
+    }
+
+    fn stop_all_recorders(&self) {
+        let drains: Vec<tokio::sync::oneshot::Sender<()>> = self
+            .active_recorders
+            .lock()
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in drains {
+            let _ = tx.send(());
+        }
+    }
+
+    fn meeting_recordings_dir(&self, meeting_id: &str) -> PathBuf {
+        let base = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".backtext-data").join("recordings"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("backtext-recordings"));
+        base.join(meeting_id)
+    }
+
+    /// Spawns a persistent background dual-audio recording & live transcription task for `meeting_id`.
+    /// Streams real-time audio levels every 500ms and transcribes seamless 8s WAV chunks.
+    pub fn start_continuous_recorder_for_meeting(&self, meeting_id: &str) {
+        self.stop_all_recorders();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        self.active_recorders
+            .lock()
+            .insert(meeting_id.to_string(), stop_tx);
+
+        let ctrl = self.clone();
+        let mid = meeting_id.to_string();
+        rt.spawn(async move {
+            let rec_dir = ctrl.meeting_recordings_dir(&mid);
+            let _ = std::fs::create_dir_all(&rec_dir);
+
+            let mut session = match ctrl
+                .sensors
+                .start_dual_audio_stream(&rec_dir.display().to_string(), 8)
+                .await
+            {
+                Ok(s) => s,
+                Err(err) => {
+                    ctrl.events.publish(BacktextEvent::RecordingAudioLevel {
+                        meeting_id: mid.clone(),
+                        mic_level: 0.0,
+                        system_level: 0.0,
+                        mic_active: false,
+                        system_active: false,
+                        elapsed_secs: 0,
+                        stt_ready: false,
+                        stt_status: "Audio-Aufnahme konnte nicht gestartet werden".into(),
+                        warning: Some(err.to_string()),
+                    });
+                    ctrl.active_recorders.lock().remove(&mid);
+                    return;
+                }
+            };
+
+            let mut tick_idx: u64 = 0;
+            let mut cached_stt = (false, String::new());
+            let mut last_stt_error: Option<String> = None;
+
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        session.stop();
+                        // Drain final flushed chunk if emitted during graceful shutdown
+                        let _ = tokio::time::timeout(std::time::Duration::from_millis(2600), async {
+                            while let Some(ev) = session.rx.recv().await {
+                                if let DualAudioStreamEvent::Chunk { mic_wav_path, system_wav_path, .. } = ev {
+                                    let _ = ctrl.process_recorded_audio_pair(&mid, mic_wav_path, system_wav_path).await;
+                                }
+                            }
+                        }).await;
+                        break;
+                    }
+                    maybe_ev = session.rx.recv() => {
+                        let Some(ev) = maybe_ev else {
+                            break;
+                        };
+                        match ev {
+                            DualAudioStreamEvent::Level {
+                                mic_rms,
+                                system_rms,
+                                mic_active,
+                                system_active,
+                                elapsed_secs,
+                                error,
+                            } => {
+                                if tick_idx % 8 == 0 {
+                                    if let Ok(ai_cfg) = ctrl.storage.get_ai_settings() {
+                                        cached_stt = stt_readiness_status(&ai_cfg, ctrl.storage.secrets());
+                                    }
+                                }
+                                tick_idx += 1;
+                                ctrl.events.publish(BacktextEvent::RecordingAudioLevel {
+                                    meeting_id: mid.clone(),
+                                    mic_level: mic_rms,
+                                    system_level: system_rms,
+                                    mic_active,
+                                    system_active,
+                                    elapsed_secs,
+                                    stt_ready: cached_stt.0,
+                                    stt_status: cached_stt.1.clone(),
+                                    warning: error.or_else(|| last_stt_error.clone()),
+                                });
+                            }
+                            DualAudioStreamEvent::Chunk {
+                                mic_wav_path,
+                                system_wav_path,
+                                ..
+                            } => {
+                                match ctrl
+                                    .process_recorded_audio_pair(&mid, mic_wav_path, system_wav_path)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        last_stt_error = None;
+                                    }
+                                    Err(err) => {
+                                        last_stt_error = Some(format!("Transkription: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ctrl.active_recorders.lock().remove(&mid);
+        });
     }
 
     /// Captures a real macOS ScreenCaptureKit screenshot during a live meeting, checks dHash
@@ -353,23 +520,12 @@ impl AppController {
         Ok(true)
     }
 
-    /// Records a real dual-channel audio chunk (Mic + ScreenCaptureKit System Audio),
-    /// extracts 256-dim acoustic MFCC/pitch voiceprints, runs configured Whisper/Deepgram/OpenAI STT,
-    /// and attributes speakers into the live meeting transcript.
-    pub async fn capture_real_dual_audio_turn(
+    async fn process_recorded_audio_pair(
         &self,
         meeting_id: &str,
-        duration_secs: u64,
-    ) -> Result<MeetingDetail> {
-        let chunk_dir = std::env::temp_dir().join(format!(
-            "backtext_chunk_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let capture = self
-            .sensors
-            .record_dual_audio_chunk(&chunk_dir.display().to_string(), duration_secs.clamp(3, 15))
-            .await?;
-
+        mic_wav_path: Option<String>,
+        system_wav_path: Option<String>,
+    ) -> Result<usize> {
         let profile = self.storage.get_user_profile()?;
         let vocab = self.storage.list_vocabulary()?;
         let ai_settings = self.storage.get_ai_settings()?;
@@ -387,9 +543,10 @@ impl AppController {
             .ok()
             .and_then(|w| w.detected_active_speaker_tile);
 
+        let mut added = 0usize;
         for (channel, maybe_wav) in [
-            (AudioChannel::Microphone, capture.mic_wav_path),
-            (AudioChannel::System, capture.system_wav_path),
+            (AudioChannel::Microphone, mic_wav_path),
+            (AudioChannel::System, system_wav_path),
         ] {
             let Some(wav_path_str) = maybe_wav else {
                 continue;
@@ -408,8 +565,7 @@ impl AppController {
                 &ai_settings,
                 self.storage.secrets(),
             )
-            .await
-            .unwrap_or_default();
+            .await?;
 
             for utt in utterances {
                 let mut sessions = self.live_sessions.lock();
@@ -445,6 +601,7 @@ impl AppController {
 
                 self.storage.insert_transcript_segment(&seg)?;
                 self.events.publish(BacktextEvent::TranscriptSegmentAdded(seg));
+                added += 1;
                 if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
                     upsert_participant_vec(&mut detail.meeting.participants, participant.clone());
                     self.storage.save_meeting(&detail.meeting)?;
@@ -455,6 +612,29 @@ impl AppController {
                 }
             }
         }
+        Ok(added)
+    }
+
+    /// Records a single dual-channel audio turn (Mic + ScreenCaptureKit System Audio),
+    /// extracts 256-dim acoustic MFCC/pitch voiceprints, runs configured STT,
+    /// and attributes speakers into the live meeting transcript.
+    pub async fn capture_real_dual_audio_turn(
+        &self,
+        meeting_id: &str,
+        duration_secs: u64,
+    ) -> Result<MeetingDetail> {
+        let chunk_dir = std::env::temp_dir().join(format!(
+            "backtext_chunk_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let capture = self
+            .sensors
+            .record_dual_audio_chunk(&chunk_dir.display().to_string(), duration_secs.clamp(3, 15))
+            .await?;
+
+        let _ = self
+            .process_recorded_audio_pair(meeting_id, capture.mic_wav_path, capture.system_wav_path)
+            .await;
 
         let _ = std::fs::remove_dir_all(&chunk_dir);
         self.storage
@@ -596,6 +776,10 @@ impl AppController {
     }
 
     pub async fn stop_and_summarize_meeting(&self, meeting_id: &str) -> Result<MeetingDetail> {
+        // Stop continuous audio stream and allow brief graceful flush of the final audio chunk
+        self.stop_recorder_for_meeting(meeting_id);
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
         self.live_sessions.lock().remove(meeting_id);
         if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
             detail.meeting.status = MeetingStatus::Completed;
@@ -616,6 +800,23 @@ impl AppController {
         self.storage
             .get_meeting_detail(meeting_id)?
             .ok_or_else(|| anyhow::anyhow!("Meeting not found after summary"))
+    }
+
+    pub fn delete_meeting(&self, meeting_id: &str) -> Result<bool> {
+        self.stop_recorder_for_meeting(meeting_id);
+        self.live_sessions.lock().remove(meeting_id);
+        let was_active = matches!(
+            &*self.capture_status.lock(),
+            CaptureStatus::RecordingMeeting { meeting_id: active_id, .. } if active_id == meeting_id
+        );
+        if was_active {
+            *self.capture_status.lock() = CaptureStatus::Active;
+            self.events
+                .publish(BacktextEvent::CaptureStatusChanged(CaptureStatus::Active));
+        }
+        let rec_dir = self.meeting_recordings_dir(meeting_id);
+        let _ = std::fs::remove_dir_all(&rec_dir);
+        self.storage.delete_meeting(meeting_id)
     }
 
     pub async fn enhance_meeting(&self, meeting_id: &str) -> Result<EnhancedMeetingResult> {
@@ -904,6 +1105,20 @@ impl AppController {
                 self.storage.update_meeting_user_notes(id, notes)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
+            "update_meeting_title" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.update_meeting_title(id, title)?;
+                Ok(serde_json::to_value(self.storage.get_meeting_detail(id)?)?)
+            }
+            "delete_meeting" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let deleted = self.delete_meeting(id)?;
+                Ok(serde_json::json!({
+                    "deleted": deleted,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
             "enhance_meeting" => {
                 let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
                 let res = self.enhance_meeting(id).await?;
@@ -1002,6 +1217,8 @@ impl AppController {
                     "openai" => KEY_OPENAI,
                     "anthropic" => KEY_ANTHROPIC,
                     "gemini" => KEY_GEMINI,
+                    "openrouter" => KEY_OPENROUTER,
+                    "primalabs" => KEY_PRIMALABS,
                     "deepgram" => KEY_DEEPGRAM,
                     "groq" => KEY_GROQ,
                     _ => anyhow::bail!("Unknown API key provider: {provider}"),
@@ -1015,6 +1232,8 @@ impl AppController {
                     "openai" => KEY_OPENAI,
                     "anthropic" => KEY_ANTHROPIC,
                     "gemini" => KEY_GEMINI,
+                    "openrouter" => KEY_OPENROUTER,
+                    "primalabs" => KEY_PRIMALABS,
                     "deepgram" => KEY_DEEPGRAM,
                     "groq" => KEY_GROQ,
                     _ => anyhow::bail!("Unknown API key provider: {provider}"),
@@ -1033,6 +1252,37 @@ impl AppController {
                 )
                 .await;
                 Ok(serde_json::to_value(res)?)
+            }
+            "list_provider_models" => {
+                let provider = args
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("primalabs");
+                let settings = self.storage.get_ai_settings()?;
+                let models = list_provider_models(
+                    self.ai.http_client(),
+                    provider,
+                    &settings,
+                    self.storage.secrets(),
+                )
+                .await;
+                Ok(serde_json::to_value(models)?)
+            }
+            "set_hover_shortcut" => {
+                let shortcut = args
+                    .get("shortcut")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Alt+Space")
+                    .trim()
+                    .to_string();
+                let mut settings = self.storage.get_ai_settings()?;
+                settings.hover_shortcut = shortcut.clone();
+                self.storage.save_ai_settings(&settings)?;
+                let display = format_shortcut_display(&shortcut);
+                let tel = self.update_telemetry(|t| t.global_shortcut = display.clone());
+                self.events
+                    .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
+                Ok(serde_json::json!({ "shortcut": shortcut, "display": display }))
             }
             "list_ollama_models" => {
                 let settings = self.storage.get_ai_settings()?;

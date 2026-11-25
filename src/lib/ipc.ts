@@ -43,6 +43,16 @@ export async function setNativeAutostart(enabled: boolean): Promise<boolean> {
   return enabled;
 }
 
+export async function setNativeGlobalShortcut(shortcut: string): Promise<string> {
+  if (isTauriRuntime()) {
+    return await invoke<string>('set_global_shortcut', { shortcut });
+  }
+  const res = await callRpc<{ shortcut: string; display: string }>('set_hover_shortcut', {
+    shortcut,
+  });
+  return res.display;
+}
+
 /**
  * Subscribes to real-time backend events (`ChatStreamDelta`, `DaemonTelemetryUpdated`,
  * `ModelDownloadProgress`, `CalendarSynced`) over Tauri native events or HTTP SSE (`/api/events`).

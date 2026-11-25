@@ -486,9 +486,15 @@ pub struct AiProviderSettings {
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     pub ollama_url: String,
+    #[serde(default = "default_hover_shortcut")]
+    pub hover_shortcut: String,
     pub openai_api_key_set: bool,
     pub anthropic_api_key_set: bool,
     pub gemini_api_key_set: bool,
+    #[serde(default)]
+    pub openrouter_api_key_set: bool,
+    #[serde(default)]
+    pub primalabs_api_key_set: bool,
     pub deepgram_api_key_set: bool,
     #[serde(default)]
     pub groq_api_key_set: bool,
@@ -506,6 +512,10 @@ fn default_embedding_model() -> String {
     "nomic-embed-text".to_string()
 }
 
+fn default_hover_shortcut() -> String {
+    "Alt+Space".to_string()
+}
+
 impl Default for AiProviderSettings {
     fn default() -> Self {
         Self {
@@ -517,9 +527,12 @@ impl Default for AiProviderSettings {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
+            hover_shortcut: default_hover_shortcut(),
             openai_api_key_set: false,
             anthropic_api_key_set: false,
             gemini_api_key_set: false,
+            openrouter_api_key_set: false,
+            primalabs_api_key_set: false,
             deepgram_api_key_set: false,
             groq_api_key_set: false,
         }
