@@ -33,6 +33,47 @@ func jsonNullable(_ value: String?) -> Any {
     return NSNull()
 }
 
+func deviceHasInputChannels(_ deviceID: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    let sizeStatus = AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &dataSize)
+    guard sizeStatus == noErr, dataSize >= UInt32(MemoryLayout<AudioBufferList>.size) else {
+        return false
+    }
+    var raw = Data(count: Int(dataSize))
+    let readStatus: OSStatus = raw.withUnsafeMutableBytes { buf -> OSStatus in
+        guard let base = buf.baseAddress else { return -1 }
+        return AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &dataSize, base)
+    }
+    guard readStatus == noErr else { return false }
+    return raw.withUnsafeBytes { buf -> Bool in
+        guard let ptr = buf.bindMemory(to: AudioBufferList.self).baseAddress else { return false }
+        let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: ptr))
+        for audioBuf in list {
+            if audioBuf.mNumberChannels > 0 {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+func isDeviceRunningSomewhere(_ deviceID: AudioDeviceID) -> Bool {
+    var isRunning: UInt32 = 0
+    var runSize = UInt32(MemoryLayout<UInt32>.size)
+    var runAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    let runStatus = AudioObjectGetPropertyData(deviceID, &runAddr, 0, nil, &runSize, &isRunning)
+    return runStatus == noErr && isRunning != 0
+}
+
 func isDefaultMicRunning() -> Bool {
     var deviceID = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -50,16 +91,44 @@ func isDefaultMicRunning() -> Bool {
         &deviceID
     )
     guard status == noErr, deviceID != 0 else { return false }
+    return isDeviceRunningSomewhere(deviceID)
+}
 
-    var isRunning: UInt32 = 0
-    var runSize = UInt32(MemoryLayout<UInt32>.size)
-    var runAddr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+func isAnyInputDeviceRunning() -> Bool {
+    if isDefaultMicRunning() {
+        return true
+    }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
-    let runStatus = AudioObjectGetPropertyData(deviceID, &runAddr, 0, nil, &runSize, &isRunning)
-    return runStatus == noErr && isRunning != 0
+    var dataSize: UInt32 = 0
+    let sizeStatus = AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject),
+        &addr,
+        0,
+        nil,
+        &dataSize
+    )
+    guard sizeStatus == noErr, dataSize > 0 else { return false }
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var devices = [AudioDeviceID](repeating: 0, count: count)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &addr,
+        0,
+        nil,
+        &dataSize,
+        &devices
+    )
+    guard status == noErr else { return false }
+    for dev in devices {
+        if dev != 0 && deviceHasInputChannels(dev) && isDeviceRunningSomewhere(dev) {
+            return true
+        }
+    }
+    return false
 }
 
 func computeDHash64(from cgImage: CGImage) -> UInt64 {
@@ -181,9 +250,18 @@ func collectAXText(_ el: AXUIElement, depth: Int, maxDepth: Int, buffer: inout [
 
 func queryBrowserURL(bundleID: String, appName: String) -> String? {
     let script: String
-    if bundleID == "com.apple.Safari" {
-        script = "tell application \"Safari\" to if (count of documents) > 0 then return URL of front document"
-    } else if ["com.google.Chrome", "company.thebrowser.Browser", "com.brave.Browser", "com.microsoft.edgemac"].contains(bundleID) {
+    if bundleID == "com.apple.Safari" || bundleID == "com.kagi.kagimacOS" {
+        script = "tell application \"\(appName)\" to if (count of documents) > 0 then return URL of front document"
+    } else if [
+        "com.google.Chrome",
+        "org.chromium.Chromium",
+        "company.thebrowser.Browser",
+        "company.thebrowser.dia",
+        "com.brave.Browser",
+        "com.microsoft.edgemac",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera"
+    ].contains(bundleID) {
         script = "tell application \"\(appName)\" to if (count of windows) > 0 then return URL of active tab of front window"
     } else {
         return nil
@@ -199,6 +277,30 @@ func queryBrowserURL(bundleID: String, appName: String) -> String? {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return s.isEmpty ? nil : s
+}
+
+func frontmostCGWindowTitle(for pid: pid_t) -> String {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+        return ""
+    }
+    var bestTitle = ""
+    var bestArea: Double = 0.0
+    for win in list {
+        let ownerPid = (win[kCGWindowOwnerPID as String] as? Int32) ?? 0
+        let layer = (win[kCGWindowLayer as String] as? Int) ?? 0
+        if ownerPid != pid || layer != 0 { continue }
+        let name = (win[kCGWindowName as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.isEmpty { continue }
+        let bounds = win[kCGWindowBounds as String] as? [String: Any]
+        let w = (bounds?["Width"] as? Double) ?? 0.0
+        let h = (bounds?["Height"] as? Double) ?? 0.0
+        let area = w * h
+        if area >= bestArea {
+            bestArea = area
+            bestTitle = name
+        }
+    }
+    return bestTitle
 }
 
 func handlePermissions() {
@@ -308,6 +410,10 @@ func handleActiveWindow() {
         }
     }
 
+    if windowTitle.isEmpty {
+        windowTitle = frontmostCGWindowTitle(for: pid)
+    }
+
     let lowTitle = windowTitle.lowercased()
     let isPrivate = lowTitle.contains("private") || lowTitle.contains("inkognito") || lowTitle.contains("incognito") || lowTitle.contains("privat")
     let browserURL = isPrivate ? nil : queryBrowserURL(bundleID: bundleID, appName: appName)
@@ -340,7 +446,7 @@ func handleActiveWindow() {
         "is_secure_field_focused": secureFocused,
         "detected_screen_share_presenter": jsonNullable(presenter),
         "detected_active_speaker_tile": jsonNullable(activeSpeaker),
-        "mic_running": isDefaultMicRunning()
+        "mic_running": isAnyInputDeviceRunning()
     ]
     JSONOut.emit(payload)
 }
@@ -351,8 +457,14 @@ func captureFrontmostSCImage() async -> CGImage? {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
-        guard let targetWin = content.windows.first(where: {
-            $0.owningApplication?.processID == frontPID && $0.frame.width > 120 && $0.frame.height > 120
+        let candidates = content.windows.filter {
+            $0.owningApplication?.processID == frontPID
+                && $0.windowLayer == 0
+                && $0.frame.width > 160
+                && $0.frame.height > 120
+        }
+        guard let targetWin = candidates.max(by: {
+            ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
         }) else {
             return nil
         }
@@ -903,6 +1015,247 @@ func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
     sigTermSrc.cancel()
 }
 
+func matchMeetingFromStrings(bundleID: String, ownerName: String, title: String, url: String) -> (String, String)? {
+    let bLow = bundleID.lowercased()
+    let oLow = ownerName.lowercased()
+    let tLow = title.lowercased()
+    let uLow = url.lowercased()
+    let combined = "\(bLow) \(oLow) \(tLow) \(uLow)"
+
+    if bLow.contains("com.microsoft.teams") || oLow.contains("microsoft teams") {
+        let cleanTitle = title.isEmpty ? "Microsoft Teams Meeting" : title
+        return ("Microsoft Teams", cleanTitle)
+    }
+    if uLow.contains("teams.microsoft")
+        || uLow.contains("teams.live")
+        || uLow.contains("teams.cloud.microsoft")
+        || tLow.contains("microsoft teams")
+        || tLow.contains("teams.microsoft")
+        || tLow.contains("teams.live")
+    {
+        let cleanTitle = title.isEmpty ? "Microsoft Teams (Browser)" : title
+        return ("Microsoft Teams (Browser)", cleanTitle)
+    }
+    if bLow == "us.zoom.xos"
+        || uLow.contains("zoom.us/j/")
+        || uLow.contains("zoom.us/wc/")
+        || tLow.contains("zoom meeting")
+        || tLow.contains("zoom workplace")
+    {
+        let cleanTitle = title.isEmpty ? "Zoom Meeting" : title
+        return ("Zoom", cleanTitle)
+    }
+    if uLow.contains("meet.google.com/")
+        || tLow.contains("google meet")
+        || tLow.hasPrefix("meet - ")
+        || tLow.hasPrefix("meet – ")
+    {
+        let cleanTitle = title.isEmpty ? "Google Meet" : title
+        return ("Google Meet", cleanTitle)
+    }
+    if (bLow.contains("slack") || oLow.contains("slack")) && tLow.contains("huddle") {
+        let cleanTitle = title.isEmpty ? "Slack Huddle" : title
+        return ("Slack Huddle", cleanTitle)
+    }
+    if bLow == "com.apple.facetime" || oLow == "facetime" {
+        let cleanTitle = title.isEmpty ? "FaceTime" : title
+        return ("FaceTime", cleanTitle)
+    }
+    if combined.contains("webex") {
+        let cleanTitle = title.isEmpty ? "Cisco Webex" : title
+        return ("Cisco Webex", cleanTitle)
+    }
+    if uLow.contains("whereby.com") || tLow.contains("whereby") {
+        let cleanTitle = title.isEmpty ? "Whereby" : title
+        return ("Whereby", cleanTitle)
+    }
+    if uLow.contains("meet.jit.si") || tLow.contains("jitsi meet") {
+        let cleanTitle = title.isEmpty ? "Jitsi Meet" : title
+        return ("Jitsi Meet", cleanTitle)
+    }
+    return nil
+}
+
+func scanBrowserMeetingTab(runningApps: [NSRunningApplication]) -> (String, String)? {
+    let chromiumBundles: [(String, String)] = [
+        ("com.google.Chrome", "Google Chrome"),
+        ("company.thebrowser.Browser", "Arc"),
+        ("com.microsoft.edgemac", "Microsoft Edge"),
+        ("com.brave.Browser", "Brave Browser"),
+        ("com.vivaldi.Vivaldi", "Vivaldi"),
+        ("org.chromium.Chromium", "Chromium")
+    ]
+    let runningBundles = Set(runningApps.compactMap { $0.bundleIdentifier })
+
+    func runOsa(_ script: String) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    for (bid, appName) in chromiumBundles {
+        if !runningBundles.contains(bid) { continue }
+        let script = """
+        tell application "\(appName)"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set u to URL of t
+                    if u contains "teams.microsoft" or u contains "teams.live" or u contains "teams.cloud.microsoft" or u contains "meet.google.com/" or u contains "zoom.us/j/" or u contains "zoom.us/wc/" or u contains "whereby.com" or u contains "meet.jit.si" then
+                        return (title of t) & "|||" & u
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """
+        let res = runOsa(script)
+        if !res.isEmpty {
+            let parts = res.components(separatedBy: "|||")
+            let tabTitle = parts.first ?? ""
+            let tabUrl = parts.count > 1 ? parts[1] : ""
+            if let matched = matchMeetingFromStrings(bundleID: bid, ownerName: appName, title: tabTitle, url: tabUrl) {
+                return matched
+            }
+        }
+    }
+
+    if runningBundles.contains("com.apple.Safari") {
+        let script = """
+        tell application "Safari"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set u to URL of t
+                    if u contains "teams.microsoft" or u contains "teams.live" or u contains "teams.cloud.microsoft" or u contains "meet.google.com/" or u contains "zoom.us/j/" or u contains "zoom.us/wc/" or u contains "whereby.com" or u contains "meet.jit.si" then
+                        return (name of t) & "|||" & u
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """
+        let res = runOsa(script)
+        if !res.isEmpty {
+            let parts = res.components(separatedBy: "|||")
+            let tabTitle = parts.first ?? ""
+            let tabUrl = parts.count > 1 ? parts[1] : ""
+            if let matched = matchMeetingFromStrings(bundleID: "com.apple.Safari", ownerName: "Safari", title: tabTitle, url: tabUrl) {
+                return matched
+            }
+        }
+    }
+
+    return nil
+}
+
+func handleAudioEnvironment() {
+    let micRunning: Bool = isAnyInputDeviceRunning()
+    let runningApps = NSWorkspace.shared.runningApplications
+
+    var pidMap: [Int32: (String, String)] = [:]
+    for app in runningApps {
+        pidMap[app.processIdentifier] = (app.bundleIdentifier ?? "", app.localizedName ?? "")
+    }
+
+    var detectedApp: String? = nil
+    var detectedTitle: String? = nil
+    var hasCallControls: Bool = false
+
+    // 1. Scan ALL on-screen windows (not just frontmost!) — catches Teams Desktop, Teams Browser, Zoom, Meet, Slack Huddle
+    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        var teamsWindowCount: Int = 0
+        for win in list {
+            let layer = (win[kCGWindowLayer as String] as? Int) ?? 0
+            if layer != 0 { continue }
+            let ownerPid = (win[kCGWindowOwnerPID as String] as? Int32) ?? 0
+            let info = pidMap[ownerPid]
+            let bid = info?.0 ?? ""
+            let ownerName = (win[kCGWindowOwnerName as String] as? String) ?? (info?.1 ?? "")
+            let winTitle = (win[kCGWindowName as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let bounds = win[kCGWindowBounds as String] as? [String: Any]
+            let width = (bounds?["Width"] as? Double) ?? 0.0
+            let height = (bounds?["Height"] as? Double) ?? 0.0
+            if width < 120.0 || height < 80.0 { continue }
+
+            let bLow = bid.lowercased()
+            if bLow.contains("com.microsoft.teams") || ownerName.lowercased().contains("microsoft teams") {
+                teamsWindowCount += 1
+            }
+
+            if let (appLabel, mtgTitle) = matchMeetingFromStrings(bundleID: bid, ownerName: ownerName, title: winTitle, url: "") {
+                // Avoid false positives when Teams/Zoom/FaceTime main lobby sits idle without mic or active call window
+                let tLow = winTitle.lowercased()
+                let isDedicatedCallTitle = tLow.contains("besprechung")
+                    || tLow.contains("meeting")
+                    || tLow.contains("anruf")
+                    || tLow.contains("call")
+                    || tLow.contains("huddle")
+                    || tLow.contains("meet.google")
+                    || tLow.contains("meet - ")
+                    || tLow.contains("meet – ")
+                    || (appLabel.contains("Teams") && !winTitle.isEmpty && tLow != "microsoft teams" && tLow != "teams" && !tLow.hasPrefix("chat |") && !tLow.hasPrefix("kalender |") && !tLow.hasPrefix("calendar |"))
+                if micRunning || isDedicatedCallTitle {
+                    detectedApp = appLabel
+                    detectedTitle = mtgTitle
+                    hasCallControls = true
+                    break
+                }
+            }
+        }
+        // Teams desktop opens a 2nd dedicated meeting window alongside main chat window during active calls
+        if detectedApp == nil && teamsWindowCount >= 2 && micRunning {
+            detectedApp = "Microsoft Teams"
+            detectedTitle = "Microsoft Teams Meeting"
+            hasCallControls = true
+        }
+    }
+
+    // 2. If mic is active and no visible window title matched (e.g. Teams/Meet in background browser tab or another Space), scan open browser tabs
+    if detectedApp == nil && micRunning {
+        if let (appLabel, mtgTitle) = scanBrowserMeetingTab(runningApps: runningApps) {
+            detectedApp = appLabel
+            detectedTitle = mtgTitle
+            hasCallControls = true
+        }
+    }
+
+    // 3. Final fallback when mic is active and a dedicated native call app (Teams Desktop / Zoom / FaceTime) is running in another Space
+    if detectedApp == nil && micRunning {
+        for app in runningApps {
+            let bid = (app.bundleIdentifier ?? "").lowercased()
+            if bid.contains("com.microsoft.teams") {
+                detectedApp = "Microsoft Teams"
+                detectedTitle = "Microsoft Teams Meeting"
+                hasCallControls = true
+                break
+            } else if bid == "us.zoom.xos" {
+                detectedApp = "Zoom"
+                detectedTitle = "Zoom Meeting"
+                hasCallControls = true
+                break
+            } else if bid == "com.apple.facetime" {
+                detectedApp = "FaceTime"
+                detectedTitle = "FaceTime"
+                hasCallControls = true
+                break
+            }
+        }
+    }
+
+    let payload: [String: Any] = [
+        "microphone_in_use": micRunning,
+        "system_audio_active": micRunning && (detectedApp != nil),
+        "has_call_controls_ui": hasCallControls,
+        "detected_meeting_app": jsonNullable(detectedApp),
+        "detected_meeting_title": jsonNullable(detectedTitle)
+    ]
+    JSONOut.emit(payload)
+}
+
 func handleRecordMic(outPath: String, seconds: Double) {
     let samples = recordMicrophoneSamples(durationSecs: seconds)
     let sampleCount: Int = samples.count
@@ -924,6 +1277,8 @@ case "request-permission":
     handleRequestPermission(args.count > 2 ? args[2] : "screen")
 case "active-window":
     handleActiveWindow()
+case "audio-env":
+    handleAudioEnvironment()
 case "capture-window-ocr":
     let includeImg = args.contains("--image")
     handleCaptureWindowOCR(includeImage: includeImg)

@@ -904,7 +904,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <Lock size={15} />
                 Sicherheit, Autostart & Updates
               </span>
-              <span className="pill pill-sage">v0.3.0</span>
+              <span className="pill pill-sage">v0.4.0</span>
             </h2>
 
             <div className="transcript-row">

@@ -71,6 +71,7 @@ pub struct AppController {
     live_sessions: Arc<Mutex<HashMap<String, LiveMeetingRuntime>>>,
     active_recorders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     telemetry: Arc<Mutex<DaemonTelemetry>>,
+    pending_manual_stop: Arc<Mutex<bool>>,
 }
 
 pub fn format_shortcut_display(shortcut: &str) -> String {
@@ -136,7 +137,15 @@ impl AppController {
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
             active_recorders: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Arc::new(Mutex::new(initial_telemetry)),
+            pending_manual_stop: Arc::new(Mutex::new(false)),
         })
+    }
+
+    pub fn take_manual_stop_flag(&self) -> bool {
+        let mut guard = self.pending_manual_stop.lock();
+        let was = *guard;
+        *guard = false;
+        was
     }
 
     pub fn update_telemetry<F: FnOnce(&mut DaemonTelemetry)>(&self, f: F) -> DaemonTelemetry {
@@ -776,6 +785,18 @@ impl AppController {
     }
 
     pub async fn stop_and_summarize_meeting(&self, meeting_id: &str) -> Result<MeetingDetail> {
+        self.stop_and_summarize_meeting_internal(meeting_id, true)
+            .await
+    }
+
+    pub async fn stop_and_summarize_meeting_internal(
+        &self,
+        meeting_id: &str,
+        manual: bool,
+    ) -> Result<MeetingDetail> {
+        if manual {
+            *self.pending_manual_stop.lock() = true;
+        }
         // Stop continuous audio stream and allow brief graceful flush of the final audio chunk
         self.stop_recorder_for_meeting(meeting_id);
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
@@ -1138,6 +1159,104 @@ impl AppController {
                     .storage
                     .assign_speaker_identity(mid, label, name, email, None)?;
                 Ok(serde_json::to_value(self.storage.get_meeting_detail(mid)?)?)
+            }
+            "add_meeting_participant" => {
+                let mid = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let name = args
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let email = args
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                let person_id = args
+                    .get("personId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                let detail = self
+                    .storage
+                    .add_meeting_participant(mid, name, email, person_id)?;
+                let persons = self.storage.list_persons()?;
+                Ok(serde_json::json!({
+                    "detail": detail,
+                    "persons": persons
+                }))
+            }
+            "remove_meeting_participant" => {
+                let mid = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let label = args
+                    .get("speakerLabel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = self.storage.remove_meeting_participant(mid, label)?;
+                Ok(serde_json::to_value(detail)?)
+            }
+            "upsert_person" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("per_{}", uuid::Uuid::new_v4().simple()));
+                let full_name = args
+                    .get("fullName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if full_name.is_empty() {
+                    anyhow::bail!("Name darf nicht leer sein.");
+                }
+                let existing = self
+                    .storage
+                    .list_persons()?
+                    .into_iter()
+                    .find(|p| p.id == id);
+                let email = args
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let company = args
+                    .get("company")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let role_notes = args
+                    .get("roleNotes")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let person = Person {
+                    id,
+                    full_name,
+                    email,
+                    company,
+                    role_notes,
+                    voiceprint_samples: existing.as_ref().map(|p| p.voiceprint_samples).unwrap_or(0),
+                    voiceprint_confidence: existing
+                        .as_ref()
+                        .map(|p| p.voiceprint_confidence)
+                        .unwrap_or(0.0),
+                    meeting_count: existing.as_ref().map(|p| p.meeting_count).unwrap_or(0),
+                    open_commitments: existing
+                        .as_ref()
+                        .map(|p| p.open_commitments.clone())
+                        .unwrap_or_default(),
+                    last_seen_at: existing
+                        .as_ref()
+                        .and_then(|p| p.last_seen_at)
+                        .or_else(|| Some(Utc::now())),
+                };
+                self.storage.upsert_person(&person)?;
+                Ok(serde_json::to_value(self.storage.list_persons()?)?)
+            }
+            "delete_person" => {
+                let pid = args.get("personId").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.delete_person(pid)?;
+                Ok(serde_json::to_value(self.storage.list_persons()?)?)
             }
             "run_chat_or_recipe" => {
                 let mid = args.get("meetingId").and_then(|v| v.as_str()).filter(|s| !s.is_empty());

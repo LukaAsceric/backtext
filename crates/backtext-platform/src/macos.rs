@@ -616,23 +616,54 @@ JSON.stringify({ bundleId, appName, pid, winTitle: appName });
     }
 
     async fn observe_audio_environment(&self) -> Result<AudioEnvironmentSignal> {
+        if let v = self.run_sensor_json(&["audio-env"]).await {
+            let mic_active = v["microphone_in_use"].as_bool().unwrap_or(false)
+                || is_macos_default_mic_running();
+            let detected_meeting_app = v["detected_meeting_app"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let detected_meeting_title = v["detected_meeting_title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let has_call_controls_ui = v["has_call_controls_ui"]
+                .as_bool()
+                .unwrap_or(detected_meeting_app.is_some());
+            let system_audio_active = v["system_audio_active"]
+                .as_bool()
+                .unwrap_or(mic_active && detected_meeting_app.is_some());
+            return Ok(AudioEnvironmentSignal {
+                microphone_in_use: mic_active,
+                system_audio_active,
+                has_call_controls_ui,
+                detected_meeting_app,
+                detected_meeting_title,
+            });
+        }
+
         let mic_active = is_macos_default_mic_running();
         let win = self.observe_active_window().await.ok();
         let mut meeting_app = None;
         let mut meeting_title = None;
         if let Some(ref w) = win {
             let low = format!(
-                "{} {} {:?}",
-                w.app_bundle_id, w.window_title, w.browser_url
+                "{} {} {} {:?}",
+                w.app_bundle_id, w.app_name, w.window_title, w.browser_url
             )
             .to_lowercase();
-            if low.contains("zoom.us") || low.contains("us.zoom.xos") {
+            if low.contains("zoom.us") || low.contains("us.zoom.xos") || low.contains("zoom workplace") {
                 meeting_app = Some("Zoom".into());
                 meeting_title = Some(w.window_title.clone());
-            } else if low.contains("meet.google.com") {
+            } else if low.contains("meet.google.com") || low.contains("google meet") {
                 meeting_app = Some("Google Meet".into());
                 meeting_title = Some(w.window_title.clone());
-            } else if low.contains("teams.microsoft") || low.contains("com.microsoft.teams") {
+            } else if low.contains("teams.microsoft")
+                || low.contains("teams.live")
+                || low.contains("teams.cloud.microsoft")
+                || low.contains("com.microsoft.teams")
+                || low.contains("microsoft teams")
+            {
                 meeting_app = Some("Microsoft Teams".into());
                 meeting_title = Some(w.window_title.clone());
             } else if low.contains("slack") && low.contains("huddle") {
@@ -640,6 +671,12 @@ JSON.stringify({ bundleId, appName, pid, winTitle: appName });
                 meeting_title = Some(w.window_title.clone());
             } else if low.contains("facetime") {
                 meeting_app = Some("FaceTime".into());
+                meeting_title = Some(w.window_title.clone());
+            } else if low.contains("webex") {
+                meeting_app = Some("Cisco Webex".into());
+                meeting_title = Some(w.window_title.clone());
+            } else if low.contains("whereby.com") || low.contains("meet.jit.si") {
+                meeting_app = Some("Browser Meeting".into());
                 meeting_title = Some(w.window_title.clone());
             }
         }

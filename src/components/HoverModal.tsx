@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { EyeOff, X, Monitor } from 'lucide-react';
 import type { ChatMessage, ContextSnapshot, Language, Recipe } from '../types';
+import { hideNativeHoverOverlay, subscribeHoverShown } from '../lib/ipc';
 import { RecipeChatBar } from './RecipeChatBar';
 
 interface HoverModalProps {
@@ -28,10 +29,41 @@ export const HoverModal: React.FC<HoverModalProps> = ({
   onClose,
   onExecute,
 }) => {
+  const [focusSignal, setFocusSignal] = useState(0);
+
+  // Always auto-focus the Hover chat input whenever the modal opens, window gains focus, or Tauri reveals the hover overlay
+  useEffect(() => {
+    if (open || standaloneWindow) {
+      setFocusSignal((n) => n + 1);
+    }
+  }, [open, standaloneWindow]);
+
+  useEffect(() => {
+    if (!open && !standaloneWindow) return;
+    const bumpFocus = () => setFocusSignal((n) => n + 1);
+    window.addEventListener('focus', bumpFocus);
+    const unsub = subscribeHoverShown(bumpFocus);
+    return () => {
+      window.removeEventListener('focus', bumpFocus);
+      unsub();
+    };
+  }, [open, standaloneWindow]);
+
   if (!open && !standaloneWindow) return null;
 
+  const handleDismiss = async () => {
+    if (standaloneWindow) {
+      await hideNativeHoverOverlay();
+    } else {
+      onClose();
+    }
+  };
+
   const dialog = (
-    <div className="hover-dialog" style={standaloneWindow ? { width: '100%', height: '100vh', borderRadius: 0 } : undefined}>
+    <div
+      className="hover-dialog"
+      style={standaloneWindow ? { width: '100%', height: '100vh', borderRadius: 0 } : undefined}
+    >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <strong>backtext Hover</strong>
@@ -40,11 +72,9 @@ export const HoverModal: React.FC<HoverModalProps> = ({
             {lang === 'de' ? 'Unsichtbar bei Screen-Sharing' : 'Hidden from Screen Share'}
           </span>
         </div>
-        {!standaloneWindow && (
-          <button type="button" className="mini-btn" onClick={onClose}>
-            <X size={13} /> ESC
-          </button>
-        )}
+        <button type="button" className="mini-btn" onClick={handleDismiss}>
+          <X size={13} /> ESC
+        </button>
       </div>
 
       {frontSnapshot && (
@@ -72,11 +102,14 @@ export const HoverModal: React.FC<HoverModalProps> = ({
       <RecipeChatBar
         lang={lang}
         scopeFilter="all"
+        autoFocus
+        focusSignal={focusSignal}
         recipes={recipes}
         messages={messages}
         streamingText={streamingText}
         busy={busy}
         onExecute={onExecute}
+        onEscape={handleDismiss}
       />
     </div>
   );
@@ -86,7 +119,7 @@ export const HoverModal: React.FC<HoverModalProps> = ({
   }
 
   return (
-    <div className="hover-backdrop" onClick={onClose}>
+    <div className="hover-backdrop" onClick={handleDismiss}>
       <div onClick={(e) => e.stopPropagation()}>{dialog}</div>
     </div>
   );

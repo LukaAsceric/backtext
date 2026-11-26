@@ -10,7 +10,6 @@ import {
   Settings,
   Sun,
   Moon,
-  Command,
 } from 'lucide-react';
 import type {
   AiProviderSettings,
@@ -26,6 +25,7 @@ import type {
   MeetingParticipant,
   MemorySearchHit,
   PermissionStatus,
+  Person,
   PrivacyRule,
   ProviderTestResult,
   Recipe,
@@ -41,11 +41,9 @@ import type {
 } from './types';
 import {
   callRpc,
-  isTauriRuntime,
   setNativeAutostart,
   setNativeGlobalShortcut,
   subscribeBacktextEvents,
-  toggleNativeHoverOverlay,
 } from './lib/ipc';
 import { t } from './lib/i18n';
 import { TodayView } from './views/TodayView';
@@ -260,6 +258,9 @@ export const App: React.FC = () => {
               }
             : prev,
         );
+      } else if (ev.event === 'meeting_detected') {
+        const payload = ev.payload as { meeting_id?: string };
+        refreshBootstrap(payload.meeting_id);
       } else if (
         ev.event === 'calendar_synced' ||
         ev.event === 'context_episode_updated' ||
@@ -539,38 +540,19 @@ export const App: React.FC = () => {
             </span>
             <span className="nav-badge">{lang.toUpperCase()}</span>
           </button>
+        </nav>
 
+        <div className="sidebar-footer">
           <button
             type="button"
             id="nav-settings"
-            className={`nav-item ${activeNav === 'settings' ? 'selected' : ''}`}
+            className={`nav-item sidebar-settings-btn ${activeNav === 'settings' ? 'selected' : ''}`}
             onClick={() => setActiveNav('settings')}
           >
             <span className="nav-item-left">
               <Settings size={15} />
               {t(lang, 'settings')}
             </span>
-          </button>
-        </nav>
-
-        <div className="sidebar-footer">
-          <button
-            type="button"
-            id="open-hover-assistant-btn"
-            className="hover-launch-btn"
-            onClick={async () => {
-              if (isTauriRuntime()) {
-                await toggleNativeHoverOverlay();
-              } else {
-                setHoverOpen(true);
-              }
-            }}
-          >
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-              <Command size={13} />
-              {t(lang, 'hoverBtn')}
-            </span>
-            <span className="kbd">{data.telemetry.global_shortcut.replace('Alt+Space (', '').replace(')', '')}</span>
           </button>
         </div>
       </aside>
@@ -622,6 +604,7 @@ export const App: React.FC = () => {
             lang={lang}
             platform={data.permissions.platform}
             meetings={data.meetings}
+            persons={data.persons}
             selectedDetail={selectedMeeting}
             recordingLevel={recordingLevel}
             recipes={data.recipes}
@@ -730,6 +713,25 @@ export const App: React.FC = () => {
               setSelectedMeeting(detail);
               await refreshBootstrap(meetingId);
             }}
+            onAddParticipant={async (meetingId, displayName, email, personId) => {
+              const res = await callRpc<{ detail: MeetingDetail | null; persons: Person[] }>(
+                'add_meeting_participant',
+                { meetingId, displayName, email, personId },
+              );
+              if (res.detail) {
+                setSelectedMeeting(res.detail);
+              }
+              setData((prev) => (prev ? { ...prev, persons: res.persons } : prev));
+            }}
+            onRemoveParticipant={async (meetingId, speakerLabel) => {
+              const detail = await callRpc<MeetingDetail | null>('remove_meeting_participant', {
+                meetingId,
+                speakerLabel,
+              });
+              if (detail) {
+                setSelectedMeeting(detail);
+              }
+            }}
             onRunMeetingChat={async (meetingId, input, recipeSlug) => {
               setBusy(true);
               try {
@@ -750,9 +752,14 @@ export const App: React.FC = () => {
         {activeNav === 'context' && (
           <ContextTimelineView
             lang={lang}
+            captureStatus={status}
+            telemetry={data.telemetry}
+            permissions={data.permissions}
             episodes={data.episodes}
             snapshots={data.snapshots}
             clipboard={data.clipboard}
+            onRefresh={() => refreshBootstrap()}
+            onOpenSettings={() => setActiveNav('settings')}
             onPurgeRecent={async (minutes) => {
               await callRpc('purge_recent_context', { minutes });
               await refreshBootstrap();
@@ -786,6 +793,20 @@ export const App: React.FC = () => {
             projects={data.profile.active_projects}
             meetings={data.meetings}
             episodes={data.episodes}
+            onUpsertPerson={async (input) => {
+              const persons = await callRpc<Person[]>('upsert_person', {
+                id: input.id,
+                fullName: input.fullName,
+                email: input.email,
+                company: input.company,
+                roleNotes: input.roleNotes,
+              });
+              setData((prev) => (prev ? { ...prev, persons } : prev));
+            }}
+            onDeletePerson={async (personId) => {
+              const persons = await callRpc<Person[]>('delete_person', { personId });
+              setData((prev) => (prev ? { ...prev, persons } : prev));
+            }}
           />
         )}
 

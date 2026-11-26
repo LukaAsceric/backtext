@@ -109,7 +109,7 @@ pub fn spawn_background_daemon(controller: AppController) {
                         && perms.screen_capture_granted
                         && !obs.is_private_browsing
                         && !obs.is_secure_field_focused
-                        && focus_dwell_ms == 4_000
+                        && (focus_dwell_ms == 4_000 || focus_dwell_ms == 8_000)
                     {
                         if let Ok(shot) = controller.sensors.capture_window_screenshot_ocr(false).await {
                             if shot.ok && !shot.ocr_text.trim().is_empty() {
@@ -177,7 +177,13 @@ pub fn spawn_background_daemon(controller: AppController) {
                                     }
                                 }
 
-                                if accepted_since_compact >= 5 {
+                                let has_no_episodes = controller
+                                    .storage
+                                    .list_context_episodes(1)
+                                    .map(|e| e.is_empty())
+                                    .unwrap_or(false);
+
+                                if has_no_episodes || accepted_since_compact >= 2 {
                                     accepted_since_compact = 0;
                                     if let Ok(recent) = controller.storage.list_recent_snapshots(5) {
                                         if let Some(ep) = compact_snapshots_to_episode(&recent) {
@@ -207,6 +213,10 @@ pub fn spawn_background_daemon(controller: AppController) {
                         | FilterDecision::DroppedAsNoise { .. } => {
                             controller.update_telemetry(|t| {
                                 t.snapshots_filtered += 1;
+                                t.last_window_app = Some(obs.app_name.clone());
+                                if !obs.is_private_browsing && !obs.is_secure_field_focused {
+                                    t.last_window_title = Some(obs.window_title.clone());
+                                }
                             });
                         }
                     }
@@ -233,6 +243,10 @@ pub fn spawn_background_daemon(controller: AppController) {
             }
 
             // 3. Autonomous Bot-Free Meeting Start / End Detection & Screen-Share Capture
+            if controller.take_manual_stop_flag() {
+                detector.mark_manually_stopped(Utc::now(), 90);
+            }
+
             if let Ok(audio_sig) = controller.sensors.observe_audio_environment().await {
                 let profile = controller.storage.get_user_profile().unwrap_or_default();
                 let cal_events = controller
@@ -295,7 +309,7 @@ pub fn spawn_background_daemon(controller: AppController) {
                         }
                     }
                     DetectorTransition::EndMeeting { meeting_id } => {
-                        let _ = controller.stop_and_summarize_meeting(&meeting_id).await;
+                        let _ = controller.stop_and_summarize_meeting_internal(&meeting_id, false).await;
                     }
                     _ => {}
                 }
@@ -314,7 +328,7 @@ pub fn spawn_background_daemon(controller: AppController) {
                 t.last_tick_at = Some(Utc::now());
                 t.meeting_detector_phase = phase_label;
             });
-            if tick_count % 3 == 0 {
+            if tick_count == 1 || tick_count % 2 == 0 {
                 controller
                     .events
                     .publish(BacktextEvent::DaemonTelemetryUpdated(updated_tel));

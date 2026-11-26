@@ -825,6 +825,117 @@ impl StorageEngine {
             .unwrap_or(person))
     }
 
+    pub fn delete_person(&self, person_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE meeting_participants SET person_id = NULL WHERE person_id = ?1",
+            params![person_id],
+        );
+        let _ = conn.execute(
+            "UPDATE transcript_segments SET person_id = NULL WHERE person_id = ?1",
+            params![person_id],
+        );
+        let affected = conn.execute("DELETE FROM persons WHERE id = ?1", params![person_id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn add_meeting_participant(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+        email: Option<&str>,
+        existing_person_id: Option<&str>,
+    ) -> Result<Option<MeetingDetail>> {
+        let clean_name = display_name.trim();
+        if clean_name.is_empty() {
+            return self.get_meeting_detail(meeting_id);
+        }
+        let clean_email = email
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_string());
+
+        let persons = self.list_persons()?;
+        let matched = existing_person_id
+            .and_then(|pid| persons.iter().find(|p| p.id == pid).cloned())
+            .or_else(|| {
+                persons.iter().find(|p| {
+                    p.full_name.eq_ignore_ascii_case(clean_name)
+                        || (clean_email.is_some()
+                            && p.email
+                                .as_deref()
+                                .map(|e| e.eq_ignore_ascii_case(clean_email.as_deref().unwrap_or("")))
+                                .unwrap_or(false))
+                })
+                .cloned()
+            });
+
+        let person = if let Some(mut p) = matched {
+            p.last_seen_at = Some(Utc::now());
+            if clean_email.is_some() && p.email.is_none() {
+                p.email = clean_email.clone();
+            }
+            self.upsert_person(&p)?;
+            p
+        } else {
+            let p = Person {
+                id: format!("per_{}", uuid::Uuid::new_v4().simple()),
+                full_name: clean_name.to_string(),
+                email: clean_email.clone(),
+                company: None,
+                role_notes: "Manuell als Meeting-Teilnehmer hinzugefügt.".into(),
+                voiceprint_samples: 0,
+                voiceprint_confidence: 0.0,
+                meeting_count: 1,
+                open_commitments: vec![],
+                last_seen_at: Some(Utc::now()),
+            };
+            self.upsert_person(&p)?;
+            p
+        };
+
+        let speaker_label = format!("MAN_{}", &person.id[..person.id.len().min(12)]);
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO meeting_participants (
+                    meeting_id, speaker_label, display_name, person_id, email,
+                    is_self, identification_source, confidence, talk_time_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'manual', 1.0, 0)
+                 ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    person_id = excluded.person_id,
+                    email = COALESCE(excluded.email, meeting_participants.email)",
+                params![
+                    meeting_id,
+                    speaker_label,
+                    person.full_name,
+                    person.id,
+                    person.email,
+                ],
+            )?;
+        }
+        self.get_meeting_detail(meeting_id)
+    }
+
+    pub fn remove_meeting_participant(
+        &self,
+        meeting_id: &str,
+        speaker_label: &str,
+    ) -> Result<Option<MeetingDetail>> {
+        if speaker_label == "SELF" {
+            return self.get_meeting_detail(meeting_id);
+        }
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "DELETE FROM meeting_participants WHERE meeting_id = ?1 AND speaker_label = ?2 AND is_self = 0",
+                params![meeting_id, speaker_label],
+            )?;
+        }
+        self.get_meeting_detail(meeting_id)
+    }
+
     // -------------------------------------------------------------------------
     // Meetings, Transcripts & Screen-Sharing Frames
     // -------------------------------------------------------------------------

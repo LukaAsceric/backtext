@@ -239,10 +239,34 @@ pub fn score_relevance_and_project(
         .filter(|w| w.len() >= 3)
         .collect();
 
-    // Base score from information density
-    let density_score = ((unique_words.len() as f32) / 65.0).clamp(0.15, 0.55);
+    // Base score from information density (include title + URL + visible text)
+    let title_words: usize = window_title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .count();
+    let effective_words = unique_words.len().max(title_words);
+    let density_score = ((effective_words as f32) / 50.0).clamp(0.24, 0.55);
+
+    // Productive app / browser URL bonus so normal desktop work windows aren't dropped on first 4s tick
+    let app_low = app_name.to_lowercase();
+    let productive_bonus = if browser_url.is_some()
+        || [
+            "code", "cursor", "xcode", "terminal", "iterm", "warp", "ghostty", "chrome",
+            "safari", "arc", "brave", "edge", "firefox", "dia", "slack", "teams", "zoom",
+            "notion", "obsidian", "linear", "figma", "mail", "notes", "notizen", "word",
+            "excel", "powerpoint", "pages", "keynote", "numbers", "outlook", "calendar",
+            "kalender", "github", "zed", "intellij", "postman",
+        ]
+        .iter()
+        .any(|k| app_low.contains(k))
+    {
+        0.12_f32
+    } else {
+        0.04_f32
+    };
+
     // Dwell duration bonus (up to +0.20)
-    let dwell_bonus = ((dwell_ms as f32) / 180_000.0).clamp(0.0, 0.20);
+    let dwell_bonus = ((dwell_ms as f32) / 150_000.0).clamp(0.0, 0.20);
 
     let mut matched_project: Option<String> = None;
     let mut domain_bonus = 0.0_f32;
@@ -264,7 +288,8 @@ pub fn score_relevance_and_project(
         }
     }
 
-    let score = (density_score + dwell_bonus + domain_bonus.min(0.30)).clamp(0.10, 0.99);
+    let score = (density_score + productive_bonus + dwell_bonus + domain_bonus.min(0.30))
+        .clamp(0.10, 0.99);
     (score, matched_project)
 }
 
@@ -294,7 +319,8 @@ pub fn evaluate_context_candidate(
     }
 
     let alpha_chars = scrubbed_text.chars().filter(|c| c.is_alphanumeric()).count();
-    if alpha_chars < 18 && candidate.window_title.trim().len() < 8 {
+    let has_meaningful_title = candidate.window_title.trim().len() >= 4;
+    if alpha_chars < 10 && !has_meaningful_title && candidate.browser_url.is_none() {
         return FilterDecision::DroppedAsNoise {
             reason: "Zu geringe Informationsdichte (leeres Fenster / System-UI)".into(),
         };
@@ -326,7 +352,7 @@ pub fn evaluate_context_candidate(
         vocabulary,
     );
 
-    if relevance_score < 0.22 {
+    if relevance_score < 0.20 {
         return FilterDecision::DroppedAsNoise {
             reason: format!("Relevanz-Score zu niedrig ({relevance_score:.2})"),
         };

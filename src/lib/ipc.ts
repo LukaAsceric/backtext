@@ -36,6 +36,25 @@ export async function toggleNativeHoverOverlay(): Promise<boolean> {
   return false;
 }
 
+export async function hideNativeHoverOverlay(): Promise<void> {
+  if (isTauriRuntime()) {
+    await invoke<void>('hide_hover_overlay');
+  }
+}
+
+export function subscribeHoverShown(handler: () => void): () => void {
+  if (!isTauriRuntime()) return () => {};
+  let unlistenFn: (() => void) | null = null;
+  listen('backtext://hover-shown', () => {
+    handler();
+  }).then((unlisten) => {
+    unlistenFn = unlisten;
+  });
+  return () => {
+    unlistenFn?.();
+  };
+}
+
 export async function setNativeAutostart(enabled: boolean): Promise<boolean> {
   if (isTauriRuntime()) {
     return await invoke<boolean>('set_autostart_enabled', { enabled });

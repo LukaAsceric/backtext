@@ -39,11 +39,20 @@ fn toggle_hover_overlay(app: tauri::AppHandle) -> Result<bool, String> {
             win.center().ok();
             win.show().map_err(|e| e.to_string())?;
             win.set_focus().ok();
+            let _ = win.emit("backtext://hover-shown", ());
             Ok(true)
         }
     } else {
         Ok(false)
     }
+}
+
+#[tauri::command]
+fn hide_hover_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("hover") {
+        win.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -290,6 +299,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backtext_rpc,
             toggle_hover_overlay,
+            hide_hover_overlay,
             set_autostart_enabled,
             set_global_shortcut
         ])

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Mic,
   Square,
@@ -12,11 +12,14 @@ import {
   AlertCircle,
   Settings as SettingsIcon,
   Radio,
+  UserPlus,
+  X,
 } from 'lucide-react';
 import type {
   Language,
   Meeting,
   MeetingDetail,
+  Person,
   Recipe,
   RecordingAudioLevel,
 } from '../types';
@@ -28,6 +31,7 @@ interface MeetingWorkspaceProps {
   lang: Language;
   platform: string;
   meetings: Meeting[];
+  persons: Person[];
   selectedDetail: MeetingDetail | null;
   recordingLevel: RecordingAudioLevel | null;
   recipes: Recipe[];
@@ -44,6 +48,13 @@ interface MeetingWorkspaceProps {
   onEnhanceMeeting: (meetingId: string) => Promise<void>;
   onToggleActionItem: (meetingId: string, actionId: string) => Promise<void>;
   onAssignSpeaker: (meetingId: string, speakerLabel: string, personName: string) => Promise<void>;
+  onAddParticipant: (
+    meetingId: string,
+    displayName: string,
+    email?: string,
+    personId?: string,
+  ) => Promise<void>;
+  onRemoveParticipant: (meetingId: string, speakerLabel: string) => Promise<void>;
   onRunMeetingChat: (meetingId: string, input: string, recipeSlug?: string) => Promise<void>;
   onOpenSettings: () => void;
 }
@@ -52,6 +63,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   lang,
   platform,
   meetings,
+  persons,
   selectedDetail,
   recordingLevel,
   recipes,
@@ -68,6 +80,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   onEnhanceMeeting,
   onToggleActionItem,
   onAssignSpeaker,
+  onAddParticipant,
+  onRemoveParticipant,
   onRunMeetingChat,
   onOpenSettings,
 }) => {
@@ -82,8 +96,12 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   const [showPeoplePopover, setShowPeoplePopover] = useState(false);
   const [renamingLabel, setRenamingLabel] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [newPartName, setNewPartName] = useState('');
+  const [newPartEmail, setNewPartEmail] = useState('');
+  const [highlightedSegmentId, setHighlightedSegmentId] = useState<string | null>(null);
 
   const saveTimerRef = useRef<number | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
   const lastMeetingIdRef = useRef<string | null>(null);
 
   // Sync editor state and pick the most helpful default tab when switching meetings
@@ -95,9 +113,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
       setDraftTitle(current.title ?? '');
       setShowPeoplePopover(false);
       setRenamingLabel(null);
+      setHighlightedSegmentId(null);
       setSaveState('idle');
-      // Granola focus: live meetings always open directly on your clean notepad;
-      // completed meetings with AI notes open on AI Notes.
       if (current.status === 'live') {
         setActiveTab('notes');
       } else if (current.enhanced_markdown) {
@@ -133,8 +150,42 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      if (highlightTimerRef.current) window.clearTimeout(highlightTimerRef.current);
     };
   }, []);
+
+  // Scroll & highlight the exact transcript segment when a Granola-style [MM:SS] citation is clicked
+  const handleJumpToTranscript = (segmentId: string) => {
+    setActiveTab('transcript');
+    setHighlightedSegmentId(segmentId);
+    if (highlightTimerRef.current) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    window.setTimeout(() => {
+      const el = document.getElementById(`transcript-seg-${segmentId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 60);
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedSegmentId((prev) => (prev === segmentId ? null : prev));
+    }, 3400);
+  };
+
+  // Existing contacts not yet added to this meeting (for 1-click quick add)
+  const suggestedContacts = useMemo(() => {
+    if (!current) return [];
+    const existingIds = new Set(
+      current.participants.map((p) => p.person_id).filter(Boolean) as string[],
+    );
+    const existingNames = new Set(
+      current.participants.map((p) => p.display_name.toLowerCase()),
+    );
+    return persons.filter(
+      (per) =>
+        !existingIds.has(per.id) && !existingNames.has(per.full_name.toLowerCase()),
+    );
+  }, [persons, current]);
 
   const activeRecLevel =
     isLive && recordingLevel && recordingLevel.meeting_id === current?.id ? recordingLevel : null;
@@ -372,7 +423,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* Subtle STT / Audio Warning Banner (only when recording and attention needed) */}
+            {/* Subtle STT / Audio Warning Banner */}
             {isLive && activeRecLevel && (activeRecLevel.warning || !activeRecLevel.stt_ready) && (
               <div className="granola-notice-bar">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.2 }}>
@@ -424,7 +475,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                 <span>·</span>
                 <button
                   type="button"
-                  className="mini-btn"
+                  id="toggle-participants-btn"
+                  className={`mini-btn ${showPeoplePopover ? 'active-choice' : ''}`}
                   onClick={() => setShowPeoplePopover((v) => !v)}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
                 >
@@ -432,6 +484,12 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                   {current.participants.length}{' '}
                   {lang === 'de' ? 'Teilnehmer' : 'Participants'}
                 </button>
+                {current.detected_app && (
+                  <>
+                    <span>·</span>
+                    <span className="mono-ts">{current.detected_app}</span>
+                  </>
+                )}
                 {activeTab === 'notes' && (
                   <span className="mono-ts" style={{ marginLeft: 'auto' }}>
                     {saveState === 'saving'
@@ -447,37 +505,68 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                 )}
               </div>
 
-              {/* Compact On-Demand Participants & Voiceprint Popover */}
+              {/* Full Meeting Participant Management Popover */}
               {showPeoplePopover && (
-                <div className="granola-people-popover">
+                <div className="granola-people-popover" id="participants-manager-panel">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      {lang === 'de'
+                        ? 'Teilnehmer verwalten & Sprecher zuordnen'
+                        : 'Manage Participants & Assign Speakers'}
+                    </span>
+                    <button
+                      type="button"
+                      className="icon-ghost-btn"
+                      style={{ opacity: 1 }}
+                      onClick={() => setShowPeoplePopover(false)}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     {current.participants.map((p) => (
-                      <button
+                      <div
                         key={p.speaker_label}
-                        type="button"
-                        className="pill pill-neutral"
-                        style={{ cursor: p.is_self ? 'default' : 'pointer' }}
-                        title={`${sourceBadgeLabel(p.identification_source, lang)} (${Math.round(p.confidence * 100)}%)`}
-                        onClick={() => {
-                          if (!p.is_self) {
-                            setRenamingLabel(p.speaker_label);
-                            setRenameValue(p.display_name);
-                          }
-                        }}
+                        className="participant-chip"
+                        title={`${sourceBadgeLabel(p.identification_source, lang)} (${Math.round(p.confidence * 100)}%)${p.email ? ` · ${p.email}` : ''}`}
                       >
-                        <span>{p.display_name}</span>
-                        <span className="mono-ts">· {Math.round(p.confidence * 100)}%</span>
-                      </button>
+                        <button
+                          type="button"
+                          className="participant-chip-main"
+                          style={{ cursor: p.is_self ? 'default' : 'pointer' }}
+                          onClick={() => {
+                            if (!p.is_self) {
+                              setRenamingLabel(p.speaker_label);
+                              setRenameValue(p.display_name);
+                            }
+                          }}
+                        >
+                          <span>{p.display_name}</span>
+                          <span className="mono-ts">· {Math.round(p.confidence * 100)}%</span>
+                        </button>
+                        {!p.is_self && (
+                          <button
+                            type="button"
+                            className="participant-remove-btn"
+                            title={lang === 'de' ? 'Aus Meeting entfernen' : 'Remove from meeting'}
+                            onClick={() => onRemoveParticipant(current.id, p.speaker_label)}
+                          >
+                            <X size={11} />
+                          </button>
+                        )}
+                      </div>
                     ))}
                   </div>
+
                   {renamingLabel && (
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
                       <input
                         className="input-field"
                         style={{ maxWidth: 220, padding: '5px 9px', fontSize: 12.5 }}
                         value={renameValue}
                         onChange={(e) => setRenameValue(e.target.value)}
-                        placeholder="Vor- und Nachname"
+                        placeholder={lang === 'de' ? 'Vor- und Nachname' : 'Full name'}
                       />
                       <button
                         type="button"
@@ -501,6 +590,82 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                       </button>
                     </div>
                   )}
+
+                  {/* Quick-Add Known Contacts */}
+                  {suggestedContacts.length > 0 && (
+                    <div style={{ marginTop: 10, paddingTop: 9, borderTop: '1px solid var(--border-subtle)' }}>
+                      <div style={{ fontSize: 11.5, color: 'var(--text-tertiary)', marginBottom: 6 }}>
+                        {lang === 'de' ? 'Bekannten Kontakt hinzufügen:' : 'Quick-add known contact:'}
+                      </div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        {suggestedContacts.slice(0, 6).map((per) => (
+                          <button
+                            key={per.id}
+                            type="button"
+                            className="mini-btn"
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                            onClick={() =>
+                              onAddParticipant(current.id, per.full_name, per.email ?? undefined, per.id)
+                            }
+                          >
+                            <Plus size={11} />
+                            {per.full_name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Add New Participant Form */}
+                  <form
+                    style={{
+                      display: 'flex',
+                      gap: 7,
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      marginTop: 10,
+                      paddingTop: 9,
+                      borderTop: '1px solid var(--border-subtle)',
+                    }}
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (!newPartName.trim()) return;
+                      await onAddParticipant(
+                        current.id,
+                        newPartName.trim(),
+                        newPartEmail.trim() || undefined,
+                      );
+                      setNewPartName('');
+                      setNewPartEmail('');
+                    }}
+                  >
+                    <input
+                      id="add-participant-name-input"
+                      className="input-field"
+                      style={{ flex: '1 1 160px', padding: '5px 9px', fontSize: 12.5 }}
+                      value={newPartName}
+                      onChange={(e) => setNewPartName(e.target.value)}
+                      placeholder={lang === 'de' ? 'Teilnehmer-Name…' : 'Participant name…'}
+                    />
+                    <input
+                      id="add-participant-email-input"
+                      className="input-field"
+                      style={{ flex: '1 1 170px', padding: '5px 9px', fontSize: 12.5 }}
+                      value={newPartEmail}
+                      onChange={(e) => setNewPartEmail(e.target.value)}
+                      placeholder={lang === 'de' ? 'E-Mail (optional)' : 'Email (optional)'}
+                    />
+                    <button
+                      type="submit"
+                      id="add-participant-submit-btn"
+                      className="btn btn-primary"
+                      style={{ padding: '5px 10px', fontSize: 12 }}
+                      disabled={!newPartName.trim()}
+                    >
+                      <UserPlus size={12} />
+                      {lang === 'de' ? 'Hinzufügen' : 'Add'}
+                    </button>
+                  </form>
                 </div>
               )}
             </div>
@@ -541,6 +706,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                           ? 'Noch keine KI-Notizen generiert. Klicke oben auf **Beenden** oder **Mit KI verdichten**.'
                           : 'No AI notes generated yet. Click **Finish** or **Enhance with AI** above.')
                       }
+                      transcript={selectedDetail.transcript}
+                      onJumpToTranscript={handleJumpToTranscript}
                     />
                   </div>
 
@@ -549,23 +716,14 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                       <div className="section-heading">
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                           <CheckSquare size={14} />
-                          {t(lang, 'actionItems')}
+                          {t(lang, 'actionItems')} ({current.action_items.length})
                         </span>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                         {current.action_items.map((act) => (
                           <label
                             key={act.id}
-                            style={{
-                              display: 'flex',
-                              alignItems: 'flex-start',
-                              gap: 9,
-                              padding: '8px 10px',
-                              borderRadius: 6,
-                              background: 'var(--bg-surface-subtle)',
-                              cursor: 'pointer',
-                              fontSize: 13,
-                            }}
+                            className={`action-item-row ${act.completed ? 'completed' : ''}`}
                           >
                             <input
                               type="checkbox"
@@ -599,7 +757,11 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                     </div>
                   )}
                   {selectedDetail.transcript.map((seg) => (
-                    <div key={seg.id} className="transcript-row">
+                    <div
+                      key={seg.id}
+                      id={`transcript-seg-${seg.id}`}
+                      className={`transcript-row ${highlightedSegmentId === seg.id ? 'highlighted' : ''}`}
+                    >
                       <div className="transcript-meta">
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                           <button
@@ -679,6 +841,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
               compact
               recipes={recipes}
               messages={selectedDetail.chat_messages}
+              transcript={selectedDetail.transcript}
+              onJumpToTranscript={handleJumpToTranscript}
               streamingText={streamingText}
               busy={busy}
               onExecute={(inp, slug) => onRunMeetingChat(current.id, inp, slug)}

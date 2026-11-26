@@ -96,14 +96,20 @@ impl HybridAiEngine {
             .join("\n");
 
         let sys_prompt = format!(
-            "Du bist backtext, ein präziser Meeting-Notiz-Enhancer im Granola-Stil. Nutze die eigenen Stichpunkte als Rückgrat und reichere sie mit Fakten aus Transkript und Folien an.\n{dossier}"
+            "Du bist backtext, ein präziser Meeting-Notiz-Enhancer im Granola-Stil. Nutze die eigenen Stichpunkte als Rückgrat und reichere sie mit Fakten aus Transkript und Folien an.\n\
+            WICHTIGE FORMATREGELN:\n\
+            1. Setze bei wichtigen Aussagen, Entscheidungen und Fakten direkt inline den exakten Transkript-Zeitstempel im Format [MM:SS] (z. B. [00:42], [02:15]), damit der Nutzer per Klick direkt zur Originalstelle im Transkript springen kann.\n\
+            2. Wenn im Meeting echte, konkrete Aufgaben vereinbart wurden, liste sie am Ende unter der Überschrift `### Action Items` strikt im Format:\n\
+               - [ ] Verantwortlicher: Konkrete Aufgabe (Frist)\n\
+               Wenn keine echten Aufgaben vereinbart wurden, lass den Abschnitt `### Action Items` komplett weg.\n\
+            3. Erfinde niemals Fakten oder Aufgaben, die nicht in Notizen, Transkript oder Folien vorkommen.\n{dossier}"
         );
         let usr_prompt = format!(
             "Meeting: {}\nEigene Notizen:\n{}\n\nTranskript:\n{}\n\nScreen-Share-OCR:\n{}",
             detail.meeting.title, detail.meeting.raw_user_notes, transcript_text, slides_text
         );
 
-        let extracted_actions = extract_structured_actions(
+        let fallback_actions = extract_structured_actions(
             &detail.transcript,
             &detail.meeting.raw_user_notes,
             &profile.display_name,
@@ -120,7 +126,9 @@ impl HybridAiEngine {
         .await;
 
         if let Some((llm_md, provider_used)) = outcome.result {
-            let exec_summary = llm_md
+            let (cleaned_md, parsed_llm_actions) =
+                parse_and_strip_llm_action_items(&llm_md, &profile.display_name);
+            let exec_summary = cleaned_md
                 .lines()
                 .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
                 .take(2)
@@ -128,19 +136,19 @@ impl HybridAiEngine {
                 .join(" ");
             let mut updated = detail.meeting.clone();
             updated.executive_summary = exec_summary.clone();
-            updated.enhanced_markdown = llm_md.clone();
-            if !extracted_actions.is_empty() {
-                updated.action_items = extracted_actions.clone();
-            }
+            updated.enhanced_markdown = cleaned_md.clone();
+            // Always trust LLM's parsed action items (even if empty -> replaces stale false positives!)
+            updated.action_items = parsed_llm_actions;
             storage.save_meeting(&updated)?;
             return Ok(EnhancedMeetingResult {
                 executive_summary: exec_summary,
-                enhanced_markdown: llm_md,
+                enhanced_markdown: cleaned_md,
                 action_items: updated.action_items,
                 provider_used,
             });
         }
 
+        let extracted_actions = fallback_actions;
         let provider_error_banner = outcome.last_error.map(|err| {
             format!("*Hinweis ({err}) — lokale Offline-Synthese verwendet.*\n\n")
         });
@@ -205,11 +213,11 @@ impl HybridAiEngine {
                 });
                 match best_seg {
                     Some(seg) => md.push_str(&format!(
-                        "- **{}** — *Kontext ({}, {:02}:{:02}):* {}\n",
+                        "- **{}** [{:02}:{:02}] — *{}*: {}\n",
                         b,
-                        seg.speaker_name,
                         seg.start_ms / 60_000,
                         (seg.start_ms % 60_000) / 1000,
+                        seg.speaker_name,
                         seg.text
                     )),
                     None => md.push_str(&format!("- **{}**\n", b)),
@@ -224,9 +232,9 @@ impl HybridAiEngine {
             } else {
                 "### Discussion Highlights & Decisions\n"
             });
-            for seg in detail.transcript.iter().take(5) {
+            for seg in detail.transcript.iter().take(6) {
                 md.push_str(&format!(
-                    "- **{}** (`{:02}:{:02}`): {}\n",
+                    "- **{}** [{:02}:{:02}]: {}\n",
                     seg.speaker_name,
                     seg.start_ms / 60_000,
                     (seg.start_ms % 60_000) / 1000,
@@ -244,7 +252,7 @@ impl HybridAiEngine {
             });
             for frame in &detail.screenshares {
                 md.push_str(&format!(
-                    "- **{}** (`{:02}:{:02}`, {}): {}\n",
+                    "- **{}** [{:02}:{:02}] ({}): {}\n",
                     frame.slide_title,
                     frame.captured_at_ms / 60_000,
                     (frame.captured_at_ms % 60_000) / 1000,
@@ -257,9 +265,7 @@ impl HybridAiEngine {
         let mut updated = detail.meeting.clone();
         updated.executive_summary = executive_summary.clone();
         updated.enhanced_markdown = md.clone();
-        if !extracted_actions.is_empty() {
-            updated.action_items = extracted_actions;
-        }
+        updated.action_items = extracted_actions;
         storage.save_meeting(&updated)?;
 
         Ok(EnhancedMeetingResult {
@@ -447,6 +453,257 @@ impl HybridAiEngine {
     }
 }
 
+fn is_action_items_heading(trimmed: &str) -> bool {
+    let lower = trimmed.to_lowercase();
+    let is_heading_like = trimmed.starts_with('#')
+        || (trimmed.starts_with("**") && trimmed.ends_with("**"))
+        || (trimmed.starts_with("__") && trimmed.ends_with("__"));
+    if !is_heading_like {
+        return false;
+    }
+    let clean = lower
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim_matches('_')
+        .trim_end_matches(':')
+        .trim();
+    clean == "action items"
+        || clean == "action-items"
+        || clean == "aufgaben"
+        || clean == "vereinbarte aufgaben"
+        || clean == "vereinbarte action items"
+        || clean == "offene aufgaben"
+        || clean == "to-dos"
+        || clean == "todos"
+        || clean == "next steps"
+        || clean == "nächste schritte"
+}
+
+fn is_any_heading(trimmed: &str) -> bool {
+    trimmed.starts_with('#')
+        || (trimmed.starts_with("**")
+            && trimmed.ends_with("**")
+            && trimmed.len() > 4
+            && !trimmed.contains('\n'))
+}
+
+fn strip_checkbox_prefix(trimmed: &str) -> Option<(bool, &str)> {
+    // Handles: "- [ ] ...", "* [x] ...", "• [ ] ...", "1. [ ] ...", "[ ] ..."
+    let mut rest = trimmed;
+    if let Some(r) = rest
+        .strip_prefix("- ")
+        .or_else(|| rest.strip_prefix("* "))
+        .or_else(|| rest.strip_prefix("• "))
+    {
+        rest = r.trim_start();
+    } else if let Some(dot_idx) = rest.find(". ") {
+        if dot_idx > 0 && dot_idx <= 3 && rest[..dot_idx].chars().all(|c| c.is_ascii_digit()) {
+            rest = rest[dot_idx + 2..].trim_start();
+        }
+    }
+
+    if let Some(after) = rest.strip_prefix("[ ]") {
+        Some((false, after.trim()))
+    } else if let Some(after) = rest
+        .strip_prefix("[x]")
+        .or_else(|| rest.strip_prefix("[X]"))
+        .or_else(|| rest.strip_prefix("[✓]"))
+    {
+        Some((true, after.trim()))
+    } else {
+        None
+    }
+}
+
+fn strip_bullet_prefix(trimmed: &str) -> Option<&str> {
+    if let Some(r) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("• "))
+    {
+        return Some(r.trim());
+    }
+    if let Some(dot_idx) = trimmed.find(". ") {
+        if dot_idx > 0 && dot_idx <= 3 && trimmed[..dot_idx].chars().all(|c| c.is_ascii_digit()) {
+            return Some(trimmed[dot_idx + 2..].trim());
+        }
+    }
+    None
+}
+
+fn parse_action_item_body(body: &str, completed: bool, default_owner: &str) -> Option<ActionItem> {
+    let clean_body = body.trim();
+    if clean_body.len() < 4 {
+        return None;
+    }
+    let low = clean_body.to_lowercase();
+    if low.starts_with("keine ")
+        || low == "keine"
+        || low == "none"
+        || low == "n/a"
+        || low.starts_with("no action items")
+    {
+        return None;
+    }
+
+    // Extract optional trailing "(Frist)" hint
+    let mut main_part = clean_body;
+    let mut due_hint: Option<String> = None;
+    if main_part.ends_with(')') {
+        if let Some(open_idx) = main_part.rfind('(') {
+            let candidate_due = main_part[open_idx + 1..main_part.len() - 1].trim();
+            if candidate_due.len() >= 2
+                && candidate_due.len() <= 42
+                && !candidate_due.contains("http")
+            {
+                let before = main_part[..open_idx].trim();
+                if before.len() >= 4 {
+                    due_hint = Some(candidate_due.to_string());
+                    main_part = before;
+                }
+            }
+        }
+    }
+
+    // Split Owner & Task on ": ", " — ", " – ", or " - " (when owner prefix is short & plausible)
+    let mut owner = default_owner.to_string();
+    let mut task = main_part.to_string();
+    for sep in [" — ", " – ", ": ", " - "] {
+        if let Some(idx) = main_part.find(sep) {
+            let left = main_part[..idx]
+                .trim()
+                .trim_matches('*')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']')
+                .trim();
+            let right = main_part[idx + sep.len()..].trim();
+            let left_words = left.split_whitespace().count();
+            if !left.is_empty()
+                && left.len() <= 36
+                && left_words <= 4
+                && !right.is_empty()
+                && !left.contains("http")
+            {
+                owner = left.to_string();
+                task = right.to_string();
+                break;
+            }
+        }
+    }
+
+    // Clean any residual markdown escapes in task text
+    let task_clean = task
+        .replace("\\*", "*")
+        .replace("\\_", "_")
+        .trim()
+        .to_string();
+    if task_clean.is_empty() {
+        return None;
+    }
+
+    Some(ActionItem {
+        id: format!("act_{}", uuid::Uuid::new_v4().simple()),
+        owner,
+        task: task_clean,
+        due_hint,
+        completed,
+    })
+}
+
+/// Extracts structured `ActionItem` entries from LLM markdown output (e.g. `### Action Items`
+/// with `- [ ] Owner — Task (Due)` or `- [ ] Owner: Task (Due)`) and strips the duplicated
+/// raw markdown action block so the UI renders interactive checkboxes cleanly without `- [ ]` noise.
+pub fn parse_and_strip_llm_action_items(
+    llm_md: &str,
+    default_owner: &str,
+) -> (String, Vec<ActionItem>) {
+    let lines: Vec<&str> = llm_md.lines().collect();
+    let mut keep_mask = vec![true; lines.len()];
+    let mut items: Vec<ActionItem> = Vec::new();
+    let mut in_action_section = false;
+    let mut action_heading_idx: Option<usize> = None;
+    let mut section_parsed_any = false;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if is_action_items_heading(trimmed) {
+            in_action_section = true;
+            action_heading_idx = Some(idx);
+            section_parsed_any = false;
+            continue;
+        }
+
+        if in_action_section && is_any_heading(trimmed) && !is_action_items_heading(trimmed) {
+            if section_parsed_any {
+                if let Some(h_idx) = action_heading_idx {
+                    keep_mask[h_idx] = false;
+                }
+            }
+            in_action_section = false;
+            action_heading_idx = None;
+        }
+
+        if let Some((completed, body)) = strip_checkbox_prefix(trimmed) {
+            if let Some(item) = parse_action_item_body(body, completed, default_owner) {
+                items.push(item);
+                keep_mask[idx] = false;
+                if in_action_section {
+                    section_parsed_any = true;
+                }
+            }
+            continue;
+        }
+
+        if in_action_section {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(body) = strip_bullet_prefix(trimmed) {
+                if let Some(item) = parse_action_item_body(body, false, default_owner) {
+                    items.push(item);
+                    keep_mask[idx] = false;
+                    section_parsed_any = true;
+                } else {
+                    // e.g. "- Keine Action Items" -> hide boilerplate inside action section
+                    keep_mask[idx] = false;
+                    section_parsed_any = true;
+                }
+            }
+        }
+    }
+
+    if in_action_section && section_parsed_any {
+        if let Some(h_idx) = action_heading_idx {
+            keep_mask[h_idx] = false;
+        }
+    }
+
+    let mut cleaned_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        if keep_mask[idx] {
+            // Collapse duplicate blank lines produced by stripping
+            if line.trim().is_empty()
+                && cleaned_lines
+                    .last()
+                    .map(|l| l.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            cleaned_lines.push(line);
+        }
+    }
+    while cleaned_lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        cleaned_lines.pop();
+    }
+
+    items.truncate(12);
+    (cleaned_lines.join("\n"), items)
+}
+
 fn extract_structured_actions(
     transcript: &[TranscriptSegment],
     raw_notes: &str,
@@ -455,11 +712,16 @@ fn extract_structured_actions(
     let mut items = Vec::new();
     for seg in transcript {
         let low = seg.text.to_lowercase();
-        if low.contains("bis ")
+        if low.contains("bis mittwoch")
+            || low.contains("bis donnerstag")
+            || low.contains("bis freitag")
+            || low.contains("bis morgen")
+            || low.contains("ich übernehme")
             || low.contains("dokumentiere")
             || low.contains("schicke")
-            || low.contains("send")
-            || low.contains("deliver")
+            || low.contains("i will send")
+            || low.contains("i'll send")
+            || low.contains("action item")
         {
             let due = if low.contains("mittwoch") {
                 Some("Mittwoch".into())
@@ -467,6 +729,8 @@ fn extract_structured_actions(
                 Some("Donnerstag".into())
             } else if low.contains("freitag") {
                 Some("Freitag".into())
+            } else if low.contains("morgen") {
+                Some("Morgen".into())
             } else if low.contains("heute") {
                 Some("Heute".into())
             } else {
@@ -481,18 +745,29 @@ fn extract_structured_actions(
             });
         }
     }
-    if items.is_empty() && !raw_notes.trim().is_empty() {
-        if let Some(last_line) = raw_notes.lines().rev().find(|l| !l.trim().is_empty()) {
-            items.push(ActionItem {
-                id: format!("act_{}", uuid::Uuid::new_v4().simple()),
-                owner: self_name.to_string(),
-                task: last_line.trim_start_matches('-').trim().to_string(),
-                due_hint: Some("Diese Woche".into()),
-                completed: false,
-            });
+
+    // Only parse explicit task syntax from raw user notes — never fabricate tasks from arbitrary notes!
+    for line in raw_notes.lines() {
+        let trimmed = line.trim();
+        if let Some((completed, body)) = strip_checkbox_prefix(trimmed) {
+            if let Some(item) = parse_action_item_body(body, completed, self_name) {
+                items.push(item);
+            }
+            continue;
+        }
+        let low = trimmed.to_lowercase();
+        for prefix in ["todo:", "to-do:", "action:", "aufgabe:"] {
+            if low.starts_with(prefix) {
+                let body = trimmed[prefix.len()..].trim();
+                if let Some(item) = parse_action_item_body(body, false, self_name) {
+                    items.push(item);
+                }
+                break;
+            }
         }
     }
-    items.truncate(5);
+
+    items.truncate(8);
     items
 }
 
@@ -509,7 +784,15 @@ fn render_recipe_or_query(
         .map(|m| {
             m.transcript
                 .iter()
-                .map(|s| format!("{}: {}", s.speaker_name, s.text))
+                .map(|s| {
+                    format!(
+                        "[{:02}:{:02}] {}: {}",
+                        s.start_ms / 60_000,
+                        (s.start_ms % 60_000) / 1000,
+                        s.speaker_name,
+                        s.text
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -521,7 +804,15 @@ fn render_recipe_or_query(
         .map(|m| {
             m.screenshares
                 .iter()
-                .map(|f| format!("{}: {}", f.slide_title, f.ocr_text))
+                .map(|f| {
+                    format!(
+                        "[{:02}:{:02}] {}: {}",
+                        f.captured_at_ms / 60_000,
+                        (f.captured_at_ms % 60_000) / 1000,
+                        f.slide_title,
+                        f.ocr_text
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -559,7 +850,7 @@ fn render_recipe_or_query(
             .replace("{{active_context}}", &active_context)
             .replace("{{user_profile}}", dossier),
         None => format!(
-            "Frage: {user_input}\n\nMeeting-Kontext:\n{transcript}\n\nArbeitskontext:\n{active_context}"
+            "Frage: {user_input}\n\nHinweis: Wenn du dich auf Aussagen aus dem Transkript beziehst, nenne direkt den exakten Zeitstempel im Format [MM:SS].\n\nMeeting-Kontext:\n{transcript}\n\nArbeitskontext:\n{active_context}"
         ),
     }
 }
@@ -764,5 +1055,42 @@ mod tests {
         assert_eq!(proj.len(), EMBEDDING_DIM);
         let norm: f32 = proj.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parses_and_strips_llm_action_items_from_markdown() {
+        let raw_md = "### Kontext\n- Der Film „Paprika“ läuft im Hintergrund [00:12].\n\n### Action Items\n- [ ] Luka — Aufnahme als privat markieren/verwerfen (sofort)\n- [x] **Clara Novak**: MCP Spec teilen (Freitag)\n";
+        let (cleaned, items) = parse_and_strip_llm_action_items(raw_md, "Luka");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].owner, "Luka");
+        assert_eq!(items[0].task, "Aufnahme als privat markieren/verwerfen");
+        assert_eq!(items[0].due_hint.as_deref(), Some("sofort"));
+        assert!(!items[0].completed);
+
+        assert_eq!(items[1].owner, "Clara Novak");
+        assert_eq!(items[1].task, "MCP Spec teilen");
+        assert_eq!(items[1].due_hint.as_deref(), Some("Freitag"));
+        assert!(items[1].completed);
+
+        assert!(cleaned.contains("[00:12]"));
+        assert!(!cleaned.contains("### Action Items"));
+        assert!(!cleaned.contains("[ ]"));
+    }
+
+    #[test]
+    fn offline_action_extractor_does_not_fabricate_tasks_from_casual_notes() {
+        let items = extract_structured_actions(&[], "Ich schaue gerade den Film „Paprika“", "Luka");
+        assert!(items.is_empty());
+
+        let explicit = extract_structured_actions(
+            &[],
+            "- [ ] Luka: Datenschutz prüfen (Heute)\nTODO: Clara — Slides versenden (Freitag)",
+            "Luka",
+        );
+        assert_eq!(explicit.len(), 2);
+        assert_eq!(explicit[0].task, "Datenschutz prüfen");
+        assert_eq!(explicit[0].due_hint.as_deref(), Some("Heute"));
+        assert_eq!(explicit[1].owner, "Clara");
+        assert_eq!(explicit[1].task, "Slides versenden");
     }
 }

@@ -1,19 +1,37 @@
 import React, { useState } from 'react';
-import { Trash2, Eye, Clipboard, Layers, ShieldAlert, PlusCircle } from 'lucide-react';
+import {
+  Trash2,
+  Eye,
+  Clipboard,
+  Layers,
+  ShieldAlert,
+  PlusCircle,
+  RefreshCw,
+  Activity,
+  Settings as SettingsIcon,
+} from 'lucide-react';
 import type {
+  CaptureStatus,
   ClipboardItem,
   ContextEpisode,
   ContextSnapshot,
+  DaemonTelemetry,
   Language,
+  PermissionStatus,
   ScrubberPreview,
 } from '../types';
 import { t } from '../lib/i18n';
 
 interface ContextTimelineViewProps {
   lang: Language;
+  captureStatus: CaptureStatus;
+  telemetry: DaemonTelemetry;
+  permissions: PermissionStatus;
   episodes: ContextEpisode[];
   snapshots: ContextSnapshot[];
   clipboard: ClipboardItem[];
+  onRefresh: () => Promise<void>;
+  onOpenSettings: () => void;
   onPurgeRecent: (minutes: number) => Promise<void>;
   onCaptureSample: (
     appName: string,
@@ -32,9 +50,14 @@ interface ContextTimelineViewProps {
 
 export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
   lang,
+  captureStatus,
+  telemetry,
+  permissions,
   episodes,
   snapshots,
   clipboard,
+  onRefresh,
+  onOpenSettings,
   onPurgeRecent,
   onCaptureSample,
   onPreviewScrubber,
@@ -51,6 +74,13 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
   const [simClip, setSimClip] = useState('');
   const [preview, setPreview] = useState<ScrubberPreview | null>(null);
   const [captureResult, setCaptureResult] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const isPaused = captureStatus.mode === 'paused';
+  const missingSensorPerms =
+    permissions.platform === 'macos' &&
+    !permissions.accessibility_granted &&
+    !permissions.screen_capture_granted;
 
   return (
     <div className="page-container">
@@ -68,6 +98,22 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
           </p>
         </div>
         <div className="header-actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={refreshing}
+            onClick={async () => {
+              setRefreshing(true);
+              try {
+                await onRefresh();
+              } finally {
+                setRefreshing(false);
+              }
+            }}
+          >
+            <RefreshCw size={13} />
+            {lang === 'de' ? 'Aktualisieren' : 'Refresh'}
+          </button>
           <button
             type="button"
             id="purge-15m-btn"
@@ -88,6 +134,53 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
           </button>
         </div>
       </header>
+
+      {/* Live Daemon Capture Diagnostics Bar */}
+      <div className="context-status-strip" id="context-daemon-diagnostics">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span
+            className={`status-dot ${
+              isPaused ? 'paused' : telemetry.loop_running ? 'active' : 'paused'
+            }`}
+          />
+          <strong style={{ fontSize: 12.8 }}>
+            {isPaused
+              ? lang === 'de'
+                ? 'Kontexterfassung pausiert'
+                : 'Capture paused'
+              : telemetry.loop_running
+                ? lang === 'de'
+                  ? 'Hintergrund-Sensor aktiv'
+                  : 'Background sensor active'
+                : lang === 'de'
+                  ? 'Sensor startet…'
+                  : 'Sensor starting…'}
+          </strong>
+          <span className="mono-ts">
+            <Activity size={11} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+            {telemetry.ticks_processed} Ticks · {telemetry.snapshots_accepted}{' '}
+            {lang === 'de' ? 'erfasst' : 'captured'} · {telemetry.snapshots_filtered}{' '}
+            {lang === 'de' ? 'gefiltert' : 'filtered'}
+          </span>
+          {telemetry.last_window_app && (
+            <span className="pill pill-neutral">
+              {lang === 'de' ? 'Zuletzt gesehen:' : 'Last seen:'} {telemetry.last_window_app}
+              {telemetry.last_window_title ? ` — ${telemetry.last_window_title.slice(0, 40)}` : ''}
+            </span>
+          )}
+        </div>
+        {missingSensorPerms && (
+          <button
+            type="button"
+            className="mini-btn"
+            onClick={onOpenSettings}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
+          >
+            <SettingsIcon size={11} />
+            {lang === 'de' ? 'macOS-Berechtigungen prüfen' : 'Check macOS Permissions'}
+          </button>
+        )}
+      </div>
 
       <div className="tab-strip" style={{ alignSelf: 'flex-start' }}>
         <button
@@ -126,6 +219,13 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
 
       {subTab === 'episodes' && (
         <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {episodes.length === 0 && (
+            <div style={{ fontSize: 13.2, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+              {lang === 'de'
+                ? 'Noch keine Arbeits-Episoden verdichtet. Wechsle kurz in eine andere App (z. B. Browser, Cursor, Terminal oder Teams) — backtext erfasst relevante Fenster nach 4 Sekunden automatisch und blendet sich selbst aus.'
+                : 'No work episodes compacted yet. Switch to another app (e.g. Browser, Cursor, Terminal, or Teams) — backtext captures relevant windows after 4 seconds while ignoring itself.'}
+            </div>
+          )}
           {episodes.map((ep) => (
             <div key={ep.id} className="transcript-row">
               <div className="transcript-meta">
@@ -155,6 +255,13 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
 
       {subTab === 'snapshots' && (
         <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {snapshots.length === 0 && (
+            <div style={{ fontSize: 13.2, color: 'var(--text-secondary)' }}>
+              {lang === 'de'
+                ? 'Noch keine Fenster-Snapshots erfasst. Sobald du außerhalb von backtext arbeitest, erscheinen sie hier live.'
+                : 'No window snapshots captured yet. As soon as you work in other apps, they appear here live.'}
+            </div>
+          )}
           {snapshots.map((s) => (
             <div key={s.id} className="transcript-row">
               <div className="transcript-meta">
@@ -180,6 +287,13 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
 
       {subTab === 'clipboard' && (
         <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {clipboard.length === 0 && (
+            <div style={{ fontSize: 13.2, color: 'var(--text-secondary)' }}>
+              {lang === 'de'
+                ? 'Noch keine sicheren Zwischenablage-Einträge (Passwörter & 1Password werden automatisch ignoriert).'
+                : 'No safe clipboard items yet (passwords and password managers are skipped automatically).'}
+            </div>
+          )}
           {clipboard.map((c) => (
             <div key={c.id} className="transcript-row">
               <div className="transcript-meta">

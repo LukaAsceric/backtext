@@ -62,6 +62,7 @@ pub struct MeetingDetector {
     pub phase: DetectorPhase,
     pub candidate_hold_secs: i64,
     pub cooldown_grace_secs: i64,
+    pub suppress_auto_until: Option<DateTime<Utc>>,
 }
 
 impl Default for MeetingDetector {
@@ -70,6 +71,7 @@ impl Default for MeetingDetector {
             phase: DetectorPhase::Idle,
             candidate_hold_secs: 3,
             cooldown_grace_secs: 45,
+            suppress_auto_until: None,
         }
     }
 }
@@ -123,6 +125,12 @@ impl MeetingDetector {
 
         match self.phase.clone() {
             DetectorPhase::Idle => {
+                if let Some(until) = self.suppress_auto_until {
+                    if now < until {
+                        return DetectorTransition::None;
+                    }
+                    self.suppress_auto_until = None;
+                }
                 if is_live_signal {
                     self.phase = DetectorPhase::Candidate {
                         since: now,
@@ -194,6 +202,7 @@ impl MeetingDetector {
     }
 
     pub fn mark_active(&mut self, meeting_id: String, started_at: DateTime<Utc>) {
+        self.suppress_auto_until = None;
         self.phase = DetectorPhase::Active {
             meeting_id,
             started_at,
@@ -202,6 +211,11 @@ impl MeetingDetector {
 
     pub fn mark_idle(&mut self) {
         self.phase = DetectorPhase::Idle;
+    }
+
+    pub fn mark_manually_stopped(&mut self, now: DateTime<Utc>, suppress_secs: i64) {
+        self.phase = DetectorPhase::Idle;
+        self.suppress_auto_until = Some(now + chrono::Duration::seconds(suppress_secs));
     }
 }
 
@@ -576,6 +590,7 @@ mod tests {
             phase: DetectorPhase::Idle,
             candidate_hold_secs: 3,
             cooldown_grace_secs: 30,
+            suppress_auto_until: None,
         };
         let t0 = Utc::now();
         let active_sig = AudioEnvironmentSignal {
