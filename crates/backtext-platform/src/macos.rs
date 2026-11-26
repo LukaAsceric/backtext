@@ -616,7 +616,7 @@ JSON.stringify({ bundleId, appName, pid, winTitle: appName });
     }
 
     async fn observe_audio_environment(&self) -> Result<AudioEnvironmentSignal> {
-        if let v = self.run_sensor_json(&["audio-env"]).await {
+        if let Some(v) = self.run_sensor_json(&["audio-env"]).await {
             let mic_active = v["microphone_in_use"].as_bool().unwrap_or(false)
                 || is_macos_default_mic_running();
             let detected_meeting_app = v["detected_meeting_app"]
