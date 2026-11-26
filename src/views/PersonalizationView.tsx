@@ -174,6 +174,55 @@ export const PersonalizationView: React.FC<PersonalizationViewProps> = ({
               />
             </label>
 
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <span style={{ fontSize: 12.5, fontWeight: 600 }}>
+                {lang === 'de'
+                  ? 'Breite der Meeting-Detailseite'
+                  : 'Meeting Detail Reading Width'}
+              </span>
+              <div className="width-segmented-control" id="personalization-width-control">
+                {(
+                  [
+                    {
+                      id: 'standard',
+                      label: lang === 'de' ? 'Standard' : 'Standard',
+                      hint: '820 px',
+                    },
+                    {
+                      id: 'wide',
+                      label: lang === 'de' ? 'Breit' : 'Wide',
+                      hint: '1120 px',
+                    },
+                    {
+                      id: 'full',
+                      label: lang === 'de' ? 'Füllen' : 'Full',
+                      hint: '100 %',
+                    },
+                  ] as const
+                ).map((opt) => {
+                  const active = (form.meeting_content_width || 'standard') === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      id={`width-opt-${opt.id}`}
+                      className={`width-seg-btn ${active ? 'active' : ''}`}
+                      onClick={async () => {
+                        const nextProfile = { ...form, meeting_content_width: opt.id };
+                        setForm(nextProfile);
+                        await onSaveProfile(nextProfile);
+                        setSavedBanner(true);
+                        setTimeout(() => setSavedBanner(false), 1400);
+                      }}
+                    >
+                      <span>{opt.label}</span>
+                      <span className="mono-ts">{opt.hint}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
             <button type="submit" id="save-profile-btn" className="btn btn-primary" style={{ alignSelf: 'flex-start' }}>
               <Save size={14} />
               {t(lang, 'saveProfile')}

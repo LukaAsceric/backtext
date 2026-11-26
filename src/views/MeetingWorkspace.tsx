@@ -44,6 +44,7 @@ import type {
 import { formatDurationMs, sourceBadgeLabel, t } from '../lib/i18n';
 import { RecipeChatBar } from '../components/RecipeChatBar';
 import { FormattedMarkdown } from '../components/FormattedMarkdown';
+import { RichNotepad } from '../components/RichNotepad';
 
 export interface MeetingTemplateDraft {
   id?: string;
@@ -58,6 +59,7 @@ export interface MeetingTemplateDraft {
 interface MeetingWorkspaceProps {
   lang: Language;
   platform: string;
+  contentWidth: 'standard' | 'wide' | 'full';
   meetings: Meeting[];
   templates: MeetingTemplate[];
   defaultTemplateId: string;
@@ -136,6 +138,7 @@ function chronologicalBucket(
 export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   lang,
   platform,
+  contentWidth,
   meetings,
   templates,
   defaultTemplateId,
@@ -463,7 +466,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
         {/* Collapsible Meeting List with Search, Folders, Grouping & Multi-Select */}
         {sidebarOpen && (
           <aside className={`granola-list-pane ${isNarrow ? 'overlay-drawer' : ''}`}>
-            <div className="granola-list-header">
+            <div className="granola-list-header" data-tauri-drag-region>
               <span style={{ fontWeight: 600, fontSize: 13 }}>
                 {lang === 'de' ? 'Meetings' : 'Meetings'}
               </span>
@@ -848,9 +851,9 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
 
         {/* Calm Granola-Style Focused Document Canvas */}
         {current && selectedDetail ? (
-          <section className="granola-canvas">
+          <section className="granola-canvas" data-content-width={contentWidth}>
             {/* Minimal Document Top Bar */}
-            <div className="granola-topbar">
+            <div className="granola-topbar" data-tauri-drag-region>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <button
                   type="button"
@@ -1095,12 +1098,14 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                       : '+ Folder'}
                 </button>
 
-                {current.detected_app && (
-                  <>
-                    <span>·</span>
-                    <span className="mono-ts">{current.detected_app}</span>
-                  </>
-                )}
+                {current.detected_app &&
+                  !current.detected_app.toLowerCase().includes('dual-audio') &&
+                  !current.detected_app.toLowerCase().includes('mikrofon + system') && (
+                    <>
+                      <span>·</span>
+                      <span className="mono-ts">{current.detected_app}</span>
+                    </>
+                  )}
                 {activeTab === 'notes' && (
                   <span className="mono-ts" style={{ marginLeft: 'auto' }}>
                     {saveState === 'saving'
@@ -1444,30 +1449,30 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
             {/* Main Distraction-Free Canvas Body */}
             <div className="granola-body">
               {activeTab === 'notes' && (
-                <textarea
+                <RichNotepad
                   id="meeting-rough-notes-editor"
-                  className="granola-notepad-textarea"
+                  meetingId={current.id}
+                  lang={lang}
                   value={draftNotes}
-                  onChange={(e) => {
-                    const next = e.target.value;
+                  onChange={(next) => {
                     setDraftNotes(next);
                     scheduleAutoSave(current.id, next);
                   }}
-                  onBlur={() => {
+                  onBlur={(finalMd) => {
                     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                    onSaveUserNotes(current.id, draftNotes);
+                    onSaveUserNotes(current.id, finalMd);
                     setSaveState('saved');
                   }}
                   placeholder={
                     lang === 'de'
-                      ? 'Notiere einfach deine Stichpunkte während des Gesprächs…\n\nbacktext zeichnet im Hintergrund auf und verdichtet deine Notizen danach automatisch mit Transkript & geteilten Folien.'
-                      : 'Jot rough thoughts freely during the call…\n\nbacktext records quietly in the background and enhances your notes with transcript & slide facts afterward.'
+                      ? 'Notiere einfach deine Stichpunkte während des Gesprächs…\n\nbacktext erkennt Listen automatisch, unterstützt Bilder per ⌘V / Drag & Drop und verdichtet deine Notizen danach mit Transkript & Folien.'
+                      : 'Jot rough thoughts freely during the call…\n\nbacktext auto-formats lists, supports pasted/dropped images, and enhances your notes with transcript & slide facts afterward.'
                   }
                 />
               )}
 
               {activeTab === 'enhanced' && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
                   {/* Template Switcher + Direct Edit + Compare Raw Notes Toolbar (Features 1.1 & 1.2) */}
                   <div className="enhanced-toolbar">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -1566,12 +1571,10 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                   {/* Optional Side/Top Compare Box for User's Own Rough Bullets */}
                   {showRawCompare && current.raw_user_notes.trim().length > 0 && (
                     <div className="raw-notes-compare-box">
-                      <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 4 }}>
+                      <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 6 }}>
                         {lang === 'de' ? 'Deine eigenen Stichpunkte' : 'Your Rough Notes'}
                       </div>
-                      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'var(--font-sans)', fontSize: 12.8 }}>
-                        {current.raw_user_notes}
-                      </pre>
+                      <FormattedMarkdown text={current.raw_user_notes} />
                     </div>
                   )}
 

@@ -69,7 +69,47 @@ pub struct UserProfile {
     pub auto_record_meetings: bool,
     pub consent_reminder_enabled: bool,
     pub retention_days: u32,
+    #[serde(default = "default_meeting_content_width")]
+    pub meeting_content_width: String,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_meeting_content_width() -> String {
+    "standard".to_string()
+}
+
+/// Replaces inline base64 markdown images (`![alt](data:image/...)`) with a short
+/// textual placeholder so LLM prompts and full-text search indexes never ingest megabytes of base64.
+pub fn strip_inline_data_images(markdown: &str) -> String {
+    if !markdown.contains("data:image/") {
+        return markdown.to_string();
+    }
+    let mut out = String::with_capacity(markdown.len().min(4096));
+    let mut rest = markdown;
+    while let Some(img_start) = rest.find("![") {
+        out.push_str(&rest[..img_start]);
+        let after_bang = &rest[img_start + 2..];
+        if let Some(alt_end) = after_bang.find("](") {
+            let alt = &after_bang[..alt_end];
+            let after_paren = &after_bang[alt_end + 2..];
+            if after_paren.starts_with("data:image/") {
+                if let Some(close_paren) = after_paren.find(')') {
+                    let label = if alt.trim().is_empty() {
+                        "Notizbild"
+                    } else {
+                        alt.trim()
+                    };
+                    out.push_str(&format!("[Bild: {label}]"));
+                    rest = &after_paren[close_paren + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push_str("![");
+        rest = after_bang;
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Default for UserProfile {
@@ -90,6 +130,7 @@ impl Default for UserProfile {
             auto_record_meetings: true,
             consent_reminder_enabled: true,
             retention_days: 90,
+            meeting_content_width: default_meeting_content_width(),
             updated_at: Utc::now(),
         }
     }

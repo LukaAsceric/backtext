@@ -1168,6 +1168,7 @@ impl AppController {
         self.events.publish(BacktextEvent::MeetingSummarized {
             meeting_id: meeting_id.to_string(),
             executive_summary: res.executive_summary,
+            updated_title: Some(res.title),
         });
 
         self.storage
@@ -1198,7 +1199,13 @@ impl AppController {
     }
 
     pub async fn enhance_meeting(&self, meeting_id: &str) -> Result<EnhancedMeetingResult> {
-        self.ai.enhance_meeting_summary(&self.storage, meeting_id).await
+        let res = self.ai.enhance_meeting_summary(&self.storage, meeting_id).await?;
+        self.events.publish(BacktextEvent::MeetingSummarized {
+            meeting_id: meeting_id.to_string(),
+            executive_summary: res.executive_summary.clone(),
+            updated_title: Some(res.title.clone()),
+        });
+        Ok(res)
     }
 
     /// Synchronizes macOS EventKit calendars + configured external `.ics` feeds into scheduled meetings.

@@ -10,6 +10,7 @@ import type {
 
 interface McpAndPrivacyViewProps {
   lang: Language;
+  embedded?: boolean;
   policy: McpGovernancePolicy;
   snippets: McpClientConfigSnippets;
   auditLogs: McpAuditEntry[];
@@ -43,6 +44,7 @@ const MCP_TOOL_PRESETS: Record<string, Record<string, unknown>> = {
 
 export const McpAndPrivacyView: React.FC<McpAndPrivacyViewProps> = ({
   lang,
+  embedded = false,
   policy,
   snippets,
   auditLogs,
@@ -82,21 +84,23 @@ export const McpAndPrivacyView: React.FC<McpAndPrivacyViewProps> = ({
   };
 
   return (
-    <div className="page-container">
-      <header className="page-header">
-        <div>
-          <h1 className="page-title">
-            {lang === 'de'
-              ? 'MCP-Server, Agenten-Governance & Datenschutz'
-              : 'MCP Server, Agent Governance & Privacy Shield'}
-          </h1>
-          <p className="page-subtitle">
-            {lang === 'de'
-              ? 'Verbinde Claude Desktop, Cursor oder eigene KI-Agenten lokal über stdio & Streamable HTTP — mit voller Berechtigungskontrolle und Audit-Log.'
-              : 'Connect Claude Desktop, Cursor, or custom AI agents over stdio & Streamable HTTP with granular governance and audit logging.'}
-          </p>
-        </div>
-      </header>
+    <div className={embedded ? 'settings-embedded-stack' : 'page-container'}>
+      {!embedded && (
+        <header className="page-header">
+          <div>
+            <h1 className="page-title">
+              {lang === 'de'
+                ? 'MCP-Server, Agenten-Governance & Datenschutz'
+                : 'MCP Server, Agent Governance & Privacy Shield'}
+            </h1>
+            <p className="page-subtitle">
+              {lang === 'de'
+                ? 'Verbinde Claude Desktop, Cursor oder eigene KI-Agenten lokal über stdio & Streamable HTTP — mit voller Berechtigungskontrolle und Audit-Log.'
+                : 'Connect Claude Desktop, Cursor, or custom AI agents over stdio & Streamable HTTP with granular governance and audit logging.'}
+            </p>
+          </div>
+        </header>
+      )}
 
       <div className="two-col-grid">
         {/* 1-Click MCP Client Configurations */}

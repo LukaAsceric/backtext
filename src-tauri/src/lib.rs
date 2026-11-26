@@ -18,6 +18,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 
 #[tauri::command]
 async fn backtext_rpc(
@@ -309,6 +310,7 @@ pub fn run() {
     let setup_controller = controller.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--silent-launch"]),
@@ -352,6 +354,27 @@ pub fn run() {
                 let _ = dict_win.set_always_on_top(true);
             }
 
+            // Clicking a native macOS notification brings backtext (NOT Script Editor!) to the front
+            // and opens the associated meeting briefing directly.
+            let handle_for_notif = app.handle().clone();
+            let _ = app.notification().on_action(move |performed| {
+                if let Some(win) = handle_for_notif.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                if let Some(meeting_id) = performed
+                    .notification()
+                    .and_then(|n| n.extra().get("meeting_id"))
+                    .and_then(|v| v.as_str())
+                {
+                    let _ = handle_for_notif.emit(
+                        "backtext://open-meeting",
+                        serde_json::json!({ "meeting_id": meeting_id }),
+                    );
+                }
+            });
+
             // Read initial autostart state cleanly
             let autostart_active = app.autolaunch().is_enabled().unwrap_or(false);
             setup_controller.update_telemetry(|t| t.autostart_enabled = autostart_active);
@@ -384,6 +407,7 @@ pub fn run() {
             });
 
             // Forward Rust EventBus events directly into Tauri webview windows for live token & audio streaming,
+            // dispatch native macOS notifications as `ai.backtext.desktop`,
             // and control the global non-activating Dictation HUD window over all apps (Word, Safari, etc.).
             let mut rx = setup_controller.events.subscribe();
             let app_handle_for_events = app.handle().clone();
@@ -392,6 +416,25 @@ pub fn run() {
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
+                            if let BacktextEvent::NativeNotificationRequested {
+                                ref title,
+                                ref body,
+                                ref meeting_id,
+                            } = ev
+                            {
+                                let mut builder = app_handle_for_events
+                                    .notification()
+                                    .builder()
+                                    .title(title)
+                                    .body(body);
+                                if let Some(ref mid) = meeting_id {
+                                    builder = builder.extra("meeting_id", mid.clone());
+                                }
+                                if let Err(err) = builder.show() {
+                                    tracing::warn!("Native notification failed: {err}");
+                                }
+                            }
+
                             if let BacktextEvent::VoiceTypingStateChanged {
                                 active,
                                 ref mode,
@@ -517,6 +560,17 @@ pub fn run() {
             set_global_shortcut,
             set_voice_typing_shortcut
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running backtext Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building backtext Tauri application")
+        .run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            let _ = (&app_handle, &event);
+        });
 }

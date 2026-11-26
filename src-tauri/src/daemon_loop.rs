@@ -56,13 +56,14 @@ pub fn spawn_background_daemon(controller: AppController) {
                         let mins = (m.started_at - now).num_minutes();
                         if (0..=5).contains(&mins) && !notified_meeting_ids.contains(&m.id) {
                             notified_meeting_ids.insert(m.id.clone());
-                            let _ = controller
-                                .sensors
-                                .send_native_notification(
-                                    &format!("Gleich startet: {}", m.title),
-                                    "Dein Vorbereitungs-Briefing in backtext ist bereit.",
-                                )
-                                .await;
+                            controller.events.publish(
+                                BacktextEvent::NativeNotificationRequested {
+                                    title: format!("Gleich startet: {}", m.title),
+                                    body: "Dein Vorbereitungs-Briefing in backtext ist bereit."
+                                        .to_string(),
+                                    meeting_id: Some(m.id.clone()),
+                                },
+                            );
                         }
                     }
                 }
@@ -162,6 +163,12 @@ pub fn spawn_background_daemon(controller: AppController) {
                                     t.last_window_app = Some(snapshot.app_name.clone());
                                     t.last_window_title = Some(snapshot.window_title.clone());
                                 });
+                                controller.events.publish(
+                                    BacktextEvent::ContextSnapshotCaptured {
+                                        app_name: snapshot.app_name.clone(),
+                                        window_title: snapshot.window_title.clone(),
+                                    },
+                                );
 
                                 // Upgrade vector embedding asynchronously if Ollama/OpenAI neural embeddings are enabled
                                 if let Ok(ai_cfg) = controller.storage.get_ai_settings() {
@@ -241,7 +248,12 @@ pub fn spawn_background_daemon(controller: AppController) {
                     &vocab,
                 ) {
                     last_clip_hash = Some(item.content_hash.clone());
-                    let _ = controller.storage.insert_clipboard_item(&item);
+                    if controller.storage.insert_clipboard_item(&item).is_ok() {
+                        controller.events.publish(BacktextEvent::ContextSnapshotCaptured {
+                            app_name: item.source_app.clone(),
+                            window_title: "Zwischenablage".to_string(),
+                        });
+                    }
                 }
             }
 
@@ -317,13 +329,14 @@ pub fn spawn_background_daemon(controller: AppController) {
                                     confidence,
                                 });
                                 if profile.consent_reminder_enabled {
-                                    let _ = controller
-                                        .sensors
-                                        .send_native_notification(
-                                            &format!("Meeting erkannt: {title}"),
-                                            "Bot-freie Aufnahme gestartet. Bitte denke an die Einwilligung der Teilnehmer.",
-                                        )
-                                        .await;
+                                    controller.events.publish(
+                                        BacktextEvent::NativeNotificationRequested {
+                                            title: format!("Meeting erkannt: {title}"),
+                                            body: "Bot-freie Aufnahme gestartet. Bitte denke an die Einwilligung der Teilnehmer."
+                                                .to_string(),
+                                            meeting_id: Some(detail.meeting.id.clone()),
+                                        },
+                                    );
                                 }
                             }
                         }

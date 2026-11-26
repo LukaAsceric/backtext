@@ -273,8 +273,19 @@ func queryBrowserURL(bundleID: String, appName: String) -> String? {
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = Pipe()
-    try? proc.run()
-    proc.waitUntilExit()
+    let sem = DispatchSemaphore(value: 0)
+    proc.terminationHandler = { _ in sem.signal() }
+    do {
+        try proc.run()
+    } catch {
+        return nil
+    }
+    if sem.wait(timeout: .now() + .milliseconds(750)) == .timedOut {
+        if proc.isRunning {
+            proc.terminate()
+        }
+        return nil
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return s.isEmpty ? nil : s
@@ -304,6 +315,31 @@ func frontmostCGWindowTitle(for pid: pid_t) -> String {
     return bestTitle
 }
 
+/// Computes actual seconds since last human input (mouse, keyboard, scroll, modifier).
+/// NOTE: Never use `CGEventType.null` here — `kCGEventNull` (0) is NOT `kCGAnyInputEventType`,
+/// so macOS returns system uptime since boot, permanently stalling ambient context capture!
+func computeUserIdleSeconds() -> Int {
+    let inputEvents: [CGEventType] = [
+        .mouseMoved,
+        .leftMouseDown,
+        .rightMouseDown,
+        .keyDown,
+        .scrollWheel,
+        .flagsChanged
+    ]
+    var minIdle = Double.greatestFiniteMagnitude
+    for ev in inputEvents {
+        let secs = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: ev)
+        if secs.isFinite && secs >= 0.0 && secs < minIdle {
+            minIdle = secs
+        }
+    }
+    if !minIdle.isFinite || minIdle > 86_400 {
+        return 0
+    }
+    return Int(minIdle)
+}
+
 func handlePermissions() {
     let ax = AXIsProcessTrusted()
     let sck = CGPreflightScreenCaptureAccess()
@@ -315,7 +351,7 @@ func handlePermissions() {
     } else {
         cal = (calStatus == .authorized)
     }
-    let idleSecs = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null)
+    let idleSecs = computeUserIdleSeconds()
     let sessionDict = CGSessionCopyCurrentDictionary() as? [String: Any]
     let screenLocked = (sessionDict?["CGSSessionScreenIsLocked"] as? Bool) ?? false
 
@@ -325,7 +361,7 @@ func handlePermissions() {
         "microphone_granted": mic,
         "accessibility_granted": ax,
         "calendar_granted": cal,
-        "idle_seconds": Int(idleSecs),
+        "idle_seconds": idleSecs,
         "screen_locked": screenLocked
     ]
     JSONOut.emit(payload)

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { CheckSquare, Square } from 'lucide-react';
 import type { TranscriptSegment } from '../types';
 import { formatDurationMs } from '../lib/i18n';
@@ -56,6 +56,66 @@ function findMatchingSegment(
   return best;
 }
 
+/**
+ * Granola-style clickable inline citation badge with viewport-clamped `position: fixed`
+ * hover tooltip so it NEVER triggers horizontal scrollbars or clips at window edges.
+ */
+const CitationPill: React.FC<{
+  label: string;
+  segment: TranscriptSegment;
+  onJump: (segmentId: string) => void;
+}> = ({ label, segment, onJump }) => {
+  const [tipPos, setTipPos] = useState<{ left: number; top: number } | null>(null);
+  const quotePreview =
+    segment.text.length > 150 ? `${segment.text.slice(0, 147)}…` : segment.text;
+
+  const showTooltip = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    const tipWidth = Math.min(320, Math.max(220, window.innerWidth - 28));
+    const centeredLeft = rect.left + rect.width / 2 - tipWidth / 2;
+    const clampedLeft = Math.max(12, Math.min(centeredLeft, window.innerWidth - tipWidth - 12));
+    const openAbove = rect.bottom + 110 > window.innerHeight;
+    const top = openAbove ? Math.max(12, rect.top - 86) : rect.bottom + 8;
+    setTipPos({ left: clampedLeft, top });
+  };
+
+  return (
+    <span className="transcript-cite-wrap">
+      <button
+        type="button"
+        className="transcript-cite-pill"
+        data-cite-ts={label}
+        data-segment-id={segment.id}
+        onMouseEnter={(e) => showTooltip(e.currentTarget)}
+        onFocus={(e) => showTooltip(e.currentTarget)}
+        onMouseLeave={() => setTipPos(null)}
+        onBlur={() => setTipPos(null)}
+        onClick={(e) => {
+          e.stopPropagation();
+          setTipPos(null);
+          onJump(segment.id);
+        }}
+        title={`${segment.speaker_name} (${formatDurationMs(segment.start_ms)}): "${quotePreview}"`}
+      >
+        {label}
+      </button>
+      {tipPos && (
+        <span
+          className="transcript-cite-tooltip visible"
+          role="tooltip"
+          style={{ left: tipPos.left, top: tipPos.top }}
+        >
+          <span className="transcript-cite-tooltip-meta">
+            <strong>{segment.speaker_name}</strong>
+            <span className="mono-ts">{formatDurationMs(segment.start_ms)}</span>
+          </span>
+          <span className="transcript-cite-tooltip-quote">„{quotePreview}“</span>
+        </span>
+      )}
+    </span>
+  );
+};
+
 function renderInline(
   rawLine: string,
   transcript?: TranscriptSegment[],
@@ -87,6 +147,7 @@ function renderInline(
             background: 'var(--bg-surface-hover)',
             padding: '1px 5px',
             borderRadius: 4,
+            wordBreak: 'break-word',
           }}
         >
           {part.slice(1, -1)}
@@ -100,31 +161,13 @@ function renderInline(
         const label = part.slice(1, -1);
         const seg = findMatchingSegment(tsMs, transcript);
         if (seg && onJumpToTranscript) {
-          const quotePreview =
-            seg.text.length > 150 ? `${seg.text.slice(0, 147)}…` : seg.text;
           return (
-            <span key={idx} className="transcript-cite-wrap">
-              <button
-                type="button"
-                className="transcript-cite-pill"
-                data-cite-ts={label}
-                data-segment-id={seg.id}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onJumpToTranscript(seg.id);
-                }}
-                title={`${seg.speaker_name} (${formatDurationMs(seg.start_ms)}): "${quotePreview}"`}
-              >
-                {label}
-              </button>
-              <span className="transcript-cite-tooltip" role="tooltip">
-                <span className="transcript-cite-tooltip-meta">
-                  <strong>{seg.speaker_name}</strong>
-                  <span className="mono-ts">{formatDurationMs(seg.start_ms)}</span>
-                </span>
-                <span className="transcript-cite-tooltip-quote">„{quotePreview}“</span>
-              </span>
-            </span>
+            <CitationPill
+              key={idx}
+              label={label}
+              segment={seg}
+              onJump={onJumpToTranscript}
+            />
           );
         }
         return (
@@ -150,10 +193,34 @@ export const FormattedMarkdown: React.FC<FormattedMarkdownProps> = ({
 }) => {
   const lines = text.split('\n');
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 5, lineHeight: 1.64 }}>
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 5,
+        lineHeight: 1.64,
+        minWidth: 0,
+        maxWidth: '100%',
+        overflowWrap: 'anywhere',
+      }}
+    >
       {lines.map((raw, i) => {
         const line = raw.trim();
         if (!line) return <div key={i} style={{ height: 3 }} />;
+
+        // Embedded Markdown image (data:image/... or https://...)
+        const imgMatch = line.match(/^!\[([^\]]*)\]\(((?:data:image\/|https?:\/\/)[^)]+)\)$/);
+        if (imgMatch) {
+          return (
+            <figure key={i} className="note-img-figure" style={{ margin: '6px 0' }}>
+              <img
+                src={imgMatch[2]}
+                alt={imgMatch[1] || 'Notizbild'}
+                className="note-inline-img"
+              />
+            </figure>
+          );
+        }
 
         if (line === '---' || line === '***') {
           return (
@@ -211,7 +278,9 @@ export const FormattedMarkdown: React.FC<FormattedMarkdownProps> = ({
               <span className="md-task-icon" aria-hidden="true">
                 {checked ? <CheckSquare size={14} /> : <Square size={14} />}
               </span>
-              <span>{renderInline(body, transcript, onJumpToTranscript)}</span>
+              <span style={{ minWidth: 0, flex: 1 }}>
+                {renderInline(body, transcript, onJumpToTranscript)}
+              </span>
             </div>
           );
         }
@@ -220,23 +289,29 @@ export const FormattedMarkdown: React.FC<FormattedMarkdownProps> = ({
         const orderedMatch = line.match(/^(\d+)\.\s+(.+)$/);
         if (orderedMatch) {
           return (
-            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', minWidth: 0 }}>
               <span
                 className="mono-ts"
-                style={{ color: 'var(--accent-sage)', fontWeight: 700, minWidth: 18 }}
+                style={{ color: 'var(--accent-sage)', fontWeight: 700, minWidth: 18, flexShrink: 0 }}
               >
                 {orderedMatch[1]}.
               </span>
-              <span>{renderInline(orderedMatch[2], transcript, onJumpToTranscript)}</span>
+              <span style={{ minWidth: 0, flex: 1 }}>
+                {renderInline(orderedMatch[2], transcript, onJumpToTranscript)}
+              </span>
             </div>
           );
         }
 
         if (line.startsWith('- ') || line.startsWith('* ') || line.startsWith('• ')) {
           return (
-            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-              <span style={{ color: 'var(--accent-sage)', fontWeight: 700, lineHeight: 1.55 }}>•</span>
-              <span>{renderInline(line.slice(2), transcript, onJumpToTranscript)}</span>
+            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', minWidth: 0 }}>
+              <span style={{ color: 'var(--accent-sage)', fontWeight: 700, lineHeight: 1.55, flexShrink: 0 }}>
+                •
+              </span>
+              <span style={{ minWidth: 0, flex: 1 }}>
+                {renderInline(line.slice(2), transcript, onJumpToTranscript)}
+              </span>
             </div>
           );
         }
@@ -248,8 +323,9 @@ export const FormattedMarkdown: React.FC<FormattedMarkdownProps> = ({
               style={{
                 margin: '4px 0',
                 paddingLeft: 11,
-                borderLeft: '2px solid var(--accent-sage)',
+                borderLeft: '2px solid var(--border-strong)',
                 color: 'var(--text-secondary)',
+                fontStyle: 'italic',
               }}
             >
               {renderInline(line.slice(2), transcript, onJumpToTranscript)}
@@ -257,7 +333,11 @@ export const FormattedMarkdown: React.FC<FormattedMarkdownProps> = ({
           );
         }
 
-        return <div key={i}>{renderInline(line, transcript, onJumpToTranscript)}</div>;
+        return (
+          <div key={i} style={{ minWidth: 0 }}>
+            {renderInline(line, transcript, onJumpToTranscript)}
+          </div>
+        );
       })}
     </div>
   );

@@ -1062,11 +1062,11 @@ print(lines.joined(separator: "\n"))
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    async fn send_native_notification(&self, title: &str, body: &str) -> Result<()> {
-        let safe_t = title.replace('"', "'");
-        let safe_b = body.replace('"', "'");
-        let script = format!("display notification \"{safe_b}\" with title \"{safe_t}\"");
-        let _ = Command::new("osascript").args(["-e", &script]).status().await;
+    async fn send_native_notification(&self, _title: &str, _body: &str) -> Result<()> {
+        // NOTE: Never invoke `osascript -e 'display notification ...'` on macOS — notifications
+        // sent via osascript belong to Script Editor, so clicking them launches Script Editor!
+        // Native macOS notifications are delivered directly from `backtext.app` (`ai.backtext.desktop`)
+        // via `tauri-plugin-notification` in `src-tauri/src/lib.rs` through `BacktextEvent::NativeNotificationRequested`.
         Ok(())
     }
 }

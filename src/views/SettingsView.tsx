@@ -21,13 +21,18 @@ import type {
   DaemonTelemetry,
   DictationEntry,
   Language,
+  McpAuditEntry,
+  McpClientConfigSnippets,
+  McpGovernancePolicy,
   PermissionStatus,
+  PrivacyRule,
   ProviderTestResult,
   UpdateCheckResult,
   UpdateInstallProgressPayload,
   UserProfile,
   WhisperModelInfo,
 } from '../types';
+import { McpAndPrivacyView } from './McpAndPrivacyView';
 
 interface SettingsViewProps {
   lang: Language;
@@ -42,6 +47,10 @@ interface SettingsViewProps {
   voiceTypingActive: boolean;
   updateInfo: UpdateCheckResult | null;
   updateProgress: UpdateInstallProgressPayload | null;
+  mcpPolicy: McpGovernancePolicy;
+  mcpSnippets: McpClientConfigSnippets;
+  mcpAuditLogs: McpAuditEntry[];
+  privacyRules: PrivacyRule[];
   onSaveProfile: (profile: UserProfile) => Promise<void>;
   onSaveAiSettings: (settings: AiProviderSettings) => Promise<void>;
   onSetApiKey: (provider: string, apiKey: string) => Promise<void>;
@@ -62,6 +71,14 @@ interface SettingsViewProps {
   onRequestPermission: (kind: string) => Promise<void>;
   onRefreshPermissions: () => Promise<void>;
   onClearDemoData: () => Promise<void>;
+  onSaveMcpPolicy: (policy: McpGovernancePolicy) => Promise<void>;
+  onInvokeMcpInspector: (
+    toolName: string,
+    args: Record<string, unknown>,
+  ) => Promise<{ result: unknown; audit_logs: McpAuditEntry[] }>;
+  onTogglePrivacyRule: (id: string, isEnabled: boolean) => Promise<void>;
+  onAddPrivacyRule: (kind: string, pattern: string, description: string) => Promise<void>;
+  onDeletePrivacyRule: (id: string) => Promise<void>;
 }
 
 const KEY_PROVIDERS = [
@@ -175,6 +192,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   voiceTypingActive,
   updateInfo: externalUpdateInfo,
   updateProgress,
+  mcpPolicy,
+  mcpSnippets,
+  mcpAuditLogs,
+  privacyRules,
   onSaveProfile,
   onSaveAiSettings,
   onSetApiKey,
@@ -195,8 +216,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onRequestPermission,
   onRefreshPermissions,
   onClearDemoData,
+  onSaveMcpPolicy,
+  onInvokeMcpInspector,
+  onTogglePrivacyRule,
+  onAddPrivacyRule,
+  onDeletePrivacyRule,
 }) => {
-  const [activeTab, setActiveTab] = useState<'ai' | 'local' | 'shortcuts' | 'system'>('ai');
+  const [activeTab, setActiveTab] = useState<'ai' | 'local' | 'shortcuts' | 'mcp' | 'system'>('ai');
   const [aiForm, setAiForm] = useState<AiProviderSettings>(aiSettings);
   const [aiSaved, setAiSaved] = useState(false);
 
@@ -336,6 +362,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             onClick={() => setActiveTab('shortcuts')}
           >
             {lang === 'de' ? 'Shortcuts, Voice & Kalender' : 'Shortcuts, Voice & Calendar'}
+          </button>
+          <button
+            type="button"
+            id="settings-tab-mcp"
+            className={`tab-btn ${activeTab === 'mcp' ? 'active' : ''}`}
+            onClick={() => setActiveTab('mcp')}
+          >
+            {lang === 'de' ? 'MCP & Datenschutz' : 'MCP & Privacy'}
           </button>
           <button
             type="button"
@@ -1351,10 +1385,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <h2 className="section-heading">
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                 <Lock size={15} />
-                Sicherheit, Autostart & In-App-Updates
+                Sicherheit, Darstellung & In-App-Updates
               </span>
-              <span className="pill pill-sage">v0.6.1</span>
+              <span className="pill pill-sage">v0.7.0</span>
             </h2>
+
+            <div className="transcript-row" style={{ gap: 8 }}>
+              <div className="transcript-meta">
+                <strong>Breite der Meeting-Detailseite</strong>
+                <span className="mono-ts">
+                  {(profile.meeting_content_width || 'standard') === 'full'
+                    ? 'Füllen (100 %)'
+                    : (profile.meeting_content_width || 'standard') === 'wide'
+                      ? 'Breit (1120 px)'
+                      : 'Standard (820 px)'}
+                </span>
+              </div>
+              <div className="width-segmented-control" id="settings-width-control">
+                {(
+                  [
+                    { id: 'standard', label: 'Standard', hint: '820 px' },
+                    { id: 'wide', label: 'Breit', hint: '1120 px' },
+                    { id: 'full', label: 'Füllen', hint: '100 %' },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`width-seg-btn ${(profile.meeting_content_width || 'standard') === opt.id ? 'active' : ''}`}
+                    onClick={() => onSaveProfile({ ...profile, meeting_content_width: opt.id })}
+                  >
+                    <span>{opt.label}</span>
+                    <span className="mono-ts">{opt.hint}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <div className="transcript-row">
               <div className="transcript-meta">
@@ -1363,7 +1429,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {telemetry.db_encrypted ? 'SQLCipher AES-256 aktiv' : 'SQLite WAL'}
                 </span>
               </div>
-              <div className="mono-ts">Schlüssel-Tresor: {telemetry.keychain_backend}</div>
+              <div className="mono-ts">
+                Schlüssel-Tresor: {telemetry.keychain_backend} (max. 1× Schlüsselbund-Abfrage beim Start)
+              </div>
             </div>
 
             <label
@@ -1492,6 +1560,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
           </section>
         </div>
+      )}
+
+      {/* TAB 5: MCP Server, Agent Governance & Privacy Shield */}
+      {activeTab === 'mcp' && (
+        <McpAndPrivacyView
+          embedded
+          lang={lang}
+          policy={mcpPolicy}
+          snippets={mcpSnippets}
+          auditLogs={mcpAuditLogs}
+          privacyRules={privacyRules}
+          onSavePolicy={onSaveMcpPolicy}
+          onInvokeInspector={onInvokeMcpInspector}
+          onTogglePrivacyRule={onTogglePrivacyRule}
+          onAddPrivacyRule={onAddPrivacyRule}
+          onDeletePrivacyRule={onDeletePrivacyRule}
+        />
       )}
     </div>
   );

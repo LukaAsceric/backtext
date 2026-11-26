@@ -5,7 +5,6 @@ import {
   Layers,
   Users,
   Sparkles,
-  ShieldCheck,
   Sliders,
   Settings,
   Sun,
@@ -51,10 +50,12 @@ import type {
 } from './types';
 import {
   callRpc,
+  isTauriRuntime,
   setNativeAutostart,
   setNativeGlobalShortcut,
   setNativeVoiceTypingShortcut,
   subscribeBacktextEvents,
+  subscribeOpenMeeting,
 } from './lib/ipc';
 import { t } from './lib/i18n';
 import { TodayView } from './views/TodayView';
@@ -62,7 +63,6 @@ import { MeetingWorkspace } from './views/MeetingWorkspace';
 import { ContextTimelineView } from './views/ContextTimelineView';
 import { PeopleAndProjectsView } from './views/PeopleAndProjectsView';
 import { RecipesStudioView } from './views/RecipesStudioView';
-import { McpAndPrivacyView } from './views/McpAndPrivacyView';
 import { PersonalizationView } from './views/PersonalizationView';
 import { SettingsView } from './views/SettingsView';
 import { HoverModal } from './components/HoverModal';
@@ -74,7 +74,6 @@ type NavKey =
   | 'context'
   | 'people'
   | 'recipes'
-  | 'mcp'
   | 'personalization'
   | 'settings';
 
@@ -117,6 +116,18 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('backtext-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    const isMacDesktop =
+      isTauriRuntime() &&
+      typeof navigator !== 'undefined' &&
+      /mac/i.test(navigator.platform || navigator.userAgent);
+    if (isMacDesktop && !isHoverStandalone) {
+      document.documentElement.setAttribute('data-titlebar', 'overlay');
+    } else {
+      document.documentElement.removeAttribute('data-titlebar');
+    }
+  }, [isHoverStandalone]);
 
   // Auto-adapt main navigation rail on half-screen / narrow desktop windows
   useEffect(() => {
@@ -347,16 +358,60 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
       } else if (ev.event === 'meeting_detected') {
         const payload = ev.payload as { meeting_id?: string };
         refreshBootstrap(payload.meeting_id);
+      } else if (ev.event === 'meeting_summarized') {
+        const payload = ev.payload as {
+          meeting_id?: string;
+          executive_summary?: string;
+          updated_title?: string | null;
+        };
+        if (payload.meeting_id && payload.updated_title) {
+          const mid = payload.meeting_id;
+          const nextTitle = payload.updated_title;
+          setSelectedMeeting((prev) =>
+            prev && prev.meeting.id === mid
+              ? { ...prev, meeting: { ...prev.meeting, title: nextTitle } }
+              : prev,
+          );
+          setData((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  meetings: prev.meetings.map((m) =>
+                    m.id === mid ? { ...m, title: nextTitle } : m,
+                  ),
+                }
+              : prev,
+          );
+        }
+        refreshBootstrap(payload.meeting_id);
       } else if (
         ev.event === 'calendar_synced' ||
         ev.event === 'context_episode_updated' ||
-        ev.event === 'meeting_summarized'
+        ev.event === 'context_snapshot_captured'
       ) {
         refreshBootstrap();
       }
     });
     return unsub;
   }, [refreshBootstrap]);
+
+  // Clicking a native macOS notification brings backtext to the front and opens that exact meeting
+  useEffect(() => {
+    if (isHoverStandalone) return;
+    return subscribeOpenMeeting(async (meetingId) => {
+      try {
+        const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+          meetingId,
+        });
+        if (detail) {
+          setSelectedMeeting(detail);
+          setActiveNav('meetings');
+        }
+      } catch {
+        setActiveNav('meetings');
+      }
+    });
+  }, [isHoverStandalone]);
 
   // In-window keyboard shortcut fallback (Alt+Space / Escape)
   useEffect(() => {
@@ -390,6 +445,7 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
     ? (streamingByThread[`meeting:${selectedMeeting.meeting.id}`] ?? null)
     : null;
   const defaultTemplateId = data.ai_settings.default_meeting_template_id || 'general';
+  const meetingContentWidth = data.profile.meeting_content_width ?? 'standard';
 
   const handlePause = async (minutes: number | null) => {
     const next = await callRpc<CaptureStatus>('set_capture_pause', { minutes });
@@ -405,7 +461,7 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
       });
       const detail = await callRpc<MeetingDetail>('start_live_meeting', {
         title: lang === 'de' ? `Neues Meeting (${nowLabel})` : `New Meeting (${nowLabel})`,
-        detectedApp: 'Dual-Audio (Mikrofon + System-Audio)',
+        detectedApp: '',
       });
       setSelectedMeeting(detail);
       setActiveNav('meetings');
@@ -512,14 +568,17 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
 
   return (
     <div className={`app-shell ${navCollapsed ? 'nav-collapsed' : ''}`}>
-      {/* Left Navigation Rail (Collapsible to 58px Icon-Rail on Half-Screen & Live Meetings) */}
+      {/* Left Navigation Rail (Smoothly Collapsible to 74px Icon-Rail, aligned with macOS traffic lights) */}
       <aside className={`sidebar ${navCollapsed ? 'collapsed' : ''}`}>
-        <div className="brand-row">
+        {/* Integrated macOS Overlay Titlebar Drag Strip */}
+        <div className="sidebar-titlebar-drag" data-tauri-drag-region />
+
+        <div className="brand-row" data-tauri-drag-region>
           <div className="brand-mark" title="backtext">
             <span className="brand-glyph">bt</span>
             <span className="brand-text">backtext</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <div className="brand-actions">
             <button
               type="button"
               id="toggle-main-sidebar-btn"
@@ -537,17 +596,15 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
             >
               {navCollapsed ? <PanelLeftOpen size={12} /> : <PanelLeftClose size={12} />}
             </button>
-            {!navCollapsed && (
-              <button
-                type="button"
-                id="theme-toggle-btn"
-                className="mini-btn"
-                onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
-                title="Theme wechseln"
-              >
-                {theme === 'light' ? <Moon size={12} /> : <Sun size={12} />}
-              </button>
-            )}
+            <button
+              type="button"
+              id="theme-toggle-btn"
+              className="mini-btn brand-theme-btn"
+              onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
+              title="Theme wechseln"
+            >
+              {theme === 'light' ? <Moon size={12} /> : <Sun size={12} />}
+            </button>
           </div>
         </div>
 
@@ -575,53 +632,55 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
           />
         </button>
 
-        {/* Littlebird-inspired Live Context & Pause Control Pill */}
-        <div className="status-box">
-          <div className="status-indicator-row">
-            <div className="status-dot-label">
-              <span
-                className={`status-dot ${
-                  status.mode === 'recording_meeting'
-                    ? 'recording'
+        {/* Littlebird-inspired Live Context & Pause Control Pill (Fixed-width clipper prevents button squish during expand!) */}
+        <div className="status-box-clip">
+          <div className="status-box">
+            <div className="status-indicator-row">
+              <div className="status-dot-label">
+                <span
+                  className={`status-dot ${
+                    status.mode === 'recording_meeting'
+                      ? 'recording'
+                      : status.mode === 'paused'
+                        ? 'paused'
+                        : 'active'
+                  }`}
+                />
+                <span>
+                  {status.mode === 'recording_meeting'
+                    ? t(lang, 'statusRecording')
                     : status.mode === 'paused'
-                      ? 'paused'
-                      : 'active'
-                }`}
-              />
-              <span>
-                {status.mode === 'recording_meeting'
-                  ? t(lang, 'statusRecording')
-                  : status.mode === 'paused'
-                    ? t(lang, 'statusPaused')
-                    : t(lang, 'statusActive')}
-              </span>
+                      ? t(lang, 'statusPaused')
+                      : t(lang, 'statusActive')}
+                </span>
+              </div>
+              <span className="mono-ts">MCP :{data.mcp_policy.http_port}</span>
             </div>
-            <span className="mono-ts">MCP :{data.mcp_policy.http_port}</span>
-          </div>
 
-          <div className="pause-pills">
-            {status.mode === 'paused' ? (
-              <button
-                type="button"
-                id="resume-capture-btn"
-                className="mini-btn active-choice"
-                onClick={() => handlePause(null)}
-              >
-                {t(lang, 'resume')}
-              </button>
-            ) : (
-              <>
-                <button type="button" className="mini-btn" onClick={() => handlePause(15)}>
-                  Pause 15m
+            <div className="pause-pills">
+              {status.mode === 'paused' ? (
+                <button
+                  type="button"
+                  id="resume-capture-btn"
+                  className="mini-btn active-choice"
+                  onClick={() => handlePause(null)}
+                >
+                  {t(lang, 'resume')}
                 </button>
-                <button type="button" className="mini-btn" onClick={() => handlePause(60)}>
-                  Pause 1h
-                </button>
-                <button type="button" className="mini-btn" onClick={() => handlePause(0)}>
-                  Pause ∞
-                </button>
-              </>
-            )}
+              ) : (
+                <>
+                  <button type="button" className="mini-btn" onClick={() => handlePause(15)}>
+                    Pause 15m
+                  </button>
+                  <button type="button" className="mini-btn" onClick={() => handlePause(60)}>
+                    Pause 1h
+                  </button>
+                  <button type="button" className="mini-btn" onClick={() => handlePause(0)}>
+                    Pause ∞
+                  </button>
+                </>
+              )}
+            </div>
           </div>
         </div>
 
@@ -704,20 +763,6 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
 
           <button
             type="button"
-            id="nav-mcp"
-            title={t(lang, 'mcpPrivacy')}
-            className={`nav-item ${activeNav === 'mcp' ? 'selected' : ''}`}
-            onClick={() => setActiveNav('mcp')}
-          >
-            <span className="nav-item-left">
-              <ShieldCheck size={15} />
-              <span className="nav-label-text">{t(lang, 'mcpPrivacy')}</span>
-            </span>
-            <span className="nav-badge">10</span>
-          </button>
-
-          <button
-            type="button"
             id="nav-personalization"
             title={t(lang, 'personalization')}
             className={`nav-item ${activeNav === 'personalization' ? 'selected' : ''}`}
@@ -758,6 +803,7 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
 
       {/* Main View Canvas */}
       <main className={activeNav === 'meetings' ? 'workspace-main workspace-main-flush' : 'workspace-main'}>
+        {activeNav !== 'meetings' && <div className="workspace-titlebar-drag" data-tauri-drag-region />}
         {activeNav === 'today' && (
           <TodayView
             lang={lang}
@@ -804,6 +850,7 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
           <MeetingWorkspace
             lang={lang}
             platform={data.permissions.platform}
+            contentWidth={meetingContentWidth}
             meetings={data.meetings}
             templates={data.templates ?? []}
             defaultTemplateId={defaultTemplateId}
@@ -1157,47 +1204,6 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
           />
         )}
 
-        {activeNav === 'mcp' && (
-          <McpAndPrivacyView
-            lang={lang}
-            policy={data.mcp_policy}
-            snippets={data.mcp_snippets}
-            auditLogs={data.mcp_audit_logs}
-            privacyRules={data.privacy_rules}
-            onSavePolicy={async (policy: McpGovernancePolicy) => {
-              const saved = await callRpc<McpGovernancePolicy>('save_mcp_policy', { policy });
-              setData((prev) => (prev ? { ...prev, mcp_policy: saved } : prev));
-            }}
-            onInvokeInspector={async (toolName, args) => {
-              const res = await callRpc<{ result: unknown; audit_logs: McpAuditEntry[] }>(
-                'invoke_mcp_inspector',
-                { toolName, arguments: args, clientName: 'backtext-ui-inspector' },
-              );
-              setData((prev) =>
-                prev ? { ...prev, mcp_audit_logs: res.audit_logs } : prev,
-              );
-              await refreshBootstrap();
-              return res;
-            }}
-            onTogglePrivacyRule={async (id, isEnabled) => {
-              const rules = await callRpc<PrivacyRule[]>('toggle_privacy_rule', { id, isEnabled });
-              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
-            }}
-            onAddPrivacyRule={async (kind, pattern, description) => {
-              const rules = await callRpc<PrivacyRule[]>('upsert_privacy_rule', {
-                kind,
-                pattern,
-                description,
-              });
-              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
-            }}
-            onDeletePrivacyRule={async (id) => {
-              const rules = await callRpc<PrivacyRule[]>('delete_privacy_rule', { id });
-              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
-            }}
-          />
-        )}
-
         {activeNav === 'personalization' && (
           <PersonalizationView
             lang={lang}
@@ -1249,6 +1255,10 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
             voiceTypingActive={Boolean(voiceTypingState?.active)}
             updateInfo={updateInfo}
             updateProgress={updateProgress}
+            mcpPolicy={data.mcp_policy}
+            mcpSnippets={data.mcp_snippets}
+            mcpAuditLogs={data.mcp_audit_logs}
+            privacyRules={data.privacy_rules}
             onSaveProfile={async (profile: UserProfile) => {
               const saved = await callRpc<UserProfile>('save_user_profile', { profile });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
@@ -1372,6 +1382,37 @@ const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }
             onClearDemoData={async () => {
               await callRpc('clear_demo_data');
               await refreshBootstrap();
+            }}
+            onSaveMcpPolicy={async (policy: McpGovernancePolicy) => {
+              const saved = await callRpc<McpGovernancePolicy>('save_mcp_policy', { policy });
+              setData((prev) => (prev ? { ...prev, mcp_policy: saved } : prev));
+            }}
+            onInvokeMcpInspector={async (toolName, args) => {
+              const res = await callRpc<{ result: unknown; audit_logs: McpAuditEntry[] }>(
+                'invoke_mcp_inspector',
+                { toolName, arguments: args, clientName: 'backtext-ui-inspector' },
+              );
+              setData((prev) =>
+                prev ? { ...prev, mcp_audit_logs: res.audit_logs } : prev,
+              );
+              await refreshBootstrap();
+              return res;
+            }}
+            onTogglePrivacyRule={async (id, isEnabled) => {
+              const rules = await callRpc<PrivacyRule[]>('toggle_privacy_rule', { id, isEnabled });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
+            }}
+            onAddPrivacyRule={async (kind, pattern, description) => {
+              const rules = await callRpc<PrivacyRule[]>('upsert_privacy_rule', {
+                kind,
+                pattern,
+                description,
+              });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
+            }}
+            onDeletePrivacyRule={async (id) => {
+              const rules = await callRpc<PrivacyRule[]>('delete_privacy_rule', { id });
+              setData((prev) => (prev ? { ...prev, privacy_rules: rules } : prev));
             }}
           />
         )}

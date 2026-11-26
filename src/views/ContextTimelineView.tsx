@@ -161,6 +161,9 @@ export const ContextTimelineView: React.FC<ContextTimelineViewProps> = ({
             {telemetry.ticks_processed} Ticks · {telemetry.snapshots_accepted}{' '}
             {lang === 'de' ? 'erfasst' : 'captured'} · {telemetry.snapshots_filtered}{' '}
             {lang === 'de' ? 'gefiltert' : 'filtered'}
+            {typeof permissions.idle_seconds === 'number'
+              ? ` · Idle ${permissions.idle_seconds}s`
+              : ''}
           </span>
           {telemetry.last_window_app && (
             <span className="pill pill-neutral">

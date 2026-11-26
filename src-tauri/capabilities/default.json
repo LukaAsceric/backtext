@@ -5,7 +5,9 @@
   "windows": ["main", "hover"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "global-shortcut:default",
-    "autostart:default"
+    "autostart:default",
+    "notification:default"
   ]
 }

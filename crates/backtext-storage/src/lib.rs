@@ -124,6 +124,11 @@ impl StorageEngine {
              PRAGMA secure_delete = ON;",
         )?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // Idempotent v0.7.0 column migration for existing encrypted SQLCipher databases
+        let _ = conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN meeting_content_width TEXT NOT NULL DEFAULT 'standard'",
+            [],
+        );
 
         let engine = Self {
             db_path,
@@ -138,6 +143,10 @@ impl StorageEngine {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
+        let _ = conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN meeting_content_width TEXT NOT NULL DEFAULT 'standard'",
+            [],
+        );
         let engine = Self {
             db_path: PathBuf::from(":memory:"),
             conn: Arc::new(Mutex::new(conn)),
@@ -442,13 +451,20 @@ impl StorageEngine {
                 "SELECT id, display_name, email, role, organization, ui_language,
                         preferred_output_language, writing_style, tone_instructions,
                         active_projects_json, self_voiceprint_blob, auto_record_meetings,
-                        consent_reminder_enabled, retention_days, updated_at
+                        consent_reminder_enabled, retention_days, meeting_content_width, updated_at
                  FROM user_profile LIMIT 1",
                 [],
                 |row| {
                     let projects_str: String = row.get(9)?;
                     let vp_blob: Option<Vec<u8>> = row.get(10)?;
                     let vp = vp_blob.map(|b| decode_f32_vec(&b));
+                    let width_raw: String = row
+                        .get::<_, Option<String>>(14)?
+                        .unwrap_or_else(|| "standard".to_string());
+                    let width = match width_raw.as_str() {
+                        "wide" | "full" => width_raw,
+                        _ => "standard".to_string(),
+                    };
                     Ok(UserProfile {
                         id: row.get(0)?,
                         display_name: row.get(1)?,
@@ -465,7 +481,8 @@ impl StorageEngine {
                         auto_record_meetings: row.get::<_, i64>(11)? != 0,
                         consent_reminder_enabled: row.get::<_, i64>(12)? != 0,
                         retention_days: row.get::<_, u32>(13)?,
-                        updated_at: parse_dt(&row.get::<_, String>(14)?),
+                        meeting_content_width: width,
+                        updated_at: parse_dt(&row.get::<_, String>(15)?),
                     })
                 },
             )
@@ -476,6 +493,10 @@ impl StorageEngine {
     pub fn save_user_profile(&self, profile: &UserProfile) -> Result<()> {
         let projects_json = serde_json::to_string(&profile.active_projects)?;
         let vp_blob = profile.self_voiceprint.as_ref().map(|v| encode_f32_vec(v));
+        let width = match profile.meeting_content_width.as_str() {
+            "wide" | "full" => profile.meeting_content_width.as_str(),
+            _ => "standard",
+        };
         let now_str = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
@@ -483,8 +504,8 @@ impl StorageEngine {
                 id, display_name, email, role, organization, ui_language,
                 preferred_output_language, writing_style, tone_instructions,
                 active_projects_json, self_voiceprint_blob, auto_record_meetings,
-                consent_reminder_enabled, retention_days, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                consent_reminder_enabled, retention_days, meeting_content_width, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 email = excluded.email,
@@ -499,6 +520,7 @@ impl StorageEngine {
                 auto_record_meetings = excluded.auto_record_meetings,
                 consent_reminder_enabled = excluded.consent_reminder_enabled,
                 retention_days = excluded.retention_days,
+                meeting_content_width = excluded.meeting_content_width,
                 updated_at = excluded.updated_at",
             params![
                 profile.id,
@@ -515,6 +537,7 @@ impl StorageEngine {
                 profile.auto_record_meetings as i64,
                 profile.consent_reminder_enabled as i64,
                 profile.retention_days,
+                width,
                 now_str,
             ],
         )?;
@@ -1070,14 +1093,15 @@ impl StorageEngine {
             || !meeting.enhanced_markdown.is_empty()
             || !meeting.raw_user_notes.is_empty()
         {
+            let clean_notes = strip_inline_data_images(&meeting.raw_user_notes);
             let body = format!(
                 "{}\n{}\n{}",
-                meeting.executive_summary, meeting.enhanced_markdown, meeting.raw_user_notes
+                meeting.executive_summary, meeting.enhanced_markdown, clean_notes
             );
             let snippet = if !meeting.executive_summary.is_empty() {
                 meeting.executive_summary.clone()
             } else {
-                meeting.raw_user_notes.chars().take(220).collect()
+                clean_notes.chars().take(220).collect()
             };
             self.index_memory_document(
                 &format!("meeting:{}", meeting.id),

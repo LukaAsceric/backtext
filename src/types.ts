@@ -95,6 +95,7 @@ export interface UserProfile {
   auto_record_meetings: boolean;
   consent_reminder_enabled: boolean;
   retention_days: number;
+  meeting_content_width?: 'standard' | 'wide' | 'full';
   updated_at: string;
 }
 

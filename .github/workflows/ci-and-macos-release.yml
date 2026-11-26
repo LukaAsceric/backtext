@@ -47,7 +47,7 @@ jobs:
         run: cargo test --workspace
 
   build-macos-bundle:
-    name: Build Signed Apple Silicon (M1–M5) v0.6.1 .dmg & .app.zip
+    name: Build Signed Apple Silicon (M1–M5) v0.7.0 .dmg & .app.zip
     runs-on: macos-15
     needs: verify-rust-and-ui
     steps:
@@ -202,18 +202,18 @@ jobs:
             'echo "Entferne macOS Quarantäne-Attribut für backtext.app..."' \
             'xattr -cr /Applications/backtext.app' \
             'open /Applications/backtext.app' \
-            'echo "backtext v0.6.1 wurde erfolgreich gestartet!"' \
+            'echo "backtext v0.7.0 wurde erfolgreich gestartet!"' \
             > "$HELPER"
           chmod 755 "$HELPER"
 
           hdiutil create -volname "backtext" \
             -srcfolder dist-macos/dmg-staging \
             -ov -format UDZO \
-            dist-macos/backtext_0.6.1_macos_arm64.dmg
+            dist-macos/backtext_0.7.0_macos_arm64.dmg
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$APP_DIR" \
-            dist-macos/backtext_0.6.1_macos_arm64.app.zip
+            dist-macos/backtext_0.7.0_macos_arm64.app.zip
 
           cp target/aarch64-apple-darwin/release/backtext-mcp dist-macos/backtext-mcp-macos-arm64
           chmod 755 dist-macos/backtext-mcp-macos-arm64
@@ -221,41 +221,44 @@ jobs:
       - name: Upload macOS Apple Silicon Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtext-macos-apple-silicon-arm64-v0.6.1
+          name: backtext-macos-apple-silicon-arm64-v0.7.0
           path: |
-            dist-macos/backtext_0.6.1_macos_arm64.dmg
-            dist-macos/backtext_0.6.1_macos_arm64.app.zip
+            dist-macos/backtext_0.7.0_macos_arm64.dmg
+            dist-macos/backtext_0.7.0_macos_arm64.app.zip
             dist-macos/backtext-mcp-macos-arm64
 
-      - name: Publish / Update GitHub Release v0.6.1
+      - name: Publish / Update GitHub Release v0.7.0
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NOTES=$(printf '%s\n' \
-            '## backtext v0.6.1 — Hotfix: Volle System-Audio-Lautstärke bei Meetings (kein macOS VoiceProcessingIO-Ducking) & Verstärkter Pure-Rust Echo-Filter (`arm64` · M1–M5 Pro/Max)' \
+            '## backtext v0.7.0 — Native macOS Polish, Single-Keychain Vault, Rich Notes, Auto-Titles & Context Capture Fix (`arm64` · M1–M5 Pro/Max)' \
             '' \
-            '### Behoben & Verbessert in v0.6.1' \
-            '- **Fix für extrem leises System-Audio bei Meeting-Aufzeichnung:** `AVAudioInputNode.setVoiceProcessingEnabled(true)` (Apple `VoiceProcessingIO`) wurde entfernt, da macOS dadurch automatisch alle anderen Apps (Teams, Zoom, Meet, Browser) um −12 bis −24 dB absenkt (Ducking) und Bluetooth-Headsets umschaltet. Gesprächspartner bleiben jetzt bei 100 % voller Originallautstärke.' \
-            '- **Verstärkter Pure-Rust Dual-Channel-Echo-Filter (ohne OS-Ducking):** `suppress_speaker_echo_in_mic` kombiniert jetzt Wellenform-Korrelation (`0–80 ms`) mit einer Raumhall- und Jitter-stabilen `20 ms` RMS-Hüllkurven-Korrelation über `±160 ms`.' \
-            '- **Chunk-übergreifende Post-STT Echo-Deduplizierung:** Ein Rolling-Buffer der letzten 5 System-Audio-Äußerungen filtert Lautsprecher-Echos jetzt auch dann zuverlässig aus, wenn ein Satz genau an einer Chunk-Grenze liegt.' \
-            '- **Enthält alle v0.6.0-Features:** Warmer Metal-`whisper-server`, 1-Klick In-App Auto-Updater + lokales Signatur-Zertifikat, globaler Diktat-HUD + Word/Safari-Paste-Fix, Templates Studio, Half-Screen-Fix & Meeting-Fokus-Modus.' \
+            '### Neu & Behoben in v0.7.0' \
+            '- **Max. 1× Schlüsselbund-Abfrage beim Start:** Alle API-Keys werden jetzt über einen einzigen Master-Key (`db_master_key`) im AES-256-GCM-Tresor geschützt — statt bis zu 8 separater macOS-Keychain-Prompts.' \
+            '- **Native macOS-Benachrichtigungen (kein Skripteditor mehr!):** Meeting-Vorbereitungs- & Start-Benachrichtigungen laufen direkt über `tauri-plugin-notification` als `ai.backtext.desktop`; ein Klick öffnet direkt das passende Meeting-Briefing in backtext.' \
+            '- **Integrierte macOS-Titelleiste (`Overlay`):** Die klassische Titelleiste entfällt — Ampel-Buttons sitzen integriert in der linken Leiste mit Drag-Regionen.' \
+            '- **Kontext-Gedächtnis-Aufzeichnung behoben:** Ein CoreGraphics-Bug (`CGEventType.null` lieferte System-Uptime statt Benutzer-Idle-Zeit) blockierte die Hintergrund-Erfassung. Jetzt werden Fenster, Browser-Tabs, Vision-OCR & Zwischenablage zuverlässig live aufgezeichnet.' \
+            '- **Smarte Notizen mit Bildern & Auto-Formatierung (ohne Editor-Ballast):** `- ` / `1. ` / `[] ` / `## ` werden beim Tippen automatisch formatiert; Bilder lassen sich direkt per `⌘V` oder Drag & Drop einfügen.' \
+            '- **Automatische Meeting-Titel bei der Zusammenfassung:** Platzhalter-Titel wie „Neues Meeting (12:36)“ werden beim Verdichten automatisch durch prägnante KI-Titel ersetzt (manuelle & Kalender-Titel bleiben unberührt).' \
+            '- **Aufgeräumte UI & Scrollbars:** „MCP & Datenschutz“ jetzt als Tab in den Einstellungen, kein „Dual-Audio“-Rauschen im Meeting-Header, keine horizontalen Scrollbars mehr, 3-stufige Meeting-Lesebreite (`Standard` / `Breit` / `Füllen`), ins Design integrierte Scrollleisten & butterweiche Sidebar-Animation.' \
             '' \
-            '### Update von v0.6.0' \
-            '- Wenn das Repo öffentlich ist: In backtext **Einstellungen → System & Updates → Nach Updates suchen** → **„v0.6.1 jetzt installieren & neu starten“** (1 Klick!).' \
-            '- Oder manuell über **`backtext_0.6.1_macos_arm64.dmg`** installieren.')
-          if gh release view v0.6.1 >/dev/null 2>&1; then
-            gh release upload v0.6.1 \
-              dist-macos/backtext_0.6.1_macos_arm64.dmg \
-              dist-macos/backtext_0.6.1_macos_arm64.app.zip \
+            '### 1-Klick-Update (ab v0.6.0)' \
+            '- Da das Repo jetzt öffentlich ist: In backtext **Einstellungen → System & Updates → Nach Updates suchen** → **„v0.7.0 jetzt installieren & neu starten“**.' \
+            '- Oder manuell über **`backtext_0.7.0_macos_arm64.dmg`** installieren.')
+          if gh release view v0.7.0 >/dev/null 2>&1; then
+            gh release upload v0.7.0 \
+              dist-macos/backtext_0.7.0_macos_arm64.dmg \
+              dist-macos/backtext_0.7.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
               --clobber
-            gh release edit v0.6.1 --notes "$NOTES"
+            gh release edit v0.7.0 --notes "$NOTES"
           else
-            gh release create v0.6.1 \
-              dist-macos/backtext_0.6.1_macos_arm64.dmg \
-              dist-macos/backtext_0.6.1_macos_arm64.app.zip \
+            gh release create v0.7.0 \
+              dist-macos/backtext_0.7.0_macos_arm64.dmg \
+              dist-macos/backtext_0.7.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
-              --title "backtext v0.6.1 — Hotfix: Volle System-Audio-Lautstärke & verstärkter Pure-Rust Echo-Filter" \
+              --title "backtext v0.7.0 — Native macOS Polish, Single-Keychain, Rich Notes & Context Fix" \
               --notes "$NOTES"
           fi

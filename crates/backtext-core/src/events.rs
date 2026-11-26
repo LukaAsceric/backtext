@@ -24,8 +24,20 @@ pub enum BacktextEvent {
     MeetingSummarized {
         meeting_id: String,
         executive_summary: String,
+        #[serde(default)]
+        updated_title: Option<String>,
     },
     ContextEpisodeUpdated(ContextEpisode),
+    ContextSnapshotCaptured {
+        app_name: String,
+        window_title: String,
+    },
+    NativeNotificationRequested {
+        title: String,
+        body: String,
+        #[serde(default)]
+        meeting_id: Option<String>,
+    },
     McpToolInvoked(McpAuditEntry),
     ChatStreamDelta {
         thread_id: String,

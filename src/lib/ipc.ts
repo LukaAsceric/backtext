@@ -55,6 +55,20 @@ export function subscribeHoverShown(handler: () => void): () => void {
   };
 }
 
+export function subscribeOpenMeeting(handler: (meetingId: string) => void): () => void {
+  if (!isTauriRuntime()) return () => {};
+  let unlistenFn: (() => void) | null = null;
+  listen<{ meeting_id?: string }>('backtext://open-meeting', (event) => {
+    const id = event.payload?.meeting_id;
+    if (id) handler(id);
+  }).then((unlisten) => {
+    unlistenFn = unlisten;
+  });
+  return () => {
+    unlistenFn?.();
+  };
+}
+
 export async function setNativeAutostart(enabled: boolean): Promise<boolean> {
   if (isTauriRuntime()) {
     return await invoke<boolean>('set_autostart_enabled', { enabled });

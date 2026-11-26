@@ -37,6 +37,7 @@ tracing-subscriber.workspace = true
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
 
 backtext-core.workspace = true
 backtext-storage.workspace = true

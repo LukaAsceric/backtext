@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS user_profile (
     auto_record_meetings INTEGER NOT NULL DEFAULT 1,
     consent_reminder_enabled INTEGER NOT NULL DEFAULT 1,
     retention_days INTEGER NOT NULL DEFAULT 90,
+    meeting_content_width TEXT NOT NULL DEFAULT 'standard',
     updated_at TEXT NOT NULL
 );
 

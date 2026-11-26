@@ -1,4 +1,6 @@
 :root {
+  color-scheme: light;
+
   /* Light Theme — Warm Linen & Editorial Ink */
   --bg-canvas: hsl(40, 28%, 97.5%);
   --bg-sidebar: hsl(38, 22%, 94.2%);
@@ -14,6 +16,10 @@
 
   --border-subtle: hsla(218, 16%, 14%, 0.085);
   --border-strong: hsla(218, 16%, 14%, 0.16);
+
+  /* Integrated Calm Scrollbars */
+  --scrollbar-thumb: hsla(218, 16%, 14%, 0.17);
+  --scrollbar-thumb-hover: hsla(218, 16%, 14%, 0.34);
 
   /* Semantic Calm Accents (No Violet/Neon) */
   --accent-sage: hsl(154, 48%, 32%);
@@ -39,6 +45,8 @@
 }
 
 [data-theme='dark'] {
+  color-scheme: dark;
+
   /* Dark Theme — Calm Graphite Slate (Zero Purple) */
   --bg-canvas: hsl(216, 13%, 9.5%);
   --bg-sidebar: hsl(216, 15%, 7.5%);
@@ -54,6 +62,9 @@
 
   --border-subtle: hsla(40, 20%, 94%, 0.08);
   --border-strong: hsla(40, 20%, 94%, 0.15);
+
+  --scrollbar-thumb: hsla(40, 18%, 92%, 0.16);
+  --scrollbar-thumb-hover: hsla(40, 18%, 92%, 0.30);
 
   --accent-sage: hsl(154, 46%, 48%);
   --accent-sage-soft: hsla(154, 46%, 48%, 0.14);
@@ -72,6 +83,35 @@
 *::before,
 *::after {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+/* Integrated floating scrollbars across Light & Dark mode (no harsh macOS white bars) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html,
