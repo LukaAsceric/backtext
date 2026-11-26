@@ -37,6 +37,7 @@ struct LiveMeetingRuntime {
     screenshare_dedup: ScreenShareDeduplicator,
     sim_step: usize,
     elapsed_ms: u64,
+    recent_system_texts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +355,7 @@ impl AppController {
                 screenshare_dedup: ScreenShareDeduplicator::default(),
                 sim_step: 0,
                 elapsed_ms: 0,
+                recent_system_texts: Vec::new(),
             },
         );
 
@@ -601,7 +603,13 @@ impl AppController {
             .and_then(|p| read_wav_and_spans(&PathBuf::from(p)).ok().map(|d| (PathBuf::from(p), d)));
 
         let mut added = 0usize;
-        let mut system_utterance_texts: Vec<String> = Vec::new();
+        // Seed with recent System utterances from previous chunks so cross-chunk speaker bleed is also caught
+        let mut system_utterance_texts: Vec<String> = self
+            .live_sessions
+            .lock()
+            .get(meeting_id)
+            .map(|rt| rt.recent_system_texts.clone())
+            .unwrap_or_default();
 
         // 1. Always transcribe System Audio FIRST so we can deduplicate residual loudspeaker echo on the mic channel
         if let Some((sys_path, (sr, samples, spans))) = sys_loaded.as_ref() {
@@ -636,7 +644,15 @@ impl AppController {
                             screenshare_dedup: ScreenShareDeduplicator::default(),
                             sim_step: 0,
                             elapsed_ms: 0,
+                            recent_system_texts: Vec::new(),
                         });
+                    if !utt.text.trim().is_empty() {
+                        rt.recent_system_texts.push(utt.text.clone());
+                        if rt.recent_system_texts.len() > 5 {
+                            let excess = rt.recent_system_texts.len() - 5;
+                            rt.recent_system_texts.drain(0..excess);
+                        }
+                    }
 
                     let base_ms = rt.elapsed_ms;
                     let start_ms = base_ms + utt.start_ms;
@@ -714,7 +730,7 @@ impl AppController {
                     let utterances = utterances?;
 
                     for utt in utterances {
-                        // Layer 3: Drop residual loudspeaker bleed duplicated from System Audio in the same chunk
+                        // Layer 3: Drop residual loudspeaker bleed duplicated from System Audio (current or previous chunk)
                         if is_echo_duplicate_of_system(&utt.text, &system_utterance_texts) {
                             continue;
                         }
@@ -738,6 +754,7 @@ impl AppController {
                                 screenshare_dedup: ScreenShareDeduplicator::default(),
                                 sim_step: 0,
                                 elapsed_ms: 0,
+                                recent_system_texts: Vec::new(),
                             });
 
                         let base_ms = rt.elapsed_ms;
@@ -999,6 +1016,7 @@ impl AppController {
                 screenshare_dedup: ScreenShareDeduplicator::default(),
                 sim_step: 0,
                 elapsed_ms: 0,
+                recent_system_texts: Vec::new(),
             });
 
         let step = rt.sim_step % 4;

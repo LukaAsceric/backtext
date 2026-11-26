@@ -637,46 +637,33 @@ func computeRmsNormalized(_ samples: [Int16]) -> Double {
 }
 
 final class ContinuousMicRecorder {
-    private var engine = AVAudioEngine()
+    private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var buffer: [Int16] = []
     private var latestRms: Double = 0.0
     private(set) var isRunning: Bool = false
     private(set) var errorMessage: String? = nil
 
-    func start(enableVoiceProcessing: Bool = false) {
+    func start() {
         let auth = AVCaptureDevice.authorizationStatus(for: .audio)
         if auth == .denied || auth == .restricted {
             errorMessage = "Mikrofon-Berechtigung in macOS Systemeinstellungen nicht erteilt."
             return
         }
-        if enableVoiceProcessing {
-            if startInternal(voiceProcessing: true) {
-                return
-            }
-            // Safe fallback if the active audio interface/Bluetooth device does not support Voice Processing AEC
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            engine = AVAudioEngine()
-            errorMessage = nil
-        }
-        _ = startInternal(voiceProcessing: false)
-    }
-
-    private func startInternal(voiceProcessing: Bool) -> Bool {
+        // NOTE: Never enable `input.setVoiceProcessingEnabled(true)` here!
+        // Apple's VoiceProcessingIO aggressively ducks all other macOS system audio (-12 to -24 dB)
+        // and downgrades Bluetooth headsets. Speaker bleed is handled purely in Rust DSP + Post-STT
+        // against the synchronized ScreenCaptureKit reference stream without touching playback volume.
         let input = engine.inputNode
-        if voiceProcessing {
-            try? input.setVoiceProcessingEnabled(true)
-        }
         let inputFmt = input.outputFormat(forBus: 0)
         if inputFmt.sampleRate <= 0 || inputFmt.channelCount == 0 {
             errorMessage = "Kein aktives Mikrofon-Eingabegerät gefunden."
-            return false
+            return
         }
         guard let targetFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
               let converter = AVAudioConverter(from: inputFmt, to: targetFmt) else {
             errorMessage = "Audio-Konverter konnte nicht initialisiert werden."
-            return false
+            return
         }
 
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFmt) { [weak self] pcmBuf, _ in
@@ -710,11 +697,9 @@ final class ContinuousMicRecorder {
             try engine.start()
             isRunning = true
             errorMessage = nil
-            return true
         } catch {
             errorMessage = "Mikrofon-Start fehlgeschlagen: \(error.localizedDescription)"
             isRunning = false
-            return false
         }
     }
 
@@ -814,9 +799,9 @@ final class SystemAudioCollector: NSObject, SCStreamOutput {
     }
 }
 
-func recordMicrophoneSamples(durationSecs: Double, enableVoiceProcessing: Bool = false) -> [Int16] {
+func recordMicrophoneSamples(durationSecs: Double) -> [Int16] {
     let rec = ContinuousMicRecorder()
-    rec.start(enableVoiceProcessing: enableVoiceProcessing)
+    rec.start()
     guard rec.isRunning else { return [] }
     Thread.sleep(forTimeInterval: durationSecs)
     rec.stop()
@@ -834,7 +819,7 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
 
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
-        micSamples = recordMicrophoneSamples(durationSecs: seconds, enableVoiceProcessing: true)
+        micSamples = recordMicrophoneSamples(durationSecs: seconds)
         group.leave()
     }
 
@@ -923,7 +908,7 @@ func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
     sigTermSrc.resume()
 
     let micRec = ContinuousMicRecorder()
-    micRec.start(enableVoiceProcessing: true)
+    micRec.start()
 
     var sysCollector: AnyObject? = nil
     var sysStream: AnyObject? = nil

@@ -396,10 +396,26 @@ pub fn write_wav_pcm16(path: impl AsRef<Path>, sample_rate: u32, samples: &[f32]
     Ok(())
 }
 
-/// Pure-Rust Dual-Channel Acoustic Echo / Speaker-Bleed Gate.
-/// Compares 100ms microphone frames against synchronized System-Audio frames across
-/// acoustic room delays (0–64 ms). Mutes frames where the microphone signal is
-/// predominantly speaker bleed rather than the local user speaking.
+fn compute_envelope_rms(samples: &[f32], hop: usize) -> Vec<f32> {
+    if samples.is_empty() || hop == 0 {
+        return Vec::new();
+    }
+    let mut env = Vec::with_capacity(samples.len().div_ceil(hop));
+    let mut idx = 0usize;
+    while idx < samples.len() {
+        let end = (idx + hop).min(samples.len());
+        let n = (end - idx) as f32;
+        let energy: f32 = samples[idx..end].iter().map(|x| x * x).sum();
+        env.push((energy / n).sqrt());
+        idx = end;
+    }
+    env
+}
+
+/// Pure-Rust Dual-Channel Acoustic Echo / Speaker-Bleed Gate (zero OS audio ducking).
+/// Combines waveform cross-correlation (0–80ms) AND 20ms RMS envelope correlation across
+/// ±160ms buffer-delivery jitter so loudspeaker bleed in reverberant rooms is suppressed
+/// cleanly before Whisper runs while preserving genuine local self-speech.
 /// Returns `(cleaned_mic_samples, has_remaining_self_speech)`.
 pub fn suppress_speaker_echo_in_mic(
     mic_samples: &[f32],
@@ -416,8 +432,13 @@ pub fn suppress_speaker_echo_in_mic(
 
     let mut cleaned = mic_samples.to_vec();
     let frame_len = ((sample_rate as usize) / 10).max(320); // 100ms
-    let max_lag = ((sample_rate as usize) * 64) / 1000; // 64ms acoustic path
+    let max_lag = ((sample_rate as usize) * 80) / 1000; // 80ms waveform lag
     let lag_step = (((sample_rate as usize) * 2) / 1000).max(1); // 2ms step
+
+    // 20ms envelope frames for reverb- & jitter-invariant echo detection (±160ms = ±8 hops)
+    let env_hop = ((sample_rate as usize) * 20) / 1000;
+    let mic_env = compute_envelope_rms(mic_samples, env_hop);
+    let sys_env = compute_envelope_rms(sys_samples, env_hop);
 
     let mut offset = 0usize;
     while offset < mic_samples.len() {
@@ -430,53 +451,92 @@ pub fn suppress_speaker_echo_in_mic(
         let mic_energy: f32 = mic_slice.iter().map(|x| x * x).sum();
         let mic_rms = (mic_energy / win_len as f32).sqrt();
 
-        let sys_end = end.min(sys_samples.len());
-        let sys_start = offset.min(sys_end);
-        let sys_len = sys_end - sys_start;
+        // Peak System-Audio RMS within ±160ms around this 100ms frame
+        let env_start = offset / env_hop.max(1);
+        let env_end = (end.div_ceil(env_hop.max(1))).min(mic_env.len());
+        let sys_env_lo = env_start.saturating_sub(8).min(sys_env.len());
+        let sys_env_hi = (env_end + 8).min(sys_env.len());
+        let sys_rms_window = if sys_env_hi > sys_env_lo {
+            sys_env[sys_env_lo..sys_env_hi]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+        } else {
+            0.0
+        };
 
-        if sys_len >= 160 && mic_rms >= 0.008 {
-            let sys_slice = &sys_samples[sys_start..sys_end];
-            let sys_energy: f32 = sys_slice.iter().map(|x| x * x).sum();
-            let sys_rms = (sys_energy / sys_len as f32).sqrt();
-
-            if sys_rms >= 0.015 {
-                let mut best_abs_corr = 0.0_f32;
-                let mut lag = 0usize;
-                while lag <= max_lag {
-                    let s_start = offset.saturating_sub(lag);
-                    let avail = (sys_samples.len().saturating_sub(s_start)).min(win_len);
-                    if avail >= 160 {
-                        let mut dot = 0.0_f32;
-                        let mut e_m = 0.0_f32;
-                        let mut e_s = 0.0_f32;
-                        let mut i = 0;
-                        while i < avail {
-                            let m = mic_slice[i];
-                            let s = sys_samples[s_start + i];
-                            dot += m * s;
-                            e_m += m * m;
-                            e_s += s * s;
-                            i += 2;
+        if mic_rms >= 0.008 && sys_rms_window >= 0.014 {
+            // 1. Direct waveform cross-correlation across 0..80ms
+            let mut best_abs_corr = 0.0_f32;
+            let mut lag = 0usize;
+            while lag <= max_lag {
+                let s_start = offset.saturating_sub(lag);
+                let avail = (sys_samples.len().saturating_sub(s_start)).min(win_len);
+                if avail >= 160 {
+                    let mut dot = 0.0_f32;
+                    let mut e_m = 0.0_f32;
+                    let mut e_s = 0.0_f32;
+                    let mut i = 0;
+                    while i < avail {
+                        let m = mic_slice[i];
+                        let s = sys_samples[s_start + i];
+                        dot += m * s;
+                        e_m += m * m;
+                        e_s += s * s;
+                        i += 2;
+                    }
+                    let denom = (e_m * e_s).sqrt();
+                    if denom > 1e-6 {
+                        let corr = (dot / denom).abs();
+                        if corr > best_abs_corr {
+                            best_abs_corr = corr;
                         }
+                    }
+                }
+                lag += lag_step;
+            }
+
+            // 2. Reverb- & offset-invariant 20ms RMS envelope correlation across ±160ms
+            let mut best_env_corr = 0.0_f32;
+            let ctx_lo = env_start.saturating_sub(8);
+            let ctx_hi = (env_end + 8).min(mic_env.len());
+            if ctx_hi.saturating_sub(ctx_lo) >= 6 && !sys_env.is_empty() {
+                for shift in -8isize..=8isize {
+                    let mut dot = 0.0_f32;
+                    let mut e_m = 0.0_f32;
+                    let mut e_s = 0.0_f32;
+                    let mut count = 0usize;
+                    for k in ctx_lo..ctx_hi {
+                        let sk = k as isize + shift;
+                        if sk >= 0 && (sk as usize) < sys_env.len() {
+                            let mv = mic_env[k];
+                            let sv = sys_env[sk as usize];
+                            dot += mv * sv;
+                            e_m += mv * mv;
+                            e_s += sv * sv;
+                            count += 1;
+                        }
+                    }
+                    if count >= 6 {
                         let denom = (e_m * e_s).sqrt();
                         if denom > 1e-6 {
-                            let corr = (dot / denom).abs();
-                            if corr > best_abs_corr {
-                                best_abs_corr = corr;
+                            let c = dot / denom;
+                            if c > best_env_corr {
+                                best_env_corr = c;
                             }
                         }
                     }
-                    lag += lag_step;
                 }
+            }
 
-                let is_correlated_bleed = best_abs_corr >= 0.34 && mic_rms < sys_rms * 1.45;
-                let is_quiet_leak_under_loud_speaker =
-                    sys_rms >= 0.025 && mic_rms < sys_rms * 0.48;
+            let is_correlated_bleed = best_abs_corr >= 0.30 && mic_rms < sys_rms_window * 1.45;
+            let is_envelope_bleed = best_env_corr >= 0.72 && mic_rms < sys_rms_window * 1.05;
+            let is_quiet_leak_under_loud_speaker =
+                sys_rms_window >= 0.020 && mic_rms < sys_rms_window * 0.55;
 
-                if is_correlated_bleed || is_quiet_leak_under_loud_speaker {
-                    for s in &mut cleaned[offset..end] {
-                        *s = 0.0;
-                    }
+            if is_correlated_bleed || is_envelope_bleed || is_quiet_leak_under_loud_speaker {
+                for s in &mut cleaned[offset..end] {
+                    *s = 0.0;
                 }
             }
         }
@@ -555,6 +615,20 @@ mod tests {
         assert!(
             !has_speech_bleed,
             "Delayed speaker bleed should be suppressed completely"
+        );
+
+        // Simulate reverberant + 110ms offset speaker bleed (phase-shifted frequency so raw waveform corr is low)
+        let offset_samples = (sr as usize * 110) / 1000;
+        let reverb_src = synth_voice(203.0, sr, 1.5);
+        let mut mic_reverb_bleed = vec![0.0_f32; remote.len()];
+        for i in offset_samples..remote.len() {
+            mic_reverb_bleed[i] = reverb_src[i - offset_samples] * 0.65;
+        }
+        let (_cleaned_reverb, has_speech_reverb) =
+            suppress_speaker_echo_in_mic(&mic_reverb_bleed, &remote, sr);
+        assert!(
+            !has_speech_reverb,
+            "Reverberant/offset speaker bleed should be suppressed via envelope correlation"
         );
 
         let self_voice = synth_voice(118.0, sr, 1.2);

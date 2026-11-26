@@ -586,7 +586,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </h2>
             <p style={{ margin: 0, fontSize: 12.5, color: 'var(--text-secondary)' }}>
               {telemetry.whisper_server_detected
-                ? 'Persistenter whisper-server (Apple Metal) gebündelt: Modell wird pro Meeting nur einmal geladen (statt 30×/Min) — deutlich kühler & schneller inkl. 3-stufiger Lautsprecher-Echo-Unterdrückung.'
+                ? 'Persistenter whisper-server (Apple Metal) gebündelt: Modell wird pro Meeting nur einmal geladen (statt 30×/Min) — deutlich kühler & schneller inkl. Pure-Rust Lautsprecher-Echo-Filter ohne Lautstärke-Absenkung.'
                 : telemetry.whisper_cli_detected
                   ? 'Lokale Apple-Silicon-Transkription ist startklar. Lade ein Modell herunter und aktiviere es für 100% lokale Meeting-Transkripte.'
                   : 'Installiere whisper-cpp (brew install whisper-cpp) oder nutze Deepgram/OpenAI/Groq unter KI-Router & API-Keys.'}
@@ -1353,7 +1353,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <Lock size={15} />
                 Sicherheit, Autostart & In-App-Updates
               </span>
-              <span className="pill pill-sage">v0.6.0</span>
+              <span className="pill pill-sage">v0.6.1</span>
             </h2>
 
             <div className="transcript-row">
