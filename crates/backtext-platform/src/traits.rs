@@ -129,6 +129,62 @@ pub struct SafeClipboardObservation {
     pub is_concealed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictationCaptureResult {
+    pub wav_path: Option<String>,
+    pub duration_ms: u64,
+    pub simulated_text: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct DictationCaptureSession {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    done_rx: Option<tokio::sync::oneshot::Receiver<DictationCaptureResult>>,
+}
+
+impl DictationCaptureSession {
+    pub fn new(
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        done_rx: tokio::sync::oneshot::Receiver<DictationCaptureResult>,
+    ) -> Self {
+        Self {
+            stop_tx: Some(stop_tx),
+            done_rx: Some(done_rx),
+        }
+    }
+
+    pub async fn stop_and_finish(mut self) -> DictationCaptureResult {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        let Some(rx) = self.done_rx.take() else {
+            return DictationCaptureResult {
+                wav_path: None,
+                duration_ms: 0,
+                simulated_text: None,
+                error: Some("Diktat-Aufnahme bereits abgeschlossen.".into()),
+            };
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(4), rx).await {
+            Ok(Ok(res)) => res,
+            _ => DictationCaptureResult {
+                wav_path: None,
+                duration_ms: 0,
+                simulated_text: None,
+                error: Some("Diktat-Aufnahme konnte nicht abgeschlossen werden.".into()),
+            },
+        }
+    }
+}
+
+impl Drop for DictationCaptureSession {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
 #[async_trait]
 pub trait PlatformSensors: Send + Sync {
     async fn check_permissions(&self) -> PermissionStatus;
@@ -150,6 +206,11 @@ pub trait PlatformSensors: Send + Sync {
         out_dir: &str,
         chunk_secs: u64,
     ) -> anyhow::Result<DualAudioStreamSession>;
+    async fn start_dictation_capture(
+        &self,
+        out_wav_path: &str,
+    ) -> anyhow::Result<DictationCaptureSession>;
+    async fn paste_text_at_cursor(&self, text: &str) -> anyhow::Result<bool>;
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> anyhow::Result<bool>;
     async fn upcoming_calendar_events(&self) -> anyhow::Result<Vec<CalendarMeetingEvent>>;
     async fn read_safe_clipboard(&self) -> anyhow::Result<Option<SafeClipboardObservation>>;

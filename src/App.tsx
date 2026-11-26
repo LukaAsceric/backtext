@@ -10,6 +10,8 @@ import {
   Settings,
   Sun,
   Moon,
+  Mic,
+  Square,
 } from 'lucide-react';
 import type {
   AiProviderSettings,
@@ -17,12 +19,16 @@ import type {
   CalendarFeedConfig,
   CaptureStatus,
   ChatMessage,
+  ChatScope,
+  DictationEntry,
   Language,
   McpAuditEntry,
   McpGovernancePolicy,
   Meeting,
   MeetingDetail,
+  MeetingFolder,
   MeetingParticipant,
+  MeetingTemplate,
   MemorySearchHit,
   PermissionStatus,
   Person,
@@ -36,6 +42,7 @@ import type {
   UpdateCheckResult,
   UserProfile,
   VocabularyEntry,
+  VoiceTypingStatePayload,
   LearnedPreference,
   WhisperModelInfo,
 } from './types';
@@ -43,6 +50,7 @@ import {
   callRpc,
   setNativeAutostart,
   setNativeGlobalShortcut,
+  setNativeVoiceTypingShortcut,
   subscribeBacktextEvents,
 } from './lib/ipc';
 import { t } from './lib/i18n';
@@ -72,6 +80,8 @@ export const App: React.FC = () => {
   const [selectedMeeting, setSelectedMeeting] = useState<MeetingDetail | null>(null);
   const [recordingLevel, setRecordingLevel] = useState<RecordingAudioLevel | null>(null);
   const [globalMessages, setGlobalMessages] = useState<ChatMessage[]>([]);
+  const [chatScope, setChatScope] = useState<{ scope: ChatScope; label: string } | null>(null);
+  const [voiceTypingState, setVoiceTypingState] = useState<VoiceTypingStatePayload | null>(null);
   const [streamingByThread, setStreamingByThread] = useState<Record<string, string>>({});
   const [hoverOpen, setHoverOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -220,6 +230,36 @@ export const App: React.FC = () => {
             meeting: { ...prev.meeting, participants: nextParts },
           };
         });
+      } else if (ev.event === 'meeting_notes_updated') {
+        const p = ev.payload as { meeting_id: string; enhanced_markdown: string };
+        setSelectedMeeting((prev) =>
+          prev && prev.meeting.id === p.meeting_id
+            ? {
+                ...prev,
+                meeting: { ...prev.meeting, enhanced_markdown: p.enhanced_markdown },
+              }
+            : prev,
+        );
+        setData((prev) =>
+          prev
+            ? {
+                ...prev,
+                meetings: prev.meetings.map((m) =>
+                  m.id === p.meeting_id
+                    ? { ...m, enhanced_markdown: p.enhanced_markdown }
+                    : m,
+                ),
+              }
+            : prev,
+        );
+      } else if (ev.event === 'voice_typing_state_changed') {
+        const p = ev.payload as VoiceTypingStatePayload;
+        setVoiceTypingState(p);
+        if (!p.active) {
+          window.setTimeout(() => {
+            setVoiceTypingState((cur) => (cur && !cur.active ? null : cur));
+          }, 3400);
+        }
       } else if (ev.event === 'daemon_telemetry_updated') {
         setData((prev) =>
           prev
@@ -348,6 +388,7 @@ export const App: React.FC = () => {
       await callRpc<ChatMessage>('run_chat_or_recipe', {
         input,
         recipeSlug,
+        scope: chatScope?.scope,
       });
       const updated = await callRpc<ChatMessage[]>('get_chat_messages', {
         threadId: 'global:workspace',
@@ -357,6 +398,38 @@ export const App: React.FC = () => {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleToggleSystemVoiceTyping = async () => {
+    const res = await callRpc<{
+      active: boolean;
+      entry?: DictationEntry;
+      dictations?: DictationEntry[];
+    }>('toggle_voice_typing', { mode: 'system' });
+    if (res.dictations) {
+      setData((prev) => (prev ? { ...prev, dictations: res.dictations! } : prev));
+    }
+    setVoiceTypingState((prev) =>
+      res.active
+        ? {
+            active: true,
+            mode: 'system',
+            status: lang === 'de' ? 'Voice Typing hört zu…' : 'Voice Typing listening…',
+            text: null,
+            target_app: null,
+          }
+        : res.entry
+          ? {
+              active: false,
+              mode: 'system',
+              status: res.entry.pasted
+                ? `In ${res.entry.target_app} eingefügt`
+                : 'Diktat gespeichert',
+              text: res.entry.cleaned_text,
+              target_app: res.entry.target_app,
+            }
+          : prev,
+    );
   };
 
   if (isHoverStandalone) {
@@ -568,6 +641,8 @@ export const App: React.FC = () => {
             episodes={data.episodes}
             recipes={data.recipes}
             globalMessages={globalMessages}
+            chatScope={chatScope}
+            onClearChatScope={() => setChatScope(null)}
             streamingText={globalStreamText}
             chatBusy={busy}
             onStartAdhocMeeting={handleStartAdhocMeeting}
@@ -604,6 +679,8 @@ export const App: React.FC = () => {
             lang={lang}
             platform={data.permissions.platform}
             meetings={data.meetings}
+            templates={data.templates ?? []}
+            folders={data.folders ?? []}
             persons={data.persons}
             selectedDetail={selectedMeeting}
             recordingLevel={recordingLevel}
@@ -688,6 +765,25 @@ export const App: React.FC = () => {
                   : prev,
               );
             }}
+            onSaveEnhancedNotes={async (meetingId, enhancedMarkdown) => {
+              const detail = await callRpc<MeetingDetail | null>('update_meeting_enhanced_notes', {
+                meetingId,
+                enhancedMarkdown,
+              });
+              if (detail) {
+                setSelectedMeeting(detail);
+              }
+              setData((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      meetings: prev.meetings.map((m) =>
+                        m.id === meetingId ? { ...m, enhanced_markdown: enhancedMarkdown } : m,
+                      ),
+                    }
+                  : prev,
+              );
+            }}
             onEnhanceMeeting={async (meetingId) => {
               setBusy(true);
               try {
@@ -696,6 +792,81 @@ export const App: React.FC = () => {
               } finally {
                 setBusy(false);
               }
+            }}
+            onSetMeetingTemplate={async (meetingId, templateId, regenerate) => {
+              setBusy(true);
+              try {
+                const res = await callRpc<{ detail: MeetingDetail | null; meetings: Meeting[] }>(
+                  'set_meeting_template',
+                  { meetingId, templateId, regenerate },
+                );
+                if (res.detail) setSelectedMeeting(res.detail);
+                setData((prev) => (prev ? { ...prev, meetings: res.meetings } : prev));
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onSaveTemplate={async (template) => {
+              const templates = await callRpc<MeetingTemplate[]>('save_meeting_template', {
+                template,
+              });
+              setData((prev) => (prev ? { ...prev, templates } : prev));
+            }}
+            onDeleteTemplate={async (id) => {
+              const templates = await callRpc<MeetingTemplate[]>('delete_meeting_template', { id });
+              setData((prev) => (prev ? { ...prev, templates } : prev));
+            }}
+            onSaveFolder={async (folder) => {
+              const folders = await callRpc<MeetingFolder[]>('save_meeting_folder', { folder });
+              setData((prev) => (prev ? { ...prev, folders } : prev));
+            }}
+            onDeleteFolder={async (id) => {
+              const res = await callRpc<{ folders: MeetingFolder[]; meetings: Meeting[] }>(
+                'delete_meeting_folder',
+                { id },
+              );
+              setData((prev) =>
+                prev ? { ...prev, folders: res.folders, meetings: res.meetings } : prev,
+              );
+            }}
+            onSetMeetingFolders={async (meetingId, folderIds) => {
+              const res = await callRpc<{
+                detail: MeetingDetail | null;
+                folders: MeetingFolder[];
+                meetings: Meeting[];
+              }>('set_meeting_folders', { meetingId, folderIds });
+              if (res.detail) setSelectedMeeting(res.detail);
+              setData((prev) =>
+                prev ? { ...prev, folders: res.folders, meetings: res.meetings } : prev,
+              );
+            }}
+            onAddMeetingsToFolder={async (meetingIds, folderId) => {
+              const res = await callRpc<{ folders: MeetingFolder[]; meetings: Meeting[] }>(
+                'add_meetings_to_folder',
+                { meetingIds, folderId },
+              );
+              setData((prev) =>
+                prev ? { ...prev, folders: res.folders, meetings: res.meetings } : prev,
+              );
+            }}
+            onAddSeriesAutoFolder={async (folderId, seriesKey) => {
+              const res = await callRpc<{ folders: MeetingFolder[]; meetings: Meeting[] }>(
+                'add_series_auto_folder',
+                { folderId, seriesKey },
+              );
+              setData((prev) =>
+                prev ? { ...prev, folders: res.folders, meetings: res.meetings } : prev,
+              );
+              if (selectedMeeting) {
+                const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
+                  meetingId: selectedMeeting.meeting.id,
+                });
+                if (detail) setSelectedMeeting(detail);
+              }
+            }}
+            onStartScopedChat={(scope, label) => {
+              setChatScope({ scope, label });
+              setActiveNav('today');
             }}
             onToggleActionItem={async (meetingId, actionId) => {
               const detail = await callRpc<MeetingDetail>('toggle_action_item', {
@@ -807,6 +978,13 @@ export const App: React.FC = () => {
               const persons = await callRpc<Person[]>('delete_person', { personId });
               setData((prev) => (prev ? { ...prev, persons } : prev));
             }}
+            onChatWithPerson={(person) => {
+              setChatScope({
+                scope: { person_id: person.id },
+                label: `${lang === 'de' ? 'Person' : 'Person'}: ${person.full_name}`,
+              });
+              setActiveNav('today');
+            }}
           />
         )}
 
@@ -917,6 +1095,8 @@ export const App: React.FC = () => {
             whisperModels={data.whisper_models}
             ollamaModels={data.ollama_models}
             calendarFeeds={data.calendar_feeds}
+            dictations={data.dictations ?? []}
+            voiceTypingActive={Boolean(voiceTypingState?.active)}
             onSaveProfile={async (profile: UserProfile) => {
               const saved = await callRpc<UserProfile>('save_user_profile', { profile });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
@@ -970,6 +1150,20 @@ export const App: React.FC = () => {
               );
               return display;
             }}
+            onSetVoiceTypingShortcut={async (shortcut) => {
+              const display = await setNativeVoiceTypingShortcut(shortcut);
+              setData((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      ai_settings: { ...prev.ai_settings, voice_typing_shortcut: shortcut },
+                      telemetry: { ...prev.telemetry, voice_typing_shortcut: display },
+                    }
+                  : prev,
+              );
+              return display;
+            }}
+            onToggleVoiceTyping={handleToggleSystemVoiceTyping}
             onAddCalendarFeed={async (name, icsUrl) => {
               const calendar_feeds = await callRpc<CalendarFeedConfig[]>('add_calendar_feed', {
                 name,
@@ -1007,6 +1201,29 @@ export const App: React.FC = () => {
           />
         )}
       </main>
+
+      {/* Floating Bottom Voice Typing Status Pill */}
+      {voiceTypingState && (voiceTypingState.active || voiceTypingState.status) && (
+        <div
+          id="voice-typing-floating-pill"
+          className={`voice-typing-pill ${voiceTypingState.active ? 'active' : ''}`}
+        >
+          <span className={`status-dot ${voiceTypingState.active ? 'recording' : 'active'}`} />
+          <Mic size={13} />
+          <span>{voiceTypingState.status}</span>
+          {voiceTypingState.active && (
+            <button
+              type="button"
+              className="mini-btn active-choice"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 4 }}
+              onClick={handleToggleSystemVoiceTyping}
+            >
+              <Square size={10} />
+              {lang === 'de' ? 'Stop' : 'Stop'}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* In-window Hover Overlay Modal (for Web Preview & In-Window ⌥ Space) */}
       <HoverModal

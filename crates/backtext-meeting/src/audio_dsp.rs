@@ -324,9 +324,48 @@ pub fn extract_acoustic_voiceprint_256(samples: &[f32], sample_rate: u32) -> Vec
     embedding
 }
 
-pub fn extract_voiceprint_from_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, Vec<SpeechSpan>)> {
+pub fn read_wav_and_spans(path: impl AsRef<Path>) -> Result<(u32, Vec<f32>, Vec<SpeechSpan>)> {
     let (sr, samples) = read_wav_pcm16(path)?;
-    let spans = detect_speech_spans(&samples, sr, 0.012, 200, 300);
+    let spans = detect_speech_spans(&samples, sr, 0.012, 180, 260);
+    Ok((sr, samples, spans))
+}
+
+/// Extracts an acoustic 256-dim speaker voiceprint for a specific `[start_ms..end_ms]`
+/// utterance window inside a multi-speaker WAV chunk, enabling sub-chunk remote speaker
+/// separation even when using local Whisper or single-channel remote audio.
+pub fn extract_voiceprint_for_window(
+    samples: &[f32],
+    sample_rate: u32,
+    start_ms: u64,
+    end_ms: u64,
+) -> Option<Vec<f32>> {
+    if samples.is_empty() || sample_rate == 0 {
+        return None;
+    }
+    let start_idx = ((start_ms as usize) * (sample_rate as usize)) / 1000;
+    let mut end_idx = ((end_ms as usize) * (sample_rate as usize)) / 1000;
+    let min_window = ((sample_rate as usize) * 400) / 1000;
+    if end_idx <= start_idx {
+        end_idx = start_idx + min_window;
+    } else if end_idx - start_idx < min_window {
+        end_idx = start_idx + min_window;
+    }
+    let clamped_start = start_idx.min(samples.len());
+    let clamped_end = end_idx.min(samples.len());
+    if clamped_end.saturating_sub(clamped_start) < 400 {
+        return None;
+    }
+    let vp = extract_acoustic_voiceprint_256(&samples[clamped_start..clamped_end], sample_rate);
+    let norm_sq: f32 = vp.iter().map(|x| x * x).sum();
+    if norm_sq > 0.1 {
+        Some(vp)
+    } else {
+        None
+    }
+}
+
+pub fn extract_voiceprint_from_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, Vec<SpeechSpan>)> {
+    let (sr, samples, spans) = read_wav_and_spans(path)?;
     let vp = extract_acoustic_voiceprint_256(&samples, sr);
     Ok((vp, spans))
 }
@@ -366,5 +405,21 @@ mod tests {
         let diff_sim = cosine_similarity(&vp_a1, &vp_b);
         assert!(same_sim > 0.90, "Same speaker similarity expected > 0.90, got {same_sim}");
         assert!(same_sim > diff_sim + 0.15, "Expected clear separation: same={same_sim} vs diff={diff_sim}");
+    }
+
+    #[test]
+    fn sub_chunk_window_voiceprints_separate_two_speakers_in_one_chunk() {
+        let mut combined = synth_voice(120.0, 16_000, 1.5);
+        combined.extend(vec![0.0_f32; 8_000]); // 500ms pause
+        combined.extend(synth_voice(240.0, 16_000, 1.5));
+
+        let vp_first = extract_voiceprint_for_window(&combined, 16_000, 0, 1500).unwrap();
+        let vp_second = extract_voiceprint_for_window(&combined, 16_000, 2000, 3500).unwrap();
+        let ref_first = extract_acoustic_voiceprint_256(&synth_voice(122.0, 16_000, 1.0), 16_000);
+
+        let sim_same = cosine_similarity(&vp_first, &ref_first);
+        let sim_cross = cosine_similarity(&vp_first, &vp_second);
+        assert!(sim_same > 0.85, "Expected first utterance to match speaker 1, got {sim_same}");
+        assert!(sim_same > sim_cross + 0.15, "Expected sub-chunk speakers separated: {sim_same} vs {sim_cross}");
     }
 }

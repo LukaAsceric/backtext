@@ -161,6 +161,17 @@ impl StorageEngine {
     }
 
     fn ensure_defaults_seeded(&self) -> Result<()> {
+        // Always ensure built-in meeting templates exist (even when upgrading an existing v0.4.0 DB!)
+        let has_templates: bool = {
+            let conn = self.conn.lock();
+            conn.query_row("SELECT COUNT(*) FROM meeting_templates", [], |r| r.get::<_, i64>(0))? > 0
+        };
+        if !has_templates {
+            for tpl in seed::builtin_meeting_templates() {
+                self.upsert_meeting_template(&tpl)?;
+            }
+        }
+
         let has_profile: bool = {
             let conn = self.conn.lock();
             conn.query_row("SELECT COUNT(*) FROM user_profile", [], |r| r.get::<_, i64>(0))? > 0
@@ -181,6 +192,9 @@ impl StorageEngine {
         }
         for pref in seed::builtin_learned_preferences() {
             self.upsert_learned_preference(&pref)?;
+        }
+        for fld in seed::builtin_meeting_folders() {
+            self.upsert_meeting_folder(&fld)?;
         }
 
         // Seed realistic initial data so UI & MCP tools work richly out of the box
@@ -1007,9 +1021,42 @@ impl StorageEngine {
                     ],
                 )?;
             }
+
+            // Persist explicit folder links
+            for fid in &meeting.folder_ids {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO meeting_folder_links (meeting_id, folder_id) VALUES (?1, ?2)",
+                    params![meeting.id, fid],
+                );
+            }
+
+            // Auto-link any folder whose auto_series_keys contains this meeting's recurring series_key
+            if let Some(skey) = compute_series_key(&meeting.title) {
+                let mut f_stmt = conn.prepare("SELECT id, auto_series_keys_json FROM meeting_folders")?;
+                let folder_rules: Vec<(String, Vec<String>)> = f_stmt
+                    .query_map([], |r| {
+                        let id: String = r.get(0)?;
+                        let json_str: String = r.get(1)?;
+                        let keys: Vec<String> = serde_json::from_str(&json_str).unwrap_or_default();
+                        Ok((id, keys))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for (fid, keys) in folder_rules {
+                    if keys.iter().any(|k| k.eq_ignore_ascii_case(&skey)) {
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO meeting_folder_links (meeting_id, folder_id) VALUES (?1, ?2)",
+                            params![meeting.id, fid],
+                        );
+                    }
+                }
+            }
         }
 
-        if !meeting.executive_summary.is_empty() || !meeting.raw_user_notes.is_empty() {
+        if !meeting.executive_summary.is_empty()
+            || !meeting.enhanced_markdown.is_empty()
+            || !meeting.raw_user_notes.is_empty()
+        {
             let body = format!(
                 "{}\n{}\n{}",
                 meeting.executive_summary, meeting.enhanced_markdown, meeting.raw_user_notes
@@ -1045,6 +1092,46 @@ impl StorageEngine {
             self.save_meeting(&detail.meeting)?;
         }
         Ok(())
+    }
+
+    pub fn update_meeting_enhanced_markdown(
+        &self,
+        meeting_id: &str,
+        enhanced_markdown: &str,
+    ) -> Result<Option<MeetingDetail>> {
+        let exec_summary = enhanced_markdown
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE meetings SET enhanced_markdown = ?2, executive_summary = CASE WHEN ?3 != '' THEN ?3 ELSE executive_summary END WHERE id = ?1",
+                params![meeting_id, enhanced_markdown, exec_summary],
+            )?;
+        }
+        if let Some(detail) = self.get_meeting_detail(meeting_id)? {
+            self.save_meeting(&detail.meeting)?;
+        }
+        self.get_meeting_detail(meeting_id)
+    }
+
+    pub fn update_meeting_template_id(
+        &self,
+        meeting_id: &str,
+        template_id: &str,
+    ) -> Result<Option<MeetingDetail>> {
+        let clean = template_id.trim();
+        if !clean.is_empty() {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE meetings SET template_id = ?2 WHERE id = ?1",
+                params![meeting_id, clean],
+            )?;
+        }
+        self.get_meeting_detail(meeting_id)
     }
 
     pub fn update_meeting_title(&self, meeting_id: &str, title: &str) -> Result<()> {
@@ -1105,6 +1192,7 @@ impl StorageEngine {
         let _ = conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", params![meeting_id]);
         let _ = conn.execute("DELETE FROM screenshare_frames WHERE meeting_id = ?1", params![meeting_id]);
         let _ = conn.execute("DELETE FROM meeting_participants WHERE meeting_id = ?1", params![meeting_id]);
+        let _ = conn.execute("DELETE FROM meeting_folder_links WHERE meeting_id = ?1", params![meeting_id]);
         let affected = conn.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
         Ok(affected > 0)
     }
@@ -1201,9 +1289,11 @@ impl StorageEngine {
             .query_map([], |row| {
                 let ended_str: Option<String> = row.get(6)?;
                 let actions_str: String = row.get(13)?;
+                let title: String = row.get(1)?;
+                let series_key = compute_series_key(&title);
                 Ok(Meeting {
                     id: row.get(0)?,
-                    title: row.get(1)?,
+                    title,
                     calendar_event_id: row.get(2)?,
                     detected_app: row.get(3)?,
                     project_tag: row.get(4)?,
@@ -1219,6 +1309,8 @@ impl StorageEngine {
                     participants: Vec::new(),
                     transcript_count: row.get::<_, i64>(14)? as usize,
                     screenshare_count: row.get::<_, i64>(15)? as usize,
+                    folder_ids: Vec::new(),
+                    series_key,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1243,6 +1335,14 @@ impl StorageEngine {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut fl_stmt = conn.prepare(
+                "SELECT folder_id FROM meeting_folder_links WHERE meeting_id = ?1",
+            )?;
+            m.folder_ids = fl_stmt
+                .query_map(params![m.id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
         }
         Ok(meetings)
     }
@@ -1844,22 +1944,24 @@ impl StorageEngine {
     pub fn has_demo_data(&self) -> Result<bool> {
         let conn = self.conn.lock();
         let cnt: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "SELECT COUNT(*) FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
             [],
             |r| r.get(0),
         )?;
         Ok(cnt > 0)
     }
 
-    /// Removes the initial demo dataset while preserving user profile, recipes, vocabulary, and privacy rules.
+    /// Removes the initial demo dataset while preserving user profile, recipes, templates, vocabulary, and privacy rules.
     pub fn clear_demo_data(&self) -> Result<usize> {
         let conn = self.conn.lock();
         let mut removed = 0;
         for sql in [
-            "DELETE FROM transcript_segments WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
-            "DELETE FROM screenshare_frames WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
-            "DELETE FROM meeting_participants WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
-            "DELETE FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox')",
+            "DELETE FROM transcript_segments WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
+            "DELETE FROM screenshare_frames WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
+            "DELETE FROM meeting_participants WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
+            "DELETE FROM meeting_folder_links WHERE meeting_id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
+            "DELETE FROM meetings WHERE id IN ('mtg_arch_sync', 'mtg_upcoming_velox', 'mtg_arch_sync_prev')",
+            "DELETE FROM meeting_folders WHERE id IN ('fld_product', 'fld_customers')",
             "DELETE FROM persons WHERE id IN ('per_anna', 'per_markus', 'per_clara')",
             "DELETE FROM context_episodes WHERE id IN ('ep_mcp_spec', 'ep_recipes_design')",
             "DELETE FROM context_snapshots WHERE id IN ('snap_1', 'snap_2')",
@@ -2002,9 +2104,248 @@ impl StorageEngine {
             participants,
             transcript_count: 0,
             screenshare_count: 0,
+            folder_ids: vec![],
+            series_key: compute_series_key(title),
         };
         self.save_meeting(&meeting)?;
         Ok(true)
+    }
+
+    // -------------------------------------------------------------------------
+    // Meeting Templates (Granola-Style Custom Summary Templates)
+    // -------------------------------------------------------------------------
+
+    pub fn list_meeting_templates(&self) -> Result<Vec<MeetingTemplate>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name_de, name_en, description_de, description_en, icon_key,
+                    sections_prompt, is_builtin, created_at
+             FROM meeting_templates
+             ORDER BY is_builtin DESC, name_de ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MeetingTemplate {
+                    id: row.get(0)?,
+                    name_de: row.get(1)?,
+                    name_en: row.get(2)?,
+                    description_de: row.get(3)?,
+                    description_en: row.get(4)?,
+                    icon_key: row.get(5)?,
+                    sections_prompt: row.get(6)?,
+                    is_builtin: row.get::<_, i64>(7)? != 0,
+                    created_at: parse_dt(&row.get::<_, String>(8)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_meeting_template(&self, template_id: &str) -> Result<Option<MeetingTemplate>> {
+        Ok(self
+            .list_meeting_templates()?
+            .into_iter()
+            .find(|t| t.id == template_id))
+    }
+
+    pub fn upsert_meeting_template(&self, tpl: &MeetingTemplate) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO meeting_templates (
+                id, name_de, name_en, description_de, description_en, icon_key,
+                sections_prompt, is_builtin, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                name_de = excluded.name_de,
+                name_en = excluded.name_en,
+                description_de = excluded.description_de,
+                description_en = excluded.description_en,
+                icon_key = excluded.icon_key,
+                sections_prompt = excluded.sections_prompt",
+            params![
+                tpl.id,
+                tpl.name_de,
+                tpl.name_en,
+                tpl.description_de,
+                tpl.description_en,
+                tpl.icon_key,
+                tpl.sections_prompt,
+                tpl.is_builtin as i64,
+                tpl.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_meeting_template(&self, template_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let affected = conn.execute(
+            "DELETE FROM meeting_templates WHERE id = ?1 AND is_builtin = 0",
+            params![template_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Meeting Folders & Recurring Series Auto-Add Rules
+    // -------------------------------------------------------------------------
+
+    pub fn list_meeting_folders(&self) -> Result<Vec<MeetingFolder>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, color, description, auto_series_keys_json, created_at,
+                    (SELECT COUNT(*) FROM meeting_folder_links l WHERE l.folder_id = meeting_folders.id)
+             FROM meeting_folders
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let keys_json: String = row.get(4)?;
+                Ok(MeetingFolder {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                    description: row.get(3)?,
+                    auto_series_keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                    created_at: parse_dt(&row.get::<_, String>(5)?),
+                    meeting_count: row.get::<_, i64>(6)? as usize,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn upsert_meeting_folder(&self, folder: &MeetingFolder) -> Result<()> {
+        let keys_json = serde_json::to_string(&folder.auto_series_keys)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO meeting_folders (id, name, color, description, auto_series_keys_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                color = excluded.color,
+                description = excluded.description,
+                auto_series_keys_json = excluded.auto_series_keys_json",
+            params![
+                folder.id,
+                folder.name,
+                folder.color,
+                folder.description,
+                keys_json,
+                folder.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_meeting_folder(&self, folder_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM meeting_folder_links WHERE folder_id = ?1",
+            params![folder_id],
+        );
+        let affected = conn.execute("DELETE FROM meeting_folders WHERE id = ?1", params![folder_id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn set_meeting_folders(&self, meeting_id: &str, folder_ids: &[String]) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM meeting_folder_links WHERE meeting_id = ?1",
+            params![meeting_id],
+        )?;
+        for fid in folder_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO meeting_folder_links (meeting_id, folder_id) VALUES (?1, ?2)",
+                params![meeting_id, fid],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn add_meetings_to_folder(&self, meeting_ids: &[String], folder_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        for mid in meeting_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO meeting_folder_links (meeting_id, folder_id) VALUES (?1, ?2)",
+                params![mid, folder_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Registers a recurring series key on `folder_id` and retro-links all existing matching meetings.
+    pub fn add_series_auto_folder(&self, folder_id: &str, series_key: &str) -> Result<Vec<MeetingFolder>> {
+        let clean_key = series_key.trim().to_lowercase();
+        if !clean_key.is_empty() {
+            if let Some(mut fld) = self
+                .list_meeting_folders()?
+                .into_iter()
+                .find(|f| f.id == folder_id)
+            {
+                if !fld.auto_series_keys.iter().any(|k| k.eq_ignore_ascii_case(&clean_key)) {
+                    fld.auto_series_keys.push(clean_key.clone());
+                    self.upsert_meeting_folder(&fld)?;
+                }
+                let matching_ids: Vec<String> = self
+                    .list_meetings()?
+                    .into_iter()
+                    .filter(|m| {
+                        m.series_key
+                            .as_deref()
+                            .map(|k| k.eq_ignore_ascii_case(&clean_key))
+                            .unwrap_or(false)
+                    })
+                    .map(|m| m.id)
+                    .collect();
+                self.add_meetings_to_folder(&matching_ids, folder_id)?;
+            }
+        }
+        self.list_meeting_folders()
+    }
+
+    // -------------------------------------------------------------------------
+    // Voice Typing Dictation History
+    // -------------------------------------------------------------------------
+
+    pub fn insert_dictation_entry(&self, entry: &DictationEntry) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO dictation_history (id, raw_text, cleaned_text, target_app, duration_ms, pasted, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.id,
+                entry.raw_text,
+                entry.cleaned_text,
+                entry.target_app,
+                entry.duration_ms as i64,
+                entry.pasted as i64,
+                entry.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_dictation_history(&self, limit: usize) -> Result<Vec<DictationEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, raw_text, cleaned_text, target_app, duration_ms, pasted, created_at
+             FROM dictation_history ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(DictationEntry {
+                    id: row.get(0)?,
+                    raw_text: row.get(1)?,
+                    cleaned_text: row.get(2)?,
+                    target_app: row.get(3)?,
+                    duration_ms: row.get::<_, i64>(4)? as u64,
+                    pasted: row.get::<_, i64>(5)? != 0,
+                    created_at: parse_dt(&row.get::<_, String>(6)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn record_mcp_audit(&self, entry: &McpAuditEntry) -> Result<()> {
@@ -2139,6 +2480,72 @@ mod tests {
 
         assert!(store.delete_meeting(&first_id).unwrap());
         assert!(store.get_meeting_detail(&first_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn templates_folders_auto_series_and_dictation_history_work() {
+        let store = StorageEngine::open_in_memory().unwrap();
+
+        // 7 built-in templates seeded automatically
+        let tpls = store.list_meeting_templates().unwrap();
+        assert!(tpls.len() >= 7);
+        assert!(tpls.iter().any(|t| t.id == "architecture"));
+
+        // Custom template CRUD
+        let custom = MeetingTemplate {
+            id: "tpl_custom_qbr".into(),
+            name_de: "Kunden-QBR".into(),
+            name_en: "Customer QBR".into(),
+            description_de: "Quartalsreview".into(),
+            description_en: "Quarterly review".into(),
+            icon_key: "sparkles".into(),
+            sections_prompt: "### KPIs\n### Risiken\n### Action Items".into(),
+            is_builtin: false,
+            created_at: Utc::now(),
+        };
+        store.upsert_meeting_template(&custom).unwrap();
+        assert!(store.get_meeting_template("tpl_custom_qbr").unwrap().is_some());
+        store.update_meeting_template_id("mtg_arch_sync", "tpl_custom_qbr").unwrap();
+        let detail = store.get_meeting_detail("mtg_arch_sync").unwrap().unwrap();
+        assert_eq!(detail.meeting.template_id, "tpl_custom_qbr");
+
+        // Recurring series detection + auto-series folder linking
+        let expected_series_key = detail.meeting.series_key.clone().expect("series_key should be computed");
+        let meetings = store.list_meetings().unwrap();
+        let arch_series = meetings
+            .iter()
+            .filter(|m| m.series_key.as_deref() == Some(expected_series_key.as_str()))
+            .count();
+        assert!(arch_series >= 2, "Expected current + previous seeded meeting in recurring series");
+
+        let custom_folder = MeetingFolder {
+            id: "fld_series_test".into(),
+            name: "Architektur Serie".into(),
+            color: "#2F6B53".into(),
+            description: "Automatisch verknüpft".into(),
+            auto_series_keys: vec![],
+            created_at: Utc::now(),
+            meeting_count: 0,
+        };
+        store.upsert_meeting_folder(&custom_folder).unwrap();
+        let folders = store.add_series_auto_folder("fld_series_test", &expected_series_key).unwrap();
+        let linked = folders.iter().find(|f| f.id == "fld_series_test").unwrap();
+        assert!(linked.meeting_count >= 2);
+
+        // Dictation history persistence
+        let entry = DictationEntry {
+            id: "dict_test_1".into(),
+            raw_text: "ähm test mit backtext".into(),
+            cleaned_text: "Test mit backtext.".into(),
+            target_app: "Slack".into(),
+            duration_ms: 2100,
+            pasted: true,
+            created_at: Utc::now(),
+        };
+        store.insert_dictation_entry(&entry).unwrap();
+        let hist = store.list_dictation_history(10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].cleaned_text, "Test mit backtext.");
     }
 }
 

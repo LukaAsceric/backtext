@@ -13,5 +13,6 @@ uuid.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+regex.workspace = true
 backtext-core.workspace = true
 backtext-storage.workspace = true

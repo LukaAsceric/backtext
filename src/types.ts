@@ -29,6 +29,7 @@ export interface DaemonTelemetry {
   keychain_backend: string;
   autostart_enabled: boolean;
   global_shortcut: string;
+  voice_typing_shortcut: string;
   demo_data_present: boolean;
   whisper_cli_detected: boolean;
 }
@@ -185,6 +186,54 @@ export interface Meeting {
   participants: MeetingParticipant[];
   transcript_count: number;
   screenshare_count: number;
+  folder_ids?: string[];
+  series_key?: string | null;
+}
+
+export interface MeetingTemplate {
+  id: string;
+  name_de: string;
+  name_en: string;
+  description_de: string;
+  description_en: string;
+  icon_key: string;
+  sections_prompt: string;
+  is_builtin: boolean;
+  created_at: string;
+}
+
+export interface MeetingFolder {
+  id: string;
+  name: string;
+  color: string;
+  description: string;
+  auto_series_keys: string[];
+  created_at: string;
+  meeting_count: number;
+}
+
+export interface ChatScope {
+  folder_id?: string | null;
+  person_id?: string | null;
+  meeting_ids?: string[];
+}
+
+export interface DictationEntry {
+  id: string;
+  raw_text: string;
+  cleaned_text: string;
+  target_app: string;
+  duration_ms: number;
+  pasted: boolean;
+  created_at: string;
+}
+
+export interface VoiceTypingStatePayload {
+  active: boolean;
+  mode: 'system' | 'chat' | string;
+  status: string;
+  text: string | null;
+  target_app: string | null;
 }
 
 export interface ChatSourceRef {
@@ -313,12 +362,16 @@ export interface AiProviderSettings {
   stt_provider: string;
   stt_model: string;
   whisper_model_id: string;
+  stt_max_chunk_secs: number;
   llm_provider: string;
   llm_model: string;
   embedding_provider: string;
   embedding_model: string;
   ollama_url: string;
   hover_shortcut: string;
+  voice_typing_enabled: boolean;
+  voice_typing_shortcut: string;
+  voice_typing_ai_polish: boolean;
   openai_api_key_set: boolean;
   anthropic_api_key_set: boolean;
   gemini_api_key_set: boolean;
@@ -366,6 +419,9 @@ export interface BootstrapPayload {
   telemetry: DaemonTelemetry;
   profile: UserProfile;
   meetings: Meeting[];
+  templates: MeetingTemplate[];
+  folders: MeetingFolder[];
+  dictations: DictationEntry[];
   episodes: ContextEpisode[];
   snapshots: ContextSnapshot[];
   clipboard: ClipboardItem[];
@@ -403,4 +459,9 @@ export type BacktextRealtimeEvent =
       payload: { meeting_id: string; participant: MeetingParticipant };
     }
   | { event: 'meeting_summarized'; payload: { meeting_id: string; executive_summary: string } }
+  | { event: 'voice_typing_state_changed'; payload: VoiceTypingStatePayload }
+  | {
+      event: 'meeting_notes_updated';
+      payload: { meeting_id: string; enhanced_markdown: string };
+    }
   | { event: string; payload: unknown };

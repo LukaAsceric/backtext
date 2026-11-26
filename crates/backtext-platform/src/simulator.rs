@@ -221,6 +221,37 @@ impl PlatformSensors for SimulatorPlatformSensors {
         Ok(DualAudioStreamSession::new(rx, stop_tx))
     }
 
+    async fn start_dictation_capture(
+        &self,
+        out_wav_path: &str,
+    ) -> Result<DictationCaptureSession> {
+        let wav_owned = out_wav_path.to_string();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<DictationCaptureResult>();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let _ = stop_rx.await;
+            let dur_ms = started.elapsed().as_millis().max(600) as u64;
+            let _ = write_synthetic_voice_wav(&wav_owned, 145.0, 2);
+            let _ = done_tx.send(DictationCaptureResult {
+                wav_path: Some(wav_owned),
+                duration_ms: dur_ms,
+                simulated_text: Some(
+                    "Bitte fasse die wichtigsten Entscheidungen und offenen Action Items kompakt zusammen."
+                        .into(),
+                ),
+                error: None,
+            });
+        });
+
+        Ok(DictationCaptureSession::new(stop_tx, done_rx))
+    }
+
+    async fn paste_text_at_cursor(&self, _text: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> Result<bool> {
         let _ = write_synthetic_voice_wav(out_path, 138.0, duration_secs.min(2))?;
         Ok(true)

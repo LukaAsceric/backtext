@@ -12,11 +12,14 @@ import {
   Plus,
   Command,
   ShieldCheck,
+  Mic,
+  Square,
 } from 'lucide-react';
 import type {
   AiProviderSettings,
   CalendarFeedConfig,
   DaemonTelemetry,
+  DictationEntry,
   Language,
   PermissionStatus,
   ProviderTestResult,
@@ -34,6 +37,8 @@ interface SettingsViewProps {
   whisperModels: WhisperModelInfo[];
   ollamaModels: string[];
   calendarFeeds: CalendarFeedConfig[];
+  dictations: DictationEntry[];
+  voiceTypingActive: boolean;
   onSaveProfile: (profile: UserProfile) => Promise<void>;
   onSaveAiSettings: (settings: AiProviderSettings) => Promise<void>;
   onSetApiKey: (provider: string, apiKey: string) => Promise<void>;
@@ -42,6 +47,8 @@ interface SettingsViewProps {
   onFetchProviderModels: (provider: string) => Promise<string[]>;
   onDownloadWhisperModel: (modelId: string) => Promise<void>;
   onSetGlobalShortcut: (shortcut: string) => Promise<string>;
+  onSetVoiceTypingShortcut: (shortcut: string) => Promise<string>;
+  onToggleVoiceTyping: () => Promise<void>;
   onAddCalendarFeed: (name: string, icsUrl: string) => Promise<void>;
   onDeleteCalendarFeed: (id: string) => Promise<void>;
   onSyncCalendars: () => Promise<void>;
@@ -144,6 +151,12 @@ const SHORTCUT_PRESETS = [
   { value: 'Control+Space', label: '⌃ Space' },
 ] as const;
 
+const VOICE_TYPING_PRESETS = [
+  { value: 'Alt+Shift+D', label: '⌥⇧ D (Standard)' },
+  { value: 'CommandOrControl+Shift+D', label: '⌘⇧ D' },
+  { value: 'Alt+V', label: '⌥ V' },
+] as const;
+
 export const SettingsView: React.FC<SettingsViewProps> = ({
   lang,
   profile,
@@ -153,6 +166,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   whisperModels,
   ollamaModels,
   calendarFeeds,
+  dictations,
+  voiceTypingActive,
   onSaveProfile,
   onSaveAiSettings,
   onSetApiKey,
@@ -161,6 +176,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onFetchProviderModels,
   onDownloadWhisperModel,
   onSetGlobalShortcut,
+  onSetVoiceTypingShortcut,
+  onToggleVoiceTyping,
   onAddCalendarFeed,
   onDeleteCalendarFeed,
   onSyncCalendars,
@@ -182,6 +199,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [downloadingModelId, setDownloadingModelId] = useState<string | null>(null);
   const [shortcutDraft, setShortcutDraft] = useState(aiSettings.hover_shortcut || 'Alt+Space');
   const [shortcutFeedback, setShortcutFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [vtShortcutDraft, setVtShortcutDraft] = useState(
+    aiSettings.voice_typing_shortcut || 'Alt+Shift+D',
+  );
+  const [vtFeedback, setVtFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const [feedName, setFeedName] = useState('');
   const [feedUrl, setFeedUrl] = useState('');
@@ -194,6 +215,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   useEffect(() => {
     setAiForm(aiSettings);
     setShortcutDraft(aiSettings.hover_shortcut || 'Alt+Space');
+    setVtShortcutDraft(aiSettings.voice_typing_shortcut || 'Alt+Shift+D');
   }, [aiSettings]);
 
   const modelSuggestions = Array.from(
@@ -238,6 +260,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const handleApplyVtShortcut = async (nextSpec: string) => {
+    setVtShortcutDraft(nextSpec);
+    setVtFeedback(null);
+    try {
+      const display = await onSetVoiceTypingShortcut(nextSpec);
+      setVtFeedback({
+        ok: true,
+        msg: lang === 'de' ? `Aktiv: ${display}` : `Active: ${display}`,
+      });
+    } catch (err) {
+      setVtFeedback({
+        ok: false,
+        msg: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   return (
     <div className="page-container">
       <header className="page-header">
@@ -245,8 +284,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <h1 className="page-title">{lang === 'de' ? 'Einstellungen' : 'Settings'}</h1>
           <p className="page-subtitle">
             {lang === 'de'
-              ? 'KI-Router (OpenRouter, PrimaLabs, Claude, OpenAI, Gemini), API-Schlüssel-Tresor, lokale Modelle, Hover-Shortcut und macOS-System.'
-              : 'AI router (OpenRouter, PrimaLabs, Claude, OpenAI, Gemini), API key vault, local models, Hover shortcut, and macOS system.'}
+              ? 'KI-Router (OpenRouter, PrimaLabs, Claude, OpenAI, Gemini), API-Tresor, lokale Modelle, Voice Typing & macOS-System.'
+              : 'AI router (OpenRouter, PrimaLabs, Claude, OpenAI, Gemini), API key vault, local models, Voice Typing, and macOS system.'}
           </p>
         </div>
 
@@ -273,7 +312,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className={`tab-btn ${activeTab === 'shortcuts' ? 'active' : ''}`}
             onClick={() => setActiveTab('shortcuts')}
           >
-            {lang === 'de' ? 'Shortcut & Kalender' : 'Shortcut & Calendar'}
+            {lang === 'de' ? 'Shortcuts, Voice & Kalender' : 'Shortcuts, Voice & Calendar'}
           </button>
           <button
             type="button"
@@ -582,6 +621,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               );
             })}
+
+            <div
+              className="transcript-row"
+              style={{ marginTop: 4, gap: 8, background: 'var(--bg-surface-subtle)' }}
+            >
+              <div className="transcript-meta">
+                <strong style={{ fontSize: 12.8 }}>
+                  {lang === 'de'
+                    ? 'Live-STT Latenz (VAD-Pausen-Flush)'
+                    : 'Live STT Latency (VAD Pause Flush)'}
+                </strong>
+                <span className="pill pill-sage">
+                  {lang === 'de' ? 'Max.' : 'Max'} {aiForm.stt_max_chunk_secs || 4}s
+                </span>
+              </div>
+              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-secondary)' }}>
+                {lang === 'de'
+                  ? 'backtext flusht gesprochene Sätze automatisch nach 0,7 s Sprechpause (1,5–2 s Latenz) oder spätestens nach dem gewählten Maximal-Intervall und trennt Remote-Sprecher pro Satz per 256-dim Voiceprint.'
+                  : 'backtext flushes speech automatically after a 0.7s pause (~1.5–2s latency) or at most after the selected interval, separating remote speakers per utterance via 256-dim voiceprints.'}
+              </p>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {[3, 4, 6].map((sec) => (
+                  <button
+                    key={sec}
+                    type="button"
+                    id={`stt-chunk-btn-${sec}`}
+                    className={`mini-btn ${(aiForm.stt_max_chunk_secs || 4) === sec ? 'active-choice' : ''}`}
+                    onClick={() =>
+                      onSaveAiSettings({ ...aiForm, stt_max_chunk_secs: sec })
+                    }
+                  >
+                    {sec}s {sec === 4 ? (lang === 'de' ? '(Empfohlen)' : '(Recommended)') : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
           </section>
 
           <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -668,7 +743,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       )}
 
-      {/* TAB 3: Hover Shortcut, Meetings & Calendar */}
+      {/* TAB 3: Hover Shortcut, System-Wide Voice Typing & Calendar */}
       {activeTab === 'shortcuts' && (
         <div className="two-col-grid" style={{ alignItems: 'start' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -724,6 +799,116 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   }}
                 >
                   {shortcutFeedback.msg}
+                </div>
+              )}
+            </section>
+
+            {/* System-Wide Voice Typing Card (Feature 2.7) */}
+            <section className="surface-sheet" id="voice-typing-settings-card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <h2 className="section-heading">
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                  <Mic size={15} style={{ color: 'var(--accent-terracotta)' }} />
+                  {lang === 'de' ? 'Systemweites Voice Typing (Diktat)' : 'System-Wide Voice Typing'}
+                </span>
+                <span className="kbd">{telemetry.voice_typing_shortcut || '⌥⇧ D'}</span>
+              </h2>
+              <p style={{ margin: 0, fontSize: 12.5, color: 'var(--text-secondary)' }}>
+                {lang === 'de'
+                  ? 'Drücke den Shortcut in einer beliebigen macOS-App (Slack, Mail, Cursor, Browser), sprich und drücke erneut: backtext transkribiert mit deinem Fachwörterbuch und fügt den Text direkt am Cursor ein.'
+                  : 'Press the shortcut inside any macOS app to start/stop dictation: backtext transcribes using your custom dictionary and pastes directly at your cursor.'}
+              </p>
+
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {VOICE_TYPING_PRESETS.map((preset) => (
+                  <button
+                    key={preset.value}
+                    type="button"
+                    className={`mini-btn ${vtShortcutDraft === preset.value ? 'active-choice' : ''}`}
+                    onClick={() => handleApplyVtShortcut(preset.value)}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  id="voice-typing-shortcut-input"
+                  className="input-field"
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: 12.5 }}
+                  value={vtShortcutDraft}
+                  onChange={(e) => setVtShortcutDraft(e.target.value)}
+                  placeholder="z. B. Alt+Shift+D"
+                />
+                <button
+                  type="button"
+                  id="apply-vt-shortcut-btn"
+                  className="btn btn-primary"
+                  onClick={() => handleApplyVtShortcut(vtShortcutDraft)}
+                >
+                  Übernehmen
+                </button>
+              </div>
+
+              {vtFeedback && (
+                <div
+                  className="mono-ts"
+                  style={{
+                    color: vtFeedback.ok ? 'var(--accent-sage)' : 'var(--accent-terracotta)',
+                  }}
+                >
+                  {vtFeedback.msg}
+                </div>
+              )}
+
+              <label style={{ display: 'flex', gap: 9, alignItems: 'center', fontSize: 12.8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={aiForm.voice_typing_ai_polish !== false}
+                  onChange={(e) =>
+                    onSaveAiSettings({ ...aiForm, voice_typing_ai_polish: e.target.checked })
+                  }
+                />
+                {lang === 'de'
+                  ? 'KI-Feinschliff (Zeichensetzung, Füllwörter entfernen & Wörterbuch anwenden)'
+                  : 'AI polish (punctuation, filler removal & custom dictionary)'}
+              </label>
+
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button
+                  type="button"
+                  id="test-voice-typing-btn"
+                  className={voiceTypingActive ? 'btn btn-recording' : 'btn'}
+                  onClick={onToggleVoiceTyping}
+                >
+                  {voiceTypingActive ? <Square size={12} /> : <Mic size={13} />}
+                  {voiceTypingActive
+                    ? lang === 'de'
+                      ? 'Diktat stoppen & einfügen'
+                      : 'Stop & Paste Dictation'
+                    : lang === 'de'
+                      ? 'Voice Typing jetzt testen'
+                      : 'Test Voice Typing Now'}
+                </button>
+                <span className="mono-ts">{dictations.length} Diktate gespeichert</span>
+              </div>
+
+              {dictations.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 160, overflowY: 'auto' }}>
+                  {dictations.slice(0, 5).map((d) => (
+                    <div key={d.id} className="transcript-row" style={{ padding: '7px 10px' }}>
+                      <div className="transcript-meta">
+                        <span className="mono-ts">{d.target_app}</span>
+                        <span className="mono-ts">
+                          {new Date(d.created_at).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 12.5 }}>{d.cleaned_text}</div>
+                    </div>
+                  ))}
                 </div>
               )}
             </section>
@@ -904,7 +1089,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <Lock size={15} />
                 Sicherheit, Autostart & Updates
               </span>
-              <span className="pill pill-sage">v0.4.0</span>
+              <span className="pill pill-sage">v0.5.0</span>
             </h2>
 
             <div className="transcript-row">

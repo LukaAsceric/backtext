@@ -11,11 +11,12 @@ use backtext_context::{
 use backtext_core::*;
 use backtext_mcp::{McpClientConfigSnippets, McpServer};
 use backtext_meeting::{
-    extract_voiceprint_from_wav, ScreenShareDeduplicator, SpeakerAttributionSession,
+    extract_acoustic_voiceprint_256, extract_voiceprint_for_window, extract_voiceprint_from_wav,
+    read_wav_and_spans, ScreenShareDeduplicator, SpeakerAttributionSession,
 };
 use backtext_platform::{
-    default_platform_sensors, fetch_and_parse_ics_url, DualAudioStreamEvent, PermissionStatus,
-    PlatformSensors,
+    default_platform_sensors, fetch_and_parse_ics_url, DictationCaptureSession,
+    DualAudioStreamEvent, PermissionStatus, PlatformSensors,
 };
 use backtext_storage::secrets::{
     KEY_ANTHROPIC, KEY_DEEPGRAM, KEY_GEMINI, KEY_GROQ, KEY_OPENAI, KEY_OPENROUTER, KEY_PRIMALABS,
@@ -43,6 +44,9 @@ pub struct BootstrapPayload {
     pub telemetry: DaemonTelemetry,
     pub profile: UserProfile,
     pub meetings: Vec<Meeting>,
+    pub templates: Vec<MeetingTemplate>,
+    pub folders: Vec<MeetingFolder>,
+    pub dictations: Vec<DictationEntry>,
     pub episodes: Vec<ContextEpisode>,
     pub snapshots: Vec<ContextSnapshot>,
     pub clipboard: Vec<ClipboardItem>,
@@ -70,6 +74,7 @@ pub struct AppController {
     capture_status: Arc<Mutex<CaptureStatus>>,
     live_sessions: Arc<Mutex<HashMap<String, LiveMeetingRuntime>>>,
     active_recorders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    active_dictation: Arc<Mutex<Option<(String, String, DictationCaptureSession)>>>,
     telemetry: Arc<Mutex<DaemonTelemetry>>,
     pending_manual_stop: Arc<Mutex<bool>>,
 }
@@ -82,6 +87,9 @@ pub fn format_shortcut_display(shortcut: &str) -> String {
         "CommandOrControl+Shift+B" => "⌘⇧ B".to_string(),
         "CommandOrControl+Shift+K" => "⌘⇧ K".to_string(),
         "Control+Space" => "⌃ Space".to_string(),
+        "Alt+Shift+D" => "⌥⇧ D".to_string(),
+        "CommandOrControl+Shift+D" => "⌘⇧ D".to_string(),
+        "Alt+V" => "⌥ V".to_string(),
         other => other.to_string(),
     }
 }
@@ -104,10 +112,15 @@ impl AppController {
         let mcp = McpServer::new(storage.clone(), events.clone());
         let sensors = default_platform_sensors();
         let demo_present = storage.has_demo_data().unwrap_or(false);
-        let saved_shortcut = storage
-            .get_ai_settings()
-            .map(|s| s.hover_shortcut)
-            .unwrap_or_else(|_| "Alt+Space".into());
+        let saved_ai = storage.get_ai_settings().ok();
+        let saved_shortcut = saved_ai
+            .as_ref()
+            .map(|s| s.hover_shortcut.clone())
+            .unwrap_or_else(|| "Alt+Space".into());
+        let saved_vt_shortcut = saved_ai
+            .as_ref()
+            .map(|s| s.voice_typing_shortcut.clone())
+            .unwrap_or_else(|| "Alt+Shift+D".into());
 
         let initial_telemetry = DaemonTelemetry {
             loop_running: false,
@@ -123,6 +136,7 @@ impl AppController {
             keychain_backend: storage.secrets().backend_name().to_string(),
             autostart_enabled: false,
             global_shortcut: format_shortcut_display(&saved_shortcut),
+            voice_typing_shortcut: format_shortcut_display(&saved_vt_shortcut),
             demo_data_present: demo_present,
             whisper_cli_detected: detect_whisper_cli_path().is_some(),
         };
@@ -136,6 +150,7 @@ impl AppController {
             capture_status: Arc::new(Mutex::new(CaptureStatus::Active)),
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
             active_recorders: Arc::new(Mutex::new(HashMap::new())),
+            active_dictation: Arc::new(Mutex::new(None)),
             telemetry: Arc::new(Mutex::new(initial_telemetry)),
             pending_manual_stop: Arc::new(Mutex::new(false)),
         })
@@ -177,6 +192,9 @@ impl AppController {
             telemetry: self.get_telemetry(),
             profile: self.storage.get_user_profile()?,
             meetings: self.storage.list_meetings()?,
+            templates: self.storage.list_meeting_templates()?,
+            folders: self.storage.list_meeting_folders()?,
+            dictations: self.storage.list_dictation_history(25)?,
             episodes: self.storage.list_context_episodes(25)?,
             snapshots: self.storage.list_recent_snapshots(30)?,
             clipboard: self.storage.list_clipboard_items(20)?,
@@ -246,11 +264,13 @@ impl AppController {
             }
         } else {
             let new_id = format!("mtg_{}", uuid::Uuid::new_v4().simple());
+            let title_val = title
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "Live Produkt- & Agenten-Sync".to_string());
+            let series_key = compute_series_key(&title_val);
             Meeting {
                 id: new_id,
-                title: title
-                    .filter(|t| !t.trim().is_empty())
-                    .unwrap_or_else(|| "Live Produkt- & Agenten-Sync".to_string()),
+                title: title_val,
                 calendar_event_id: None,
                 detected_app: detected_app.unwrap_or_else(|| "Zoom (Auto-Erkennung ohne Bot)".into()),
                 project_tag: profile.active_projects.first().cloned(),
@@ -275,6 +295,8 @@ impl AppController {
                 }],
                 transcript_count: 0,
                 screenshare_count: 0,
+                folder_ids: vec![],
+                series_key,
             }
         };
 
@@ -364,7 +386,7 @@ impl AppController {
     }
 
     /// Spawns a persistent background dual-audio recording & live transcription task for `meeting_id`.
-    /// Streams real-time audio levels every 500ms and transcribes seamless 8s WAV chunks.
+    /// Streams real-time audio levels every 500ms and flushes WAV chunks with VAD pause detection.
     pub fn start_continuous_recorder_for_meeting(&self, meeting_id: &str) {
         self.stop_all_recorders();
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
@@ -381,10 +403,15 @@ impl AppController {
         rt.spawn(async move {
             let rec_dir = ctrl.meeting_recordings_dir(&mid);
             let _ = std::fs::create_dir_all(&rec_dir);
+            let chunk_secs = ctrl
+                .storage
+                .get_ai_settings()
+                .map(|s| s.stt_max_chunk_secs.clamp(3, 12) as u64)
+                .unwrap_or(4);
 
             let mut session = match ctrl
                 .sensors
-                .start_dual_audio_stream(&rec_dir.display().to_string(), 8)
+                .start_dual_audio_stream(&rec_dir.display().to_string(), chunk_secs)
                 .await
             {
                 Ok(s) => s,
@@ -561,12 +588,13 @@ impl AppController {
                 continue;
             };
             let wav_path = PathBuf::from(&wav_path_str);
-            let Ok((acoustic_vp, spans)) = extract_voiceprint_from_wav(&wav_path) else {
+            let Ok((sr, samples, spans)) = read_wav_and_spans(&wav_path) else {
                 continue;
             };
             if spans.is_empty() {
                 continue;
             }
+            let chunk_vp = extract_acoustic_voiceprint_256(&samples, sr);
             let utterances = transcribe_wav_file(
                 self.ai.http_client(),
                 &wav_path,
@@ -577,6 +605,9 @@ impl AppController {
             .await?;
 
             for utt in utterances {
+                let seg_vp = extract_voiceprint_for_window(&samples, sr, utt.start_ms, utt.end_ms)
+                    .unwrap_or_else(|| chunk_vp.clone());
+
                 let mut sessions = self.live_sessions.lock();
                 let rt = sessions
                     .entry(meeting_id.to_string())
@@ -603,7 +634,7 @@ impl AppController {
                     start_ms,
                     end_ms,
                     &utt.text,
-                    &acoustic_vp,
+                    &seg_vp,
                     hint,
                 )?;
                 drop(sessions);
@@ -649,6 +680,179 @@ impl AppController {
         self.storage
             .get_meeting_detail(meeting_id)?
             .ok_or_else(|| anyhow::anyhow!("Meeting not found"))
+    }
+
+    /// Starts continuous Voice Typing dictation (either system-wide paste or in-app chat mic).
+    pub async fn start_dictation(&self, mode: &str) -> Result<bool> {
+        let mode_clean = if mode == "chat" { "chat" } else { "system" }.to_string();
+        let target_app = if mode_clean == "chat" {
+            "backtext Chat".to_string()
+        } else {
+            self.sensors
+                .observe_active_window()
+                .await
+                .map(|w| w.app_name)
+                .unwrap_or_else(|_| "Aktive App".to_string())
+        };
+
+        let wav_path = std::env::temp_dir().join(format!(
+            "backtext_dictation_{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let session = self
+            .sensors
+            .start_dictation_capture(&wav_path.display().to_string())
+            .await?;
+
+        {
+            let mut guard = self.active_dictation.lock();
+            *guard = Some((mode_clean.clone(), target_app.clone(), session));
+        }
+
+        self.events.publish(BacktextEvent::VoiceTypingStateChanged {
+            active: true,
+            mode: mode_clean,
+            status: format!("Hört zu ({target_app})…"),
+            text: None,
+            target_app: Some(target_app),
+        });
+        Ok(true)
+    }
+
+    /// Stops active Voice Typing, transcribes + polishes with custom vocabulary,
+    /// pastes at cursor when in `system` mode, and stores a `DictationEntry`.
+    pub async fn stop_dictation(&self) -> Result<DictationEntry> {
+        let taken = { self.active_dictation.lock().take() };
+        let Some((mode, target_app, session)) = taken else {
+            anyhow::bail!("Keine aktive Diktat-Aufnahme gefunden.");
+        };
+
+        self.events.publish(BacktextEvent::VoiceTypingStateChanged {
+            active: false,
+            mode: mode.clone(),
+            status: "Transkribiert & bereinigt…".into(),
+            text: None,
+            target_app: Some(target_app.clone()),
+        });
+
+        let capture = session.stop_and_finish().await;
+        let profile = self.storage.get_user_profile()?;
+        let vocab = self.storage.list_vocabulary()?;
+        let ai_settings = self.storage.get_ai_settings()?;
+        let vocab_prompt = build_stt_vocabulary_prompt(&profile, &vocab, &[]);
+
+        let raw_text = if let Some(sim) = capture.simulated_text {
+            sim
+        } else if let Some(ref wav_path_str) = capture.wav_path {
+            let wav_path = PathBuf::from(wav_path_str);
+            let res = transcribe_wav_file(
+                self.ai.http_client(),
+                &wav_path,
+                &vocab_prompt,
+                &ai_settings,
+                self.storage.secrets(),
+            )
+            .await;
+            let _ = std::fs::remove_file(&wav_path);
+            match res {
+                Ok(utts) => utts
+                    .into_iter()
+                    .map(|u| u.text)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .to_string(),
+                Err(err) => {
+                    self.events.publish(BacktextEvent::VoiceTypingStateChanged {
+                        active: false,
+                        mode,
+                        status: format!("STT-Fehler: {err}"),
+                        text: None,
+                        target_app: Some(target_app),
+                    });
+                    anyhow::bail!("Voice Typing Transkription fehlgeschlagen: {err}");
+                }
+            }
+        } else {
+            let err_msg = capture
+                .error
+                .unwrap_or_else(|| "Keine Sprache im Mikrofon erkannt.".into());
+            self.events.publish(BacktextEvent::VoiceTypingStateChanged {
+                active: false,
+                mode,
+                status: err_msg.clone(),
+                text: None,
+                target_app: Some(target_app),
+            });
+            anyhow::bail!(err_msg);
+        };
+
+        let cleaned_text = if raw_text.trim().is_empty() {
+            String::new()
+        } else {
+            self.ai
+                .polish_dictation_text(&self.storage, &raw_text, &target_app)
+                .await
+                .unwrap_or_else(|_| raw_text.clone())
+        };
+
+        let pasted = if mode == "system" && !cleaned_text.is_empty() {
+            self.sensors
+                .paste_text_at_cursor(&cleaned_text)
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        let entry = DictationEntry {
+            id: format!("dict_{}", uuid::Uuid::new_v4().simple()),
+            raw_text,
+            cleaned_text: cleaned_text.clone(),
+            target_app: target_app.clone(),
+            duration_ms: capture.duration_ms,
+            pasted,
+            created_at: Utc::now(),
+        };
+        if !entry.cleaned_text.is_empty() {
+            self.storage.insert_dictation_entry(&entry)?;
+        }
+
+        let status_label = if cleaned_text.is_empty() {
+            "Keine Sprache erkannt".to_string()
+        } else if pasted {
+            format!("In {target_app} eingefügt")
+        } else {
+            "Transkribiert".to_string()
+        };
+
+        self.events.publish(BacktextEvent::VoiceTypingStateChanged {
+            active: false,
+            mode,
+            status: status_label,
+            text: Some(cleaned_text),
+            target_app: Some(target_app),
+        });
+
+        Ok(entry)
+    }
+
+    pub async fn toggle_voice_typing(&self, mode: &str) -> Result<Value> {
+        let is_active = self.active_dictation.lock().is_some();
+        if is_active {
+            let entry = self.stop_dictation().await?;
+            let dictations = self.storage.list_dictation_history(25)?;
+            Ok(serde_json::json!({
+                "active": false,
+                "entry": entry,
+                "dictations": dictations
+            }))
+        } else {
+            self.start_dictation(mode).await?;
+            Ok(serde_json::json!({
+                "active": true
+            }))
+        }
     }
 
     /// Feeds a realistic multi-modal simulation step (Mic Self, Voiceprint Recognition,
@@ -1126,6 +1330,213 @@ impl AppController {
                 self.storage.update_meeting_user_notes(id, notes)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
+            "update_meeting_enhanced_notes" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let md = args
+                    .get("enhancedMarkdown")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = self.storage.update_meeting_enhanced_markdown(id, md)?;
+                self.events.publish(BacktextEvent::MeetingNotesUpdated {
+                    meeting_id: id.to_string(),
+                    enhanced_markdown: md.to_string(),
+                });
+                Ok(serde_json::to_value(detail)?)
+            }
+            "set_meeting_template" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let template_id = args
+                    .get("templateId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("general");
+                let regenerate = args
+                    .get("regenerate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.storage.update_meeting_template_id(id, template_id)?;
+                if regenerate {
+                    let res = self.enhance_meeting(id).await?;
+                    self.events.publish(BacktextEvent::MeetingNotesUpdated {
+                        meeting_id: id.to_string(),
+                        enhanced_markdown: res.enhanced_markdown,
+                    });
+                }
+                let detail = self.storage.get_meeting_detail(id)?;
+                Ok(serde_json::json!({
+                    "detail": detail,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
+            "rewrite_meeting_notes" => {
+                let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let instruction = args
+                    .get("instruction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Strukturiere die Notizen prägnanter.");
+                let _ = self
+                    .ai
+                    .rewrite_meeting_notes(&self.storage, Some(&self.events), id, instruction)
+                    .await?;
+                Ok(serde_json::to_value(self.storage.get_meeting_detail(id)?)?)
+            }
+            "save_meeting_template" => {
+                let tpl_val = args.get("template").cloned().unwrap_or_default();
+                let id = tpl_val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("tpl_{}", uuid::Uuid::new_v4().simple()));
+                let name_de = tpl_val
+                    .get("name_de")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if name_de.is_empty() {
+                    anyhow::bail!("Template-Name darf nicht leer sein.");
+                }
+                let name_en = tpl_val
+                    .get("name_en")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&name_de)
+                    .to_string();
+                let description_de = tpl_val
+                    .get("description_de")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let description_en = tpl_val
+                    .get("description_en")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&description_de)
+                    .to_string();
+                let icon_key = tpl_val
+                    .get("icon_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("sparkles")
+                    .to_string();
+                let sections_prompt = tpl_val
+                    .get("sections_prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("### Zusammenfassung\n### Entscheidungen\n### Action Items")
+                    .trim()
+                    .to_string();
+                let existing = self.storage.get_meeting_template(&id)?;
+                let tpl = MeetingTemplate {
+                    id,
+                    name_de,
+                    name_en,
+                    description_de,
+                    description_en,
+                    icon_key,
+                    sections_prompt,
+                    is_builtin: existing.as_ref().map(|t| t.is_builtin).unwrap_or(false),
+                    created_at: existing.map(|t| t.created_at).unwrap_or_else(Utc::now),
+                };
+                self.storage.upsert_meeting_template(&tpl)?;
+                Ok(serde_json::to_value(self.storage.list_meeting_templates()?)?)
+            }
+            "delete_meeting_template" => {
+                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.delete_meeting_template(id)?;
+                Ok(serde_json::to_value(self.storage.list_meeting_templates()?)?)
+            }
+            "save_meeting_folder" => {
+                let fld_val = args.get("folder").cloned().unwrap_or_default();
+                let id = fld_val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("fld_{}", uuid::Uuid::new_v4().simple()));
+                let name = fld_val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    anyhow::bail!("Ordnername darf nicht leer sein.");
+                }
+                let color = fld_val
+                    .get("color")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#B85838")
+                    .to_string();
+                let description = fld_val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let existing = self
+                    .storage
+                    .list_meeting_folders()?
+                    .into_iter()
+                    .find(|f| f.id == id);
+                let auto_series_keys = fld_val
+                    .get("auto_series_keys")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    .or_else(|| existing.as_ref().map(|f| f.auto_series_keys.clone()))
+                    .unwrap_or_default();
+                let folder = MeetingFolder {
+                    id,
+                    name,
+                    color,
+                    description,
+                    auto_series_keys,
+                    created_at: existing.map(|f| f.created_at).unwrap_or_else(Utc::now),
+                    meeting_count: 0,
+                };
+                self.storage.upsert_meeting_folder(&folder)?;
+                Ok(serde_json::to_value(self.storage.list_meeting_folders()?)?)
+            }
+            "delete_meeting_folder" => {
+                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.delete_meeting_folder(id)?;
+                Ok(serde_json::json!({
+                    "folders": self.storage.list_meeting_folders()?,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
+            "set_meeting_folders" => {
+                let mid = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
+                let folder_ids: Vec<String> = args
+                    .get("folderIds")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                self.storage.set_meeting_folders(mid, &folder_ids)?;
+                Ok(serde_json::json!({
+                    "detail": self.storage.get_meeting_detail(mid)?,
+                    "folders": self.storage.list_meeting_folders()?,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
+            "add_meetings_to_folder" => {
+                let meeting_ids: Vec<String> = args
+                    .get("meetingIds")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let folder_id = args.get("folderId").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.add_meetings_to_folder(&meeting_ids, folder_id)?;
+                Ok(serde_json::json!({
+                    "folders": self.storage.list_meeting_folders()?,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
+            "add_series_auto_folder" => {
+                let folder_id = args.get("folderId").and_then(|v| v.as_str()).unwrap_or("");
+                let series_key = args.get("seriesKey").and_then(|v| v.as_str()).unwrap_or("");
+                let folders = self.storage.add_series_auto_folder(folder_id, series_key)?;
+                Ok(serde_json::json!({
+                    "folders": folders,
+                    "meetings": self.storage.list_meetings()?
+                }))
+            }
             "update_meeting_title" => {
                 let id = args.get("meetingId").and_then(|v| v.as_str()).unwrap_or("");
                 let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -1262,11 +1673,25 @@ impl AppController {
                 let mid = args.get("meetingId").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
                 let slug = args.get("recipeSlug").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                let scope: Option<ChatScope> = args
+                    .get("scope")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
                 let reply = self
                     .ai
-                    .run_chat_or_recipe_streaming(&self.storage, Some(&self.events), mid, input, slug)
+                    .run_chat_or_recipe_scoped_streaming(
+                        &self.storage,
+                        Some(&self.events),
+                        mid,
+                        input,
+                        slug,
+                        scope,
+                    )
                     .await?;
                 Ok(serde_json::to_value(reply)?)
+            }
+            "toggle_voice_typing" => {
+                let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("system");
+                self.toggle_voice_typing(mode).await
             }
             "get_chat_messages" => {
                 let thread_id = args
@@ -1399,6 +1824,22 @@ impl AppController {
                 self.storage.save_ai_settings(&settings)?;
                 let display = format_shortcut_display(&shortcut);
                 let tel = self.update_telemetry(|t| t.global_shortcut = display.clone());
+                self.events
+                    .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
+                Ok(serde_json::json!({ "shortcut": shortcut, "display": display }))
+            }
+            "set_voice_typing_shortcut" => {
+                let shortcut = args
+                    .get("shortcut")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Alt+Shift+D")
+                    .trim()
+                    .to_string();
+                let mut settings = self.storage.get_ai_settings()?;
+                settings.voice_typing_shortcut = shortcut.clone();
+                self.storage.save_ai_settings(&settings)?;
+                let display = format_shortcut_display(&shortcut);
+                let tel = self.update_telemetry(|t| t.voice_typing_shortcut = display.clone());
                 self.events
                     .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
                 Ok(serde_json::json!({ "shortcut": shortcut, "display": display }))

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Mic,
   Search,
@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type {
   ChatMessage,
+  ChatScope,
   ContextEpisode,
   DaemonTelemetry,
   Language,
@@ -33,6 +34,8 @@ interface TodayViewProps {
   episodes: ContextEpisode[];
   recipes: Recipe[];
   globalMessages: ChatMessage[];
+  chatScope?: { scope: ChatScope; label: string } | null;
+  onClearChatScope?: () => void;
   streamingText?: string | null;
   chatBusy: boolean;
   onStartAdhocMeeting: () => Promise<void>;
@@ -54,6 +57,8 @@ export const TodayView: React.FC<TodayViewProps> = ({
   episodes,
   recipes,
   globalMessages,
+  chatScope,
+  onClearChatScope,
   streamingText,
   chatBusy,
   onStartAdhocMeeting,
@@ -71,6 +76,13 @@ export const TodayView: React.FC<TodayViewProps> = ({
   const [searching, setSearching] = useState(false);
   const [syncingCal, setSyncingCal] = useState(false);
   const [checkingPerms, setCheckingPerms] = useState(false);
+  const chatSectionRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (chatScope && chatSectionRef.current) {
+      chatSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [chatScope]);
 
   const missingPermissions =
     !permissions.screen_capture_granted ||
@@ -427,13 +439,20 @@ export const TodayView: React.FC<TodayViewProps> = ({
         </section>
       </div>
 
-      {/* Workspace-wide Chat & Multi-Meeting / Ambient Recipes */}
-      <section className="surface-sheet">
+      {/* Workspace-wide Chat & Multi-Meeting / Folder / Person Scoped Chat */}
+      <section ref={chatSectionRef} className="surface-sheet">
         <RecipeChatBar
           lang={lang}
           scopeFilter="all"
+          scopeChip={
+            chatScope && onClearChatScope
+              ? { label: chatScope.label, onClear: onClearChatScope }
+              : null
+          }
+          autoFocus={Boolean(chatScope)}
           recipes={recipes}
           messages={globalMessages}
+          onOpenMeeting={onOpenMeeting}
           streamingText={streamingText}
           busy={chatBusy}
           onExecute={onRunGlobalChat}

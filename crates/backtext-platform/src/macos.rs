@@ -784,6 +784,104 @@ JSON.stringify({ bundleId, appName, pid, winTitle: appName });
         Ok(DualAudioStreamSession::new(rx, stop_tx))
     }
 
+    async fn start_dictation_capture(
+        &self,
+        out_wav_path: &str,
+    ) -> Result<DictationCaptureSession> {
+        let Some(bin) = self.sensor_bin.clone() else {
+            anyhow::bail!("backtext-macos-sensor binary not found inside app bundle");
+        };
+        let wav_owned = out_wav_path.to_string();
+        let mut child = Command::new(bin)
+            .args(["record-dictation", &wav_owned])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let mut child_stdin = child.stdin.take();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to open dictation stdout"))?;
+
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<DictationCaptureResult>();
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let started = std::time::Instant::now();
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        if let Some(mut stdin) = child_stdin.take() {
+                            let _ = stdin.write_all(b"stop\n").await;
+                            let _ = stdin.shutdown().await;
+                        }
+                        break;
+                    }
+                    line_res = lines.next_line() => {
+                        if matches!(line_res, Ok(None) | Err(_)) {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut final_res = DictationCaptureResult {
+                wav_path: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                simulated_text: None,
+                error: None,
+            };
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(3200), async {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                        if v["type"].as_str() == Some("done") {
+                            let ok = v["ok"].as_bool().unwrap_or(false);
+                            final_res.wav_path = if ok {
+                                v["wav_path"].as_str().map(|s| s.to_string())
+                            } else {
+                                None
+                            };
+                            final_res.duration_ms = v["duration_ms"]
+                                .as_u64()
+                                .unwrap_or(final_res.duration_ms);
+                            final_res.error = v["error"].as_str().map(|s| s.to_string());
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            let _ = child.kill().await;
+            let _ = done_tx.send(final_res);
+        });
+
+        Ok(DictationCaptureSession::new(stop_tx, done_rx))
+    }
+
+    async fn paste_text_at_cursor(&self, text: &str) -> Result<bool> {
+        let Some(bin) = self.sensor_bin.clone() else {
+            return Ok(false);
+        };
+        let mut child = Command::new(bin)
+            .args(["paste-text"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+        let out = child.wait_with_output().await?;
+        if !out.status.success() {
+            return Ok(false);
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        Ok(parsed["ok"].as_bool().unwrap_or(false))
+    }
+
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> Result<bool> {
         let dur_str = duration_secs.to_string();
         if let Some(v) = self

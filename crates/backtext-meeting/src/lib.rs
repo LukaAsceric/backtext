@@ -1,8 +1,8 @@
 pub mod audio_dsp;
 
 pub use audio_dsp::{
-    detect_speech_spans, extract_acoustic_voiceprint_256, extract_voiceprint_from_wav,
-    read_wav_pcm16, SpeechSpan,
+    detect_speech_spans, extract_acoustic_voiceprint_256, extract_voiceprint_for_window,
+    extract_voiceprint_from_wav, read_wav_and_spans, read_wav_pcm16, SpeechSpan,
 };
 
 use anyhow::Result;

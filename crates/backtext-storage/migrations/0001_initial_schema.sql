@@ -233,3 +233,45 @@ CREATE TABLE IF NOT EXISTS memory_vectors (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_vectors_ts ON memory_vectors(timestamp DESC);
+
+-- v0.5.0 Granola Parity Tables (Templates, Folders, Auto-Series & Voice Typing History)
+CREATE TABLE IF NOT EXISTS meeting_templates (
+    id TEXT PRIMARY KEY,
+    name_de TEXT NOT NULL,
+    name_en TEXT NOT NULL,
+    description_de TEXT NOT NULL DEFAULT '',
+    description_en TEXT NOT NULL DEFAULT '',
+    icon_key TEXT NOT NULL DEFAULT 'file-text',
+    sections_prompt TEXT NOT NULL,
+    is_builtin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meeting_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT 'sage',
+    description TEXT NOT NULL DEFAULT '',
+    auto_series_keys_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meeting_folder_links (
+    meeting_id TEXT NOT NULL,
+    folder_id TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, folder_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_folder_links_folder ON meeting_folder_links(folder_id);
+
+CREATE TABLE IF NOT EXISTS dictation_history (
+    id TEXT PRIMARY KEY,
+    raw_text TEXT NOT NULL,
+    cleaned_text TEXT NOT NULL,
+    target_app TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    pasted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dictation_created ON dictation_history(created_at DESC);

@@ -8,8 +8,14 @@ import {
   Copy,
   Check,
   Slash,
+  Mic,
+  Square,
+  FilePlus2,
+  X,
+  FolderOpen,
 } from 'lucide-react';
-import type { ChatMessage, Language, Recipe, TranscriptSegment } from '../types';
+import type { ChatMessage, DictationEntry, Language, Recipe, TranscriptSegment } from '../types';
+import { callRpc } from '../lib/ipc';
 import { t } from '../lib/i18n';
 import { FormattedMarkdown } from './FormattedMarkdown';
 
@@ -17,6 +23,7 @@ interface RecipeChatBarProps {
   lang: Language;
   meetingId?: string | null;
   scopeFilter?: 'single_meeting' | 'all';
+  scopeChip?: { label: string; onClear: () => void } | null;
   compact?: boolean;
   autoFocus?: boolean;
   focusSignal?: number;
@@ -24,6 +31,8 @@ interface RecipeChatBarProps {
   messages: ChatMessage[];
   transcript?: TranscriptSegment[];
   onJumpToTranscript?: (segmentId: string) => void;
+  onOpenMeeting?: (meetingId: string) => void;
+  onApplyToNotes?: (markdown: string) => Promise<void>;
   streamingText?: string | null;
   busy: boolean;
   onExecute: (input: string, recipeSlug?: string) => Promise<void>;
@@ -33,6 +42,7 @@ interface RecipeChatBarProps {
 export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
   lang,
   scopeFilter = 'all',
+  scopeChip = null,
   compact = false,
   autoFocus = false,
   focusSignal = 0,
@@ -40,6 +50,8 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
   messages,
   transcript,
   onJumpToTranscript,
+  onOpenMeeting,
+  onApplyToNotes,
   streamingText,
   busy,
   onExecute,
@@ -50,6 +62,9 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [appliedId, setAppliedId] = useState<string | null>(null);
+  const [dictating, setDictating] = useState(false);
+  const [dictationBusy, setDictationBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -152,6 +167,35 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
     }
   };
 
+  const handleApplyMessageToNotes = async (msg: ChatMessage) => {
+    if (!onApplyToNotes) return;
+    await onApplyToNotes(msg.content);
+    setAppliedId(msg.id);
+    window.setTimeout(() => setAppliedId((prev) => (prev === msg.id ? null : prev)), 1800);
+  };
+
+  const handleToggleChatMic = async () => {
+    if (dictationBusy) return;
+    setDictationBusy(true);
+    try {
+      const res = await callRpc<{ active: boolean; entry?: DictationEntry }>('toggle_voice_typing', {
+        mode: 'chat',
+      });
+      setDictating(res.active);
+      if (!res.active && res.entry?.cleaned_text) {
+        setInput((prev) => {
+          const base = prev.trim();
+          return base ? `${base} ${res.entry!.cleaned_text}` : res.entry!.cleaned_text;
+        });
+        window.requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    } catch {
+      setDictating(false);
+    } finally {
+      setDictationBusy(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (isSlashMenuVisible) {
       if (e.key === 'ArrowDown') {
@@ -210,6 +254,25 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
         </div>
       )}
 
+      {scopeChip && (
+        <div className="chat-scope-banner" id="active-chat-scope-chip">
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <FolderOpen size={13} style={{ color: 'var(--accent-sage)' }} />
+            <strong>{lang === 'de' ? 'Kontext-Fokus:' : 'Chat Scope:'}</strong>
+            <span>{scopeChip.label}</span>
+          </span>
+          <button
+            type="button"
+            className="mini-btn"
+            onClick={scopeChip.onClear}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+          >
+            <X size={11} />
+            {lang === 'de' ? 'Aufheben' : 'Clear'}
+          </button>
+        </div>
+      )}
+
       {showMessages && (
         <div ref={scrollRef} className={`chat-thread-scroll ${compact ? 'compact' : ''}`}>
           {messages.map((msg) => {
@@ -240,6 +303,29 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
                         minute: '2-digit',
                       })}
                     </span>
+                    {!isUser && onApplyToNotes && (
+                      <button
+                        type="button"
+                        className="chat-apply-btn"
+                        onClick={() => handleApplyMessageToNotes(msg)}
+                        title={
+                          lang === 'de'
+                            ? 'Antwort direkt in KI-Notizen übernehmen'
+                            : 'Apply answer to AI Notes'
+                        }
+                      >
+                        {appliedId === msg.id ? <Check size={11} /> : <FilePlus2 size={11} />}
+                        <span>
+                          {appliedId === msg.id
+                            ? lang === 'de'
+                              ? 'Übernommen'
+                              : 'Applied'
+                            : lang === 'de'
+                              ? 'In KI-Notizen'
+                              : 'Apply to Notes'}
+                        </span>
+                      </button>
+                    )}
                     {!isUser && (
                       <button
                         type="button"
@@ -259,16 +345,31 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
                 />
                 {msg.sources && msg.sources.length > 0 && (
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
-                    {msg.sources.map((src, idx) => (
-                      <span
-                        key={`${src.ref_id}-${idx}`}
-                        className="pill pill-neutral"
-                        title={src.snippet}
-                      >
-                        <BookOpen size={11} />
-                        {src.kind}: {src.label.slice(0, 42)}
-                      </span>
-                    ))}
+                    {msg.sources.map((src, idx) => {
+                      const canOpenMeeting = src.kind === 'meeting' && Boolean(onOpenMeeting);
+                      return canOpenMeeting ? (
+                        <button
+                          key={`${src.ref_id}-${idx}`}
+                          type="button"
+                          className="pill pill-sage"
+                          style={{ cursor: 'pointer', border: '1px solid rgba(47, 107, 83, 0.24)' }}
+                          title={src.snippet}
+                          onClick={() => onOpenMeeting?.(src.ref_id)}
+                        >
+                          <BookOpen size={11} />
+                          {src.label.slice(0, 42)} ↗
+                        </button>
+                      ) : (
+                        <span
+                          key={`${src.ref_id}-${idx}`}
+                          className="pill pill-neutral"
+                          title={src.snippet}
+                        >
+                          <BookOpen size={11} />
+                          {src.kind}: {src.label.slice(0, 42)}
+                        </span>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -323,7 +424,7 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
         )}
       </div>
 
-      {/* Elevated Pill Chat Composer with Slash Menu & Tab Autocomplete */}
+      {/* Elevated Pill Chat Composer with Slash Menu, Tab Autocomplete & Voice Dictation Mic */}
       <form className="chat-input-wrap" onSubmit={handleSubmit}>
         {isSlashMenuVisible && (
           <div className="slash-menu" role="listbox" aria-label="Recipes">
@@ -403,11 +504,42 @@ export const RecipeChatBar: React.FC<RecipeChatBarProps> = ({
             }}
             onKeyDown={handleKeyDown}
             placeholder={
-              compact ? t(lang, 'meetingChatPlaceholder') : t(lang, 'chatPlaceholder')
+              dictating
+                ? lang === 'de'
+                  ? 'Diktat läuft — erneut auf Mikrofon klicken zum Einfügen…'
+                  : 'Listening — click mic again to insert…'
+                : scopeChip
+                  ? lang === 'de'
+                    ? `Frage über „${scopeChip.label}“ stellen…`
+                    : `Ask across "${scopeChip.label}"…`
+                  : compact
+                    ? lang === 'de'
+                      ? 'Frage zum Meeting, /rewrite zum Umschreiben oder / Recipe…'
+                      : 'Ask about this meeting, /rewrite to edit notes, or / Recipe…'
+                    : t(lang, 'chatPlaceholder')
             }
             disabled={busy}
             autoComplete="off"
           />
+
+          <button
+            type="button"
+            id="chat-voice-mic-btn"
+            className={`composer-mic-btn ${dictating ? 'active' : ''}`}
+            disabled={busy || dictationBusy}
+            onClick={handleToggleChatMic}
+            title={
+              dictating
+                ? lang === 'de'
+                  ? 'Diktat beenden & Text einfügen'
+                  : 'Stop dictation & insert text'
+                : lang === 'de'
+                  ? 'Per Sprache diktieren (Voice Typing)'
+                  : 'Dictate prompt with Voice Typing'
+            }
+          >
+            {dictating ? <Square size={12} /> : <Mic size={14} />}
+          </button>
 
           <button
             type="submit"

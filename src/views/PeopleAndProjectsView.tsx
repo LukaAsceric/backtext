@@ -8,6 +8,7 @@ import {
   Pencil,
   Trash2,
   X,
+  MessageSquare,
 } from 'lucide-react';
 import type { ContextEpisode, Language, Meeting, Person } from '../types';
 
@@ -27,6 +28,7 @@ interface PeopleAndProjectsViewProps {
   episodes: ContextEpisode[];
   onUpsertPerson: (input: PersonUpsertInput) => Promise<void>;
   onDeletePerson: (personId: string) => Promise<void>;
+  onChatWithPerson: (person: Person) => void;
 }
 
 export const PeopleAndProjectsView: React.FC<PeopleAndProjectsViewProps> = ({
@@ -37,6 +39,7 @@ export const PeopleAndProjectsView: React.FC<PeopleAndProjectsViewProps> = ({
   episodes,
   onUpsertPerson,
   onDeletePerson,
+  onChatWithPerson,
 }) => {
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | undefined>(undefined);
@@ -227,6 +230,21 @@ export const PeopleAndProjectsView: React.FC<PeopleAndProjectsViewProps> = ({
                       <AudioWaveform size={12} />
                       {Math.round(p.voiceprint_confidence * 100)}% ({p.voiceprint_samples})
                     </span>
+                    <button
+                      type="button"
+                      id={`chat-person-btn-${p.id}`}
+                      className="mini-btn"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                      title={
+                        lang === 'de'
+                          ? `Über alle Meetings mit ${p.full_name} chatten`
+                          : `Chat across all meetings with ${p.full_name}`
+                      }
+                      onClick={() => onChatWithPerson(p)}
+                    >
+                      <MessageSquare size={11} />
+                      Chat
+                    </button>
                     <button
                       type="button"
                       className="mini-btn"

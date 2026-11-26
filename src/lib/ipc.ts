@@ -72,6 +72,16 @@ export async function setNativeGlobalShortcut(shortcut: string): Promise<string>
   return res.display;
 }
 
+export async function setNativeVoiceTypingShortcut(shortcut: string): Promise<string> {
+  if (isTauriRuntime()) {
+    return await invoke<string>('set_voice_typing_shortcut', { shortcut });
+  }
+  const res = await callRpc<{ shortcut: string; display: string }>('set_voice_typing_shortcut', {
+    shortcut,
+  });
+  return res.display;
+}
+
 /**
  * Subscribes to real-time backend events (`ChatStreamDelta`, `DaemonTelemetryUpdated`,
  * `ModelDownloadProgress`, `CalendarSynced`) over Tauri native events or HTTP SSE (`/api/events`).

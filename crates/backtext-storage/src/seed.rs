@@ -1,10 +1,119 @@
 use backtext_core::{
-    embed_text_local_256, ActionItem, AudioChannel, ClipboardItem, ContextEpisode, ContextSnapshot,
-    ExtractionMethod, IdentificationSource, LearnedPreference, Meeting, MeetingParticipant,
-    MeetingStatus, Person, PrivacyRule, Recipe, RecipeScope, ScreenShareFrame, TranscriptSegment,
-    VocabularyEntry,
+    compute_series_key, embed_text_local_256, ActionItem, AudioChannel, ClipboardItem,
+    ContextEpisode, ContextSnapshot, ExtractionMethod, IdentificationSource, LearnedPreference,
+    Meeting, MeetingFolder, MeetingParticipant, MeetingStatus, MeetingTemplate, Person,
+    PrivacyRule, Recipe, RecipeScope, ScreenShareFrame, TranscriptSegment, VocabularyEntry,
 };
 use chrono::{Duration, Utc};
+
+pub fn builtin_meeting_templates() -> Vec<MeetingTemplate> {
+    let now = Utc::now();
+    vec![
+        MeetingTemplate {
+            id: "general".into(),
+            name_de: "Allgemeines Meeting".into(),
+            name_en: "General Meeting".into(),
+            description_de: "Ausgewogene Struktur aus Kernergebnissen, Entscheidungen, Diskussion und offenen Punkten.".into(),
+            description_en: "Balanced structure of key outcomes, decisions, discussion highlights, and open items.".into(),
+            icon_key: "file-text".into(),
+            sections_prompt: "Gliedere die Notizen klar in:\n### Kernergebnisse & Entscheidungen\n### Besprochene Themen\n### Offene Fragen & Risiken\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "architecture".into(),
+            name_de: "Architektur & Tech-Review".into(),
+            name_en: "Architecture & Tech Review".into(),
+            description_de: "Fokus auf System-Entscheidungen, Trade-offs, Latenzen, Security und offene Tech-Risiken.".into(),
+            description_en: "Focus on system decisions, trade-offs, latency/perf metrics, security, and technical risks.".into(),
+            icon_key: "cpu".into(),
+            sections_prompt: "Gliedere technisch präzise in:\n### Problemstellung & Kontext\n### Architektur-Entscheidungen & Trade-offs\n### Performance, Security & Datenschutz\n### Offene technische Fragen\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "one_on_one".into(),
+            name_de: "1:1 Gespräch".into(),
+            name_en: "1:1 Check-in".into(),
+            description_de: "Strukturiert 1:1s nach Fokus, Stimmung, Blockern, Feedback und beidseitigen Zusagen.".into(),
+            description_en: "Structures 1:1s by focus, morale, blockers, feedback, and mutual commitments.".into(),
+            icon_key: "users".into(),
+            sections_prompt: "Gliedere empathisch und klar in:\n### Aktueller Fokus & Stimmung\n### Fortschritte & Highlights\n### Blocker & benötigte Unterstützung\n### Feedback & Entwicklung\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "discovery".into(),
+            name_de: "Discovery / Kunden-Call".into(),
+            name_en: "Discovery / Customer Call".into(),
+            description_de: "Extrahiert Kundenkontext, Pain Points, Anforderungen, Einwände, Budget & nächste Schritte.".into(),
+            description_en: "Extracts customer context, pain points, requirements, objections, timeline, and next steps.".into(),
+            icon_key: "compass".into(),
+            sections_prompt: "Gliedere vertriebs- und produktorientiert in:\n### Kundenkontext & Ausgangslage\n### Zentrale Pain Points & Ziele\n### Anforderungen, Budget & Zeitplan\n### Einwände & offene Fragen\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "user_interview".into(),
+            name_de: "Nutzer-Interview / Research".into(),
+            name_en: "User Interview / Research".into(),
+            description_de: "Bündelt Workflows, wörtliche Zitate, Reibungspunkte und konkrete Produkt-Chancen.".into(),
+            description_en: "Captures workflows, verbatim quotes, friction points, and product opportunities.".into(),
+            icon_key: "sparkles".into(),
+            sections_prompt: "Gliedere research-orientiert in:\n### Nutzerprofil & aktueller Workflow\n### Zentrale Erkenntnisse & Originalzitate\n### Reibungspunkte & Workarounds\n### Produkt- & Feature-Chancen\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "standup".into(),
+            name_de: "Standup / Weekly Sync".into(),
+            name_en: "Standup / Weekly Sync".into(),
+            description_de: "Kompakter Wochen-/Tages-Abgleich: Erledigt, Nächster Fokus, Blocker & Meilensteine.".into(),
+            description_en: "Compact status sync: completed work, next focus, blockers, and milestones.".into(),
+            icon_key: "calendar".into(),
+            sections_prompt: "Gliedere ultrakompakt in:\n### Erreicht seit letztem Sync\n### Fokus bis zum nächsten Sync\n### Blocker & Abhängigkeiten\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+        MeetingTemplate {
+            id: "hiring".into(),
+            name_de: "Hiring / Bewerbungs-Interview".into(),
+            name_en: "Hiring / Candidate Interview".into(),
+            description_de: "Bewertet Stärken, Tiefgang-Signale, Kultur-Fit, offene Fragen und Empfehlung.".into(),
+            description_en: "Evaluates strengths, depth signals, culture fit, open concerns, and hiring recommendation.".into(),
+            icon_key: "user-check".into(),
+            sections_prompt: "Gliedere objektiv und faktenbasiert in:\n### Hintergrund & Kernstärken\n### Fachlicher Tiefgang & Beispiele\n### Offene Fragen & mögliche Risiken\n### Gesamteinschätzung & nächste Schritte\n### Action Items".into(),
+            is_builtin: true,
+            created_at: now,
+        },
+    ]
+}
+
+pub fn builtin_meeting_folders() -> Vec<MeetingFolder> {
+    let now = Utc::now();
+    vec![
+        MeetingFolder {
+            id: "fld_product".into(),
+            name: "Produkt & Architektur".into(),
+            color: "sage".into(),
+            description: "Technische Syncs, Architektur-Entscheidungen und Design-Reviews.".into(),
+            auto_series_keys: vec![
+                "architektur sync kontexterfassung screencapturekit mcp latenz".into(),
+            ],
+            meeting_count: 0,
+            created_at: now,
+        },
+        MeetingFolder {
+            id: "fld_customers".into(),
+            name: "Kunden & Partner".into(),
+            color: "ochre".into(),
+            description: "Discovery-Calls, Pilot-Feedback und Partner-Check-ins.".into(),
+            auto_series_keys: vec![],
+            meeting_count: 0,
+            created_at: now,
+        },
+    ]
+}
 
 pub fn builtin_privacy_rules() -> Vec<PrivacyRule> {
     vec![
@@ -491,6 +600,10 @@ pub fn initial_demo_dataset() -> SeedDataset {
         ],
         transcript_count: 6,
         screenshare_count: 2,
+        folder_ids: vec!["fld_product".into()],
+        series_key: compute_series_key(
+            "Architektur-Sync: Kontexterfassung, ScreenCaptureKit & MCP-Latenz",
+        ),
     };
 
     let m1_transcript = vec![
@@ -650,6 +763,81 @@ pub fn initial_demo_dataset() -> SeedDataset {
         ],
         transcript_count: 0,
         screenshare_count: 0,
+        folder_ids: vec!["fld_customers".into()],
+        series_key: compute_series_key("MCP Workflow Check-in mit Clara Novak (Velox Labs)"),
+    };
+
+    // Previous instance of the recurring Architecture Sync series (7 days ago)
+    let m0_id = "mtg_arch_sync_prev".to_string();
+    let m0_start = now - Duration::days(7);
+    let m0 = Meeting {
+        id: m0_id,
+        title: "Architektur-Sync: Kontexterfassung, ScreenCaptureKit & MCP-Latenz (KW47)".into(),
+        calendar_event_id: Some("cal_evt_8990".into()),
+        detected_app: "Google Meet (Arc Browser)".into(),
+        project_tag: Some("backtext".into()),
+        started_at: m0_start,
+        ended_at: Some(m0_start + Duration::minutes(35)),
+        status: MeetingStatus::Completed,
+        template_id: "architecture".into(),
+        prep_brief: None,
+        raw_user_notes: "- Dual-Channel Audio ohne Bot evaluieren\n- SQLCipher Verschlüsselung für macOS Keychain prüfen".into(),
+        executive_summary: "Vorentscheidung für lokales SQLCipher + ScreenCaptureKit ohne Meeting-Bot. Markus übernahm den Prototyp für CoreAudio + ScreenCaptureKit Dual-Channel; Anna startete die Entwürfe für den 1-Klick-Pause-Modus.".into(),
+        enhanced_markdown: "### Problemstellung & Kontext\n- Ziel war eine maximale Datenschutz-Architektur ohne Cloud-Audio-Speicherung und ohne sichtbaren Meeting-Bot.\n\n### Architektur-Entscheidungen & Trade-offs\n- **SQLCipher AES-256** mit Schlüssel im macOS Schlüsselbund statt Klartext-SQLite.\n- **ScreenCaptureKit** liefert System-Audio sauber getrennt vom eigenen Mikrofon.".into(),
+        action_items: vec![
+            ActionItem {
+                id: "act_prev_1".into(),
+                owner: "Markus Klein".into(),
+                task: "Dual-Channel Audio-Stream-Prototyp mit ScreenCaptureKit testen".into(),
+                due_hint: Some("Nächster Sync".into()),
+                completed: true,
+            },
+            ActionItem {
+                id: "act_prev_2".into(),
+                owner: "Anna Weber".into(),
+                task: "Erste UX-Wireframes für Menüleisten-Pause-Modus erstellen".into(),
+                due_hint: Some("Nächster Sync".into()),
+                completed: false,
+            },
+        ],
+        participants: vec![
+            MeetingParticipant {
+                speaker_label: "SELF".into(),
+                display_name: "Luka (Ich)".into(),
+                person_id: None,
+                email: None,
+                is_self: true,
+                identification_source: IdentificationSource::MicSelf,
+                confidence: 1.0,
+                talk_time_ms: 420_000,
+            },
+            MeetingParticipant {
+                speaker_label: "SPK_1".into(),
+                display_name: "Markus Klein".into(),
+                person_id: Some("per_markus".into()),
+                email: Some("markus@kernwerk.dev".into()),
+                is_self: false,
+                identification_source: IdentificationSource::Voiceprint,
+                confidence: 0.91,
+                talk_time_ms: 510_000,
+            },
+            MeetingParticipant {
+                speaker_label: "SPK_2".into(),
+                display_name: "Anna Weber".into(),
+                person_id: Some("per_anna".into()),
+                email: Some("anna.weber@nordlicht.io".into()),
+                is_self: false,
+                identification_source: IdentificationSource::Voiceprint,
+                confidence: 0.90,
+                talk_time_ms: 390_000,
+            },
+        ],
+        transcript_count: 0,
+        screenshare_count: 0,
+        folder_ids: vec!["fld_product".into()],
+        series_key: compute_series_key(
+            "Architektur-Sync: Kontexterfassung, ScreenCaptureKit & MCP-Latenz (KW47)",
+        ),
     };
 
     let episodes = vec![
@@ -742,7 +930,11 @@ pub fn initial_demo_dataset() -> SeedDataset {
 
     SeedDataset {
         persons,
-        meetings: vec![(m1, m1_transcript, m1_slides), (m2, vec![], vec![])],
+        meetings: vec![
+            (m1, m1_transcript, m1_slides),
+            (m2, vec![], vec![]),
+            (m0, vec![], vec![]),
+        ],
         episodes,
         snapshots,
         clipboard,

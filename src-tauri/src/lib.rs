@@ -72,33 +72,118 @@ fn set_autostart_enabled(
     Ok(active)
 }
 
+#[derive(Default)]
+struct ShortcutBindings {
+    hover: parking_lot::Mutex<Option<Shortcut>>,
+    voice_typing: parking_lot::Mutex<Option<Shortcut>>,
+}
+
+fn rebind_global_shortcuts(
+    app: &tauri::AppHandle,
+    bindings: &ShortcutBindings,
+    hover_spec: &str,
+    vt_spec: &str,
+    vt_enabled: bool,
+) -> Result<(), String> {
+    let hover_sc = Shortcut::from_str(hover_spec.trim())
+        .map_err(|e| format!("Ungültiges Hover-Shortcut-Format '{hover_spec}': {e}"))?;
+    let vt_sc = if vt_enabled && !vt_spec.trim().is_empty() {
+        Some(
+            Shortcut::from_str(vt_spec.trim())
+                .map_err(|e| format!("Ungültiges Voice-Typing-Shortcut-Format '{vt_spec}': {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+
+    gs.register(hover_sc).map_err(|e| {
+        format!(
+            "Shortcut '{hover_spec}' konnte nicht registriert werden (evtl. bereits durch macOS oder eine andere App belegt): {e}"
+        )
+    })?;
+    *bindings.hover.lock() = Some(hover_sc);
+
+    if let Some(vt) = vt_sc {
+        if vt != hover_sc {
+            if let Err(err) = gs.register(vt) {
+                tracing::warn!("Could not register voice typing shortcut '{vt_spec}': {err}");
+                *bindings.voice_typing.lock() = None;
+                return Err(format!(
+                    "Voice-Typing-Shortcut '{vt_spec}' konnte nicht registriert werden: {err}"
+                ));
+            }
+            *bindings.voice_typing.lock() = Some(vt);
+        } else {
+            *bindings.voice_typing.lock() = None;
+        }
+    } else {
+        *bindings.voice_typing.lock() = None;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn set_global_shortcut(
     app: tauri::AppHandle,
     controller: State<'_, AppController>,
+    bindings: State<'_, ShortcutBindings>,
     shortcut: String,
 ) -> Result<String, String> {
     let trimmed = shortcut.trim();
     if trimmed.is_empty() {
         return Err("Shortcut darf nicht leer sein.".into());
     }
-    let parsed = Shortcut::from_str(trimmed)
-        .map_err(|e| format!("Ungültiges Shortcut-Format '{trimmed}': {e}"))?;
+    let ai = controller.storage.get_ai_settings().unwrap_or_default();
+    rebind_global_shortcuts(
+        &app,
+        &bindings,
+        trimmed,
+        &ai.voice_typing_shortcut,
+        ai.voice_typing_enabled,
+    )?;
 
-    let gs = app.global_shortcut();
-    let _ = gs.unregister_all();
-    gs.register(parsed).map_err(|e| {
-        format!(
-            "Shortcut '{trimmed}' konnte nicht registriert werden (evtl. bereits durch macOS oder eine andere App belegt): {e}"
-        )
-    })?;
-
-    if let Ok(mut ai) = controller.storage.get_ai_settings() {
-        ai.hover_shortcut = trimmed.to_string();
-        let _ = controller.storage.save_ai_settings(&ai);
+    if let Ok(mut ai_mut) = controller.storage.get_ai_settings() {
+        ai_mut.hover_shortcut = trimmed.to_string();
+        let _ = controller.storage.save_ai_settings(&ai_mut);
     }
     let display = format_shortcut_display(trimmed);
     let tel = controller.update_telemetry(|t| t.global_shortcut = display.clone());
+    controller
+        .events
+        .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
+    Ok(display)
+}
+
+#[tauri::command]
+fn set_voice_typing_shortcut(
+    app: tauri::AppHandle,
+    controller: State<'_, AppController>,
+    bindings: State<'_, ShortcutBindings>,
+    shortcut: String,
+) -> Result<String, String> {
+    let trimmed = shortcut.trim();
+    if trimmed.is_empty() {
+        return Err("Shortcut darf nicht leer sein.".into());
+    }
+    let ai = controller.storage.get_ai_settings().unwrap_or_default();
+    rebind_global_shortcuts(
+        &app,
+        &bindings,
+        &ai.hover_shortcut,
+        trimmed,
+        true,
+    )?;
+
+    if let Ok(mut ai_mut) = controller.storage.get_ai_settings() {
+        ai_mut.voice_typing_shortcut = trimmed.to_string();
+        ai_mut.voice_typing_enabled = true;
+        let _ = controller.storage.save_ai_settings(&ai_mut);
+    }
+    let display = format_shortcut_display(trimmed);
+    let tel = controller.update_telemetry(|t| t.voice_typing_shortcut = display.clone());
     controller
         .events
         .publish(BacktextEvent::DaemonTelemetryUpdated(tel));
@@ -109,12 +194,20 @@ fn setup_menubar_tray(
     app: &tauri::App,
     tray_ctrl: AppController,
     shortcut_label: &str,
+    vt_label: &str,
 ) -> tauri::Result<()> {
     let open_main = MenuItem::with_id(app, "open_main", "backtext öffnen", true, None::<&str>)?;
     let open_hover = MenuItem::with_id(
         app,
         "open_hover",
         &format!("Hover-Assistent ({shortcut_label})"),
+        true,
+        None::<&str>,
+    )?;
+    let toggle_vt = MenuItem::with_id(
+        app,
+        "toggle_voice_typing",
+        &format!("Voice Typing starten/stoppen ({vt_label})"),
         true,
         None::<&str>,
     )?;
@@ -148,6 +241,7 @@ fn setup_menubar_tray(
         &[
             &open_main,
             &open_hover,
+            &toggle_vt,
             &sep1,
             &pause_15,
             &pause_60,
@@ -169,6 +263,14 @@ fn setup_menubar_tray(
             }
             "open_hover" => {
                 let _ = toggle_hover_overlay(app_handle.clone());
+            }
+            "toggle_voice_typing" => {
+                let ctrl = tray_ctrl.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = ctrl.toggle_voice_typing("system").await {
+                        tracing::warn!("Menubar voice typing failed: {err}");
+                    }
+                });
             }
             "pause_15" => {
                 tray_ctrl.set_capture_pause(Some(15), None);
@@ -208,14 +310,32 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    let is_vt = app
+                        .try_state::<ShortcutBindings>()
+                        .and_then(|b| *b.voice_typing.lock())
+                        .map(|vt| vt == *shortcut)
+                        .unwrap_or(false);
+                    if is_vt {
+                        if let Some(ctrl_state) = app.try_state::<AppController>() {
+                            let ctrl = ctrl_state.inner().clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(err) = ctrl.toggle_voice_typing("system").await {
+                                    tracing::warn!("Voice typing shortcut failed: {err}");
+                                }
+                            });
+                        }
+                    } else {
                         let _ = toggle_hover_overlay(app.clone());
                     }
                 })
                 .build(),
         )
         .manage(controller)
+        .manage(ShortcutBindings::default())
         .setup(move |app| {
             // Protect Hover assistant from screen capture / screen sharing
             if let Some(hover_win) = app.get_webview_window("hover") {
@@ -226,22 +346,32 @@ pub fn run() {
             let autostart_active = app.autolaunch().is_enabled().unwrap_or(false);
             setup_controller.update_telemetry(|t| t.autostart_enabled = autostart_active);
 
-            // Register user-configured global hotkey for Hover Overlay (default: Alt+Space)
-            let saved_shortcut_spec = setup_controller
-                .storage
-                .get_ai_settings()
-                .map(|s| s.hover_shortcut)
-                .unwrap_or_else(|_| "Alt+Space".into());
-            let parsed_shortcut = Shortcut::from_str(&saved_shortcut_spec)
-                .unwrap_or_else(|_| Shortcut::new(Some(Modifiers::ALT), Code::Space));
-            if let Err(err) = app.global_shortcut().register(parsed_shortcut) {
-                tracing::warn!(
-                    "Could not register global shortcut '{}': {err}",
-                    saved_shortcut_spec
-                );
+            // Register user-configured global hotkeys (Hover Overlay + System-Wide Voice Typing)
+            let saved_ai = setup_controller.storage.get_ai_settings().unwrap_or_default();
+            let hover_spec = saved_ai.hover_shortcut.clone();
+            let vt_spec = saved_ai.voice_typing_shortcut.clone();
+            let vt_enabled = saved_ai.voice_typing_enabled;
+            let bindings = app.state::<ShortcutBindings>();
+            if let Err(err) = rebind_global_shortcuts(
+                app.handle(),
+                &bindings,
+                &hover_spec,
+                &vt_spec,
+                vt_enabled,
+            ) {
+                tracing::warn!("Initial global shortcut binding warning: {err}");
+                // Ensure fallback hover shortcut is attempted
+                let fallback_hover = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+                if app.global_shortcut().register(fallback_hover).is_ok() {
+                    *bindings.hover.lock() = Some(fallback_hover);
+                }
             }
-            let display_shortcut = format_shortcut_display(&saved_shortcut_spec);
-            setup_controller.update_telemetry(|t| t.global_shortcut = display_shortcut.clone());
+            let display_shortcut = format_shortcut_display(&hover_spec);
+            let display_vt = format_shortcut_display(&vt_spec);
+            setup_controller.update_telemetry(|t| {
+                t.global_shortcut = display_shortcut.clone();
+                t.voice_typing_shortcut = display_vt.clone();
+            });
 
             // Forward Rust EventBus events directly into Tauri webview windows for live token & audio streaming
             let mut rx = setup_controller.events.subscribe();
@@ -279,9 +409,12 @@ pub fn run() {
                 }
             });
 
-            if let Err(err) =
-                setup_menubar_tray(app, setup_controller.clone(), &display_shortcut)
-            {
+            if let Err(err) = setup_menubar_tray(
+                app,
+                setup_controller.clone(),
+                &display_shortcut,
+                &display_vt,
+            ) {
                 tracing::warn!("Menubar tray initialization skipped: {err}");
             }
 
@@ -301,7 +434,8 @@ pub fn run() {
             toggle_hover_overlay,
             hide_hover_overlay,
             set_autostart_enabled,
-            set_global_shortcut
+            set_global_shortcut,
+            set_voice_typing_shortcut
         ])
         .run(tauri::generate_context!())
         .expect("error while running backtext Tauri application");

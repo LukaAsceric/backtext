@@ -975,28 +975,49 @@ func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
         JSONOut.emit(payload)
     }
 
+    var speechMsSinceFlush: Double = 0.0
+    var silenceAfterSpeechMs: Double = 0.0
+    var loopIter: Int = 0
+
     while !isStopping() {
-        Thread.sleep(forTimeInterval: 0.5)
+        Thread.sleep(forTimeInterval: 0.2)
+        loopIter += 1
         let elapsed = Int(Date().timeIntervalSince(startTime))
         let micRms = micRec.currentRms()
         var sysRms = 0.0
         if #available(macOS 13.0, *), let collector = sysCollector as? SystemAudioCollector {
             sysRms = collector.currentRms()
         }
-        let combinedErr: String? = micRec.errorMessage ?? sysError
-        let levelPayload: [String: Any] = [
-            "type": "level",
-            "mic_rms": micRms,
-            "system_rms": sysRms,
-            "mic_active": micRec.isRunning,
-            "system_active": sysActive,
-            "elapsed_secs": elapsed,
-            "error": jsonNullable(combinedErr)
-        ]
-        JSONOut.emit(levelPayload)
 
-        if Date().timeIntervalSince(lastFlush) >= effectiveChunkSecs {
+        let peakRms = max(micRms, sysRms)
+        if peakRms >= 0.045 {
+            speechMsSinceFlush += 200.0
+            silenceAfterSpeechMs = 0.0
+        } else if speechMsSinceFlush > 0.0 {
+            silenceAfterSpeechMs += 200.0
+        }
+
+        if loopIter % 2 == 0 {
+            let combinedErr: String? = micRec.errorMessage ?? sysError
+            let levelPayload: [String: Any] = [
+                "type": "level",
+                "mic_rms": micRms,
+                "system_rms": sysRms,
+                "mic_active": micRec.isRunning,
+                "system_active": sysActive,
+                "elapsed_secs": elapsed,
+                "error": jsonNullable(combinedErr)
+            ]
+            JSONOut.emit(levelPayload)
+        }
+
+        let sinceFlush = Date().timeIntervalSince(lastFlush)
+        let naturalPauseFlush = speechMsSinceFlush >= 1200.0 && silenceAfterSpeechMs >= 700.0 && sinceFlush >= 1.8
+        let maxDurationFlush = sinceFlush >= effectiveChunkSecs
+        if naturalPauseFlush || maxDurationFlush {
             lastFlush = Date()
+            speechMsSinceFlush = 0.0
+            silenceAfterSpeechMs = 0.0
             emitChunk(forceFinal: false)
         }
     }
@@ -1256,6 +1277,112 @@ func handleAudioEnvironment() {
     JSONOut.emit(payload)
 }
 
+func handleRecordDictation(outPath: String) {
+    let stopLock = NSLock()
+    var shouldStop = false
+    func requestStop() {
+        stopLock.lock()
+        shouldStop = true
+        stopLock.unlock()
+    }
+    func isStopping() -> Bool {
+        stopLock.lock()
+        defer { stopLock.unlock() }
+        return shouldStop
+    }
+
+    DispatchQueue.global(qos: .utility).async {
+        while true {
+            let data = FileHandle.standardInput.availableData
+            if data.isEmpty {
+                requestStop()
+                break
+            }
+            if let text = String(data: data, encoding: .utf8), text.lowercased().contains("stop") {
+                requestStop()
+                break
+            }
+        }
+    }
+
+    signal(SIGTERM, SIG_IGN)
+    let sigTermSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: DispatchQueue.global())
+    sigTermSrc.setEventHandler { requestStop() }
+    sigTermSrc.resume()
+
+    let micRec = ContinuousMicRecorder()
+    micRec.start()
+    let startTime = Date()
+
+    // Max safety limit: 5 minutes continuous dictation
+    while !isStopping() && Date().timeIntervalSince(startTime) < 300.0 {
+        Thread.sleep(forTimeInterval: 0.15)
+        let elapsedMs: Int = Int(Date().timeIntervalSince(startTime) * 1000.0)
+        let rms: Double = micRec.currentRms()
+        let lvl: [String: Any] = [
+            "type": "level",
+            "rms": rms,
+            "elapsed_ms": elapsedMs,
+            "mic_active": micRec.isRunning,
+            "error": jsonNullable(micRec.errorMessage)
+        ]
+        JSONOut.emit(lvl)
+    }
+
+    micRec.stop()
+    sigTermSrc.cancel()
+    let samples = micRec.drainSamples()
+    let sampleCount: Int = samples.count
+    let durMs: Int = Int(Date().timeIntervalSince(startTime) * 1000.0)
+    let ok = sampleCount > 1600 && (try? writeMono16kWav(samples: samples, to: outPath)) != nil
+    let donePayload: [String: Any] = [
+        "type": "done",
+        "ok": ok,
+        "wav_path": jsonNullable(ok ? outPath : nil),
+        "samples": sampleCount,
+        "duration_ms": durMs,
+        "error": jsonNullable(micRec.errorMessage)
+    ]
+    JSONOut.emit(donePayload)
+}
+
+func handlePasteText() {
+    let inputData = FileHandle.standardInput.readDataToEndOfFile()
+    let text = String(data: inputData, encoding: .utf8) ?? ""
+    if text.isEmpty {
+        let res: [String: Any] = ["ok": false]
+        JSONOut.emit(res)
+        return
+    }
+    let pb = NSPasteboard.general
+    let previousString: String? = pb.string(forType: .string)
+
+    pb.clearContents()
+    pb.setString(text, forType: .string)
+    Thread.sleep(forTimeInterval: 0.04)
+
+    var posted = false
+    if let src = CGEventSource(stateID: .hidSystemState),
+       let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true),
+       let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false) {
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+        posted = true
+    }
+
+    // Brief delay so target app reads pasted string before restoring user's original clipboard
+    Thread.sleep(forTimeInterval: 0.18)
+    if let prev = previousString {
+        pb.clearContents()
+        pb.setString(prev, forType: .string)
+    }
+
+    let res: [String: Any] = ["ok": posted]
+    JSONOut.emit(res)
+}
+
 func handleRecordMic(outPath: String, seconds: Double) {
     let samples = recordMicrophoneSamples(durationSecs: seconds)
     let sampleCount: Int = samples.count
@@ -1292,8 +1419,13 @@ case "record-dual-audio":
     handleRecordDualAudio(outDir: outDir, seconds: secs)
 case "stream-dual-audio":
     let outDir = args.count > 2 ? args[2] : "/tmp/backtext-audio"
-    let secs = args.count > 3 ? (Double(args[3]) ?? 8.0) : 8.0
+    let secs = args.count > 3 ? (Double(args[3]) ?? 4.5) : 4.5
     handleStreamDualAudio(outDir: outDir, chunkSecs: secs)
+case "record-dictation":
+    let outWav = args.count > 2 ? args[2] : "/tmp/backtext-dictation.wav"
+    handleRecordDictation(outPath: outWav)
+case "paste-text":
+    handlePasteText()
 case "record-mic":
     let outWav = args.count > 2 ? args[2] : "/tmp/backtext-self.wav"
     let secs = args.count > 3 ? (Double(args[3]) ?? 6.0) : 6.0

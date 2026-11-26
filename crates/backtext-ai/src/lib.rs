@@ -66,6 +66,23 @@ impl HybridAiEngine {
         let is_de = profile.preferred_output_language == Language::De;
 
         let dossier = render_personalization_dossier(&profile, &vocab, &prefs);
+        let active_template = storage
+            .get_meeting_template(&detail.meeting.template_id)?
+            .or_else(|| storage.get_meeting_template("general").ok().flatten());
+        let template_name = active_template
+            .as_ref()
+            .map(|t| if is_de { t.name_de.as_str() } else { t.name_en.as_str() })
+            .unwrap_or(if is_de { "Allgemeines Meeting" } else { "General Meeting" });
+        let template_directive = active_template
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "\nVERWENDETES TEMPLATE ({}):\n{}\n",
+                    template_name, t.sections_prompt
+                )
+            })
+            .unwrap_or_default();
+
         let transcript_text = detail
             .transcript
             .iter()
@@ -97,6 +114,7 @@ impl HybridAiEngine {
 
         let sys_prompt = format!(
             "Du bist backtext, ein präziser Meeting-Notiz-Enhancer im Granola-Stil. Nutze die eigenen Stichpunkte als Rückgrat und reichere sie mit Fakten aus Transkript und Folien an.\n\
+            {template_directive}\
             WICHTIGE FORMATREGELN:\n\
             1. Setze bei wichtigen Aussagen, Entscheidungen und Fakten direkt inline den exakten Transkript-Zeitstempel im Format [MM:SS] (z. B. [00:42], [02:15]), damit der Nutzer per Klick direkt zur Originalstelle im Transkript springen kann.\n\
             2. Wenn im Meeting echte, konkrete Aufgaben vereinbart wurden, liste sie am Ende unter der Überschrift `### Action Items` strikt im Format:\n\
@@ -105,8 +123,8 @@ impl HybridAiEngine {
             3. Erfinde niemals Fakten oder Aufgaben, die nicht in Notizen, Transkript oder Folien vorkommen.\n{dossier}"
         );
         let usr_prompt = format!(
-            "Meeting: {}\nEigene Notizen:\n{}\n\nTranskript:\n{}\n\nScreen-Share-OCR:\n{}",
-            detail.meeting.title, detail.meeting.raw_user_notes, transcript_text, slides_text
+            "Meeting: {}\nTemplate: {}\nEigene Notizen:\n{}\n\nTranskript:\n{}\n\nScreen-Share-OCR:\n{}",
+            detail.meeting.title, template_name, detail.meeting.raw_user_notes, transcript_text, slides_text
         );
 
         let fallback_actions = extract_structured_actions(
@@ -171,8 +189,9 @@ impl HybridAiEngine {
 
         let executive_summary = if is_de {
             format!(
-                "Abstimmung zu „{}“ mit {} ({} Wortbeiträge, {} erfasste Screen-Share-Folien). {}",
+                "Abstimmung zu „{}“ ({}) mit {} ({} Wortbeiträge, {} erfasste Screen-Share-Folien). {}",
                 detail.meeting.title,
+                template_name,
                 participant_names.join(", "),
                 detail.transcript.len(),
                 detail.screenshares.len(),
@@ -184,8 +203,9 @@ impl HybridAiEngine {
             )
         } else {
             format!(
-                "Sync on \"{}\" with {} ({} transcript segments, {} captured screen-share slides). {}",
+                "Sync on \"{}\" ({}) with {} ({} transcript segments, {} captured screen-share slides). {}",
                 detail.meeting.title,
+                template_name,
                 participant_names.join(", "),
                 detail.transcript.len(),
                 detail.screenshares.len(),
@@ -197,13 +217,33 @@ impl HybridAiEngine {
             )
         };
 
+        let template_headings: Vec<String> = active_template
+            .as_ref()
+            .map(|t| {
+                t.sections_prompt
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| l.starts_with("### ") && !l.to_lowercase().contains("action item"))
+                    .map(|l| l.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut md = provider_error_banner.unwrap_or_default();
+        md.push_str(&format!(
+            "*Template: **{}***\n\n",
+            template_name
+        ));
         if !user_bullets.is_empty() {
-            md.push_str(if is_de {
-                "### Angereicherte Kernpunkte (aus deinen Notizen + Transkript)\n"
-            } else {
-                "### Enhanced Key Points (from Your Notes + Transcript)\n"
+            let first_h = template_headings.first().cloned().unwrap_or_else(|| {
+                if is_de {
+                    "### Angereicherte Kernpunkte (aus deinen Notizen + Transkript)".into()
+                } else {
+                    "### Enhanced Key Points (from Your Notes + Transcript)".into()
+                }
             });
+            md.push_str(&first_h);
+            md.push('\n');
             for b in &user_bullets {
                 let b_vec = embed_text_local_256(b);
                 let best_seg = detail.transcript.iter().max_by(|x, y| {
@@ -276,6 +316,205 @@ impl HybridAiEngine {
         })
     }
 
+    /// Rewrites an existing meeting's AI notes according to a natural-language user instruction
+    /// (e.g. "Kürze den Abschnitt Risiken", "Übersetze auf Englisch") while keeping `[MM:SS]` citations.
+    pub async fn rewrite_meeting_notes(
+        &self,
+        storage: &StorageEngine,
+        events: Option<&EventBus>,
+        meeting_id: &str,
+        instruction: &str,
+    ) -> Result<EnhancedMeetingResult> {
+        let detail = storage
+            .get_meeting_detail(meeting_id)?
+            .ok_or_else(|| anyhow::anyhow!("Meeting '{meeting_id}' not found"))?;
+        let profile = storage.get_user_profile()?;
+        let vocab = storage.list_vocabulary()?;
+        let prefs = storage.list_learned_preferences()?;
+        let ai_settings = storage.get_ai_settings()?;
+        let dossier = render_personalization_dossier(&profile, &vocab, &prefs);
+
+        let transcript_text = detail
+            .transcript
+            .iter()
+            .map(|s| {
+                format!(
+                    "[{:02}:{:02}] {}: {}",
+                    s.start_ms / 60_000,
+                    (s.start_ms % 60_000) / 1000,
+                    s.speaker_name,
+                    s.text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let sys_prompt = format!(
+            "Du bist backtext, ein präziser Meeting-Notiz-Redakteur im Granola-Stil.\n\
+            Überarbeite die bestehenden KI-Notizen exakt nach der Anweisung des Nutzers.\n\
+            WICHTIGE REGELN:\n\
+            1. Behalte relevante [MM:SS]-Transkript-Referenzen bei oder ergänze passende Zeitstempel aus dem Transkript.\n\
+            2. Gib direkt die fertige überarbeitete Markdown-Notiz aus (ohne einleitendes Geplänkel).\n\
+            3. Falls Action Items aktualisiert/hinzugefügt werden, liste sie am Ende unter `### Action Items` im Format `- [ ] Verantwortlicher: Aufgabe (Frist)`.\n{dossier}"
+        );
+        let usr_prompt = format!(
+            "ANWEISUNG: {instruction}\n\nAKTUELLE KI-NOTIZEN:\n{}\n\nEIGENE STICHPUNKTE:\n{}\n\nTRANSKRIPT:\n{}",
+            detail.meeting.enhanced_markdown, detail.meeting.raw_user_notes, transcript_text
+        );
+
+        let outcome = providers::stream_completion(
+            &self.http,
+            &ai_settings,
+            storage.secrets(),
+            &sys_prompt,
+            &usr_prompt,
+            None,
+        )
+        .await;
+
+        let (cleaned_md, next_actions, provider_used) = if let Some((llm_md, prov)) = outcome.result
+        {
+            let (cleaned, parsed_actions) =
+                parse_and_strip_llm_action_items(&llm_md, &profile.display_name);
+            let final_actions = if parsed_actions.is_empty() && !detail.meeting.action_items.is_empty() {
+                detail.meeting.action_items.clone()
+            } else {
+                parsed_actions
+            };
+            (cleaned, final_actions, prov)
+        } else {
+            let low = instruction.to_lowercase();
+            let base = if detail.meeting.enhanced_markdown.trim().is_empty() {
+                detail.meeting.raw_user_notes.clone()
+            } else {
+                detail.meeting.enhanced_markdown.clone()
+            };
+            let rewritten = if low.contains("kürz")
+                || low.contains("kompakt")
+                || low.contains("shorter")
+                || low.contains("concise")
+            {
+                let compact_lines: Vec<String> = base
+                    .lines()
+                    .filter(|l| l.trim().starts_with("### ") || l.trim().starts_with("- "))
+                    .take(6)
+                    .map(|l| l.to_string())
+                    .collect();
+                if compact_lines.is_empty() {
+                    base
+                } else {
+                    format!("*Überarbeitet ({instruction}):*\n\n{}", compact_lines.join("\n"))
+                }
+            } else {
+                format!("{base}\n\n### Überarbeitungshinweis\n- {instruction}")
+            };
+            (
+                rewritten,
+                detail.meeting.action_items.clone(),
+                "local_rewrite_fallback".into(),
+            )
+        };
+
+        let exec_summary = cleaned_md
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#') && !l.trim().starts_with('*'))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut updated = detail.meeting.clone();
+        if !exec_summary.is_empty() {
+            updated.executive_summary = exec_summary.clone();
+        }
+        updated.enhanced_markdown = cleaned_md.clone();
+        updated.action_items = next_actions;
+        storage.save_meeting(&updated)?;
+
+        if let Some(bus) = events {
+            bus.publish(BacktextEvent::MeetingNotesUpdated {
+                meeting_id: meeting_id.to_string(),
+                enhanced_markdown: cleaned_md.clone(),
+            });
+        }
+
+        Ok(EnhancedMeetingResult {
+            executive_summary: updated.executive_summary,
+            enhanced_markdown: cleaned_md,
+            action_items: updated.action_items,
+            provider_used,
+        })
+    }
+
+    /// Cleans up dictated voice-typing text using the user's custom dictionary,
+    /// removing filler words and applying punctuation matching `target_app`.
+    pub async fn polish_dictation_text(
+        &self,
+        storage: &StorageEngine,
+        raw_text: &str,
+        target_app: &str,
+    ) -> Result<String> {
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+        let ai_settings = storage.get_ai_settings()?;
+        let vocab = storage.list_vocabulary()?;
+        let profile = storage.get_user_profile()?;
+
+        if ai_settings.voice_typing_ai_polish {
+            let vocab_terms: Vec<String> = vocab.iter().map(|v| v.term.clone()).collect();
+            let sys_prompt = format!(
+                "Du bist ein ultraschneller Diktat-Korrektor (Voice Typing). Korrigiere ausschließlich Zeichensetzung, Groß-/Kleinschreibung, entferne Füllwörter (äh, ähm, halt) und wende Fachbegriffe aus dem Wörterbuch an. Verändere niemals die Bedeutung und antworte NUR mit dem fertigen Text ohne Anführungszeichen.\nZiel-App: {target_app}\nWörterbuch: {}\nSprache: {}",
+                vocab_terms.join(", "),
+                profile.preferred_output_language.as_code()
+            );
+            let outcome = providers::stream_completion(
+                &self.http,
+                &ai_settings,
+                storage.secrets(),
+                &sys_prompt,
+                trimmed,
+                None,
+            )
+            .await;
+            if let Some((polished, _)) = outcome.result {
+                let clean = polished
+                    .trim()
+                    .trim_matches('"')
+                    .trim()
+                    .to_string();
+                if !clean.is_empty() {
+                    return Ok(clean);
+                }
+            }
+        }
+
+        // Fast deterministic local cleanup fallback (filler removal + custom dictionary casing)
+        let mut out = trimmed.to_string();
+        if let Ok(filler_re) = regex::Regex::new(r"(?i)(?:^|\s+)(?:ähm|äh|um|uh)(?:,|\s+|$)") {
+            out = filler_re.replace_all(&out, " ").to_string();
+        }
+        if let Ok(spaces_re) = regex::Regex::new(r"\s{2,}") {
+            out = spaces_re.replace_all(&out, " ").trim().to_string();
+        }
+        for v in &vocab {
+            let low_term = v.term.to_lowercase();
+            if low_term.len() >= 3 && out.to_lowercase().contains(&low_term) {
+                // Case-insensitive word replacement preserving user dictionary spelling
+                let re_pat = format!("(?i)\\b{}\\b", regex::escape(&v.term));
+                if let Ok(re) = regex::Regex::new(&re_pat) {
+                    out = re.replace_all(&out, v.term.as_str()).to_string();
+                }
+            }
+        }
+        if let Some(first) = out.chars().next() {
+            let mut chars = out.chars();
+            chars.next();
+            out = format!("{}{}", first.to_uppercase(), chars.as_str());
+        }
+        Ok(out)
+    }
+
     /// Executes a contextual chat prompt or `/` Recipe with live token streaming over `EventBus`.
     pub async fn run_chat_or_recipe_streaming(
         &self,
@@ -284,6 +523,28 @@ impl HybridAiEngine {
         meeting_id: Option<&str>,
         user_input: &str,
         explicit_recipe_slug: Option<&str>,
+    ) -> Result<ChatMessage> {
+        self.run_chat_or_recipe_scoped_streaming(
+            storage,
+            events,
+            meeting_id,
+            user_input,
+            explicit_recipe_slug,
+            None,
+        )
+        .await
+    }
+
+    /// Executes a contextual chat prompt or `/` Recipe scoped to a single meeting, a folder,
+    /// a person's meeting history, or an explicit multi-meeting selection.
+    pub async fn run_chat_or_recipe_scoped_streaming(
+        &self,
+        storage: &StorageEngine,
+        events: Option<&EventBus>,
+        meeting_id: Option<&str>,
+        user_input: &str,
+        explicit_recipe_slug: Option<&str>,
+        scope: Option<ChatScope>,
     ) -> Result<ChatMessage> {
         let profile = storage.get_user_profile()?;
         let vocab = storage.list_vocabulary()?;
@@ -309,15 +570,19 @@ impl HybridAiEngine {
             let _ = storage.increment_recipe_usage(&rec.slug);
         }
 
+        let scope_is_multi = scope.as_ref().map(|s| {
+            s.folder_id.is_some() || s.person_id.is_some() || !s.meeting_ids.is_empty()
+        }).unwrap_or(false);
+
         let thread_id = match meeting_id {
-            Some(mid) => format!("meeting:{mid}"),
-            None => "global:workspace".to_string(),
+            Some(mid) if !scope_is_multi => format!("meeting:{mid}"),
+            _ => "global:workspace".to_string(),
         };
 
         let user_msg = ChatMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             thread_id: thread_id.clone(),
-            meeting_id: meeting_id.map(|s| s.to_string()),
+            meeting_id: if scope_is_multi { None } else { meeting_id.map(|s| s.to_string()) },
             role: "user".into(),
             content: trimmed.to_string(),
             recipe_slug: matched_recipe.as_ref().map(|r| r.slug.clone()),
@@ -326,65 +591,221 @@ impl HybridAiEngine {
         };
         storage.insert_chat_message(&user_msg)?;
 
+        // Feature 1.2: Direct Rewrite via Chat ("/rewrite ...", "Schreib die Notizen um...", "Kürze die Notizen...")
+        if !scope_is_multi {
+            if let Some(mid) = meeting_id {
+                let low = trimmed.to_lowercase();
+                let is_rewrite_intent = low.starts_with("/rewrite")
+                    || low.contains("notizen umschreiben")
+                    || low.contains("schreib die notizen")
+                    || low.contains("kürze die notizen")
+                    || low.contains("übersetze die notizen")
+                    || low.contains("rewrite the notes")
+                    || low.contains("rewrite notes");
+                if is_rewrite_intent {
+                    let clean_instruction = trimmed
+                        .strip_prefix("/rewrite")
+                        .unwrap_or(trimmed)
+                        .trim();
+                    let instr = if clean_instruction.is_empty() {
+                        "Strukturiere die Notizen prägnanter."
+                    } else {
+                        clean_instruction
+                    };
+                    let res = self.rewrite_meeting_notes(storage, events, mid, instr).await?;
+                    let confirm_text = format!(
+                        "**KI-Notizen wurden direkt aktualisiert** *(via `{}`)*:\n\n{}",
+                        res.provider_used, res.enhanced_markdown
+                    );
+                    let assistant_msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+                    if let Some(bus) = events {
+                        bus.publish(BacktextEvent::ChatStreamDelta {
+                            thread_id: thread_id.clone(),
+                            message_id: assistant_msg_id.clone(),
+                            delta: confirm_text.clone(),
+                            done: true,
+                        });
+                    }
+                    let assistant_msg = ChatMessage {
+                        id: assistant_msg_id,
+                        thread_id,
+                        meeting_id: Some(mid.to_string()),
+                        role: "assistant".into(),
+                        content: confirm_text,
+                        recipe_slug: Some("/rewrite".into()),
+                        sources: vec![],
+                        created_at: Utc::now(),
+                    };
+                    storage.insert_chat_message(&assistant_msg)?;
+                    return Ok(assistant_msg);
+                }
+            }
+        }
+
         let mut sources: Vec<ChatSourceRef> = Vec::new();
-        let meeting_detail = match meeting_id {
-            Some(mid) => storage.get_meeting_detail(mid)?,
-            None => storage
-                .list_meetings()?
-                .into_iter()
-                .find(|m| m.status == MeetingStatus::Completed)
-                .and_then(|m| storage.get_meeting_detail(&m.id).ok().flatten()),
+        let all_meetings = storage.list_meetings()?;
+        let mut scoped_meetings: Vec<MeetingDetail> = Vec::new();
+        let mut scope_label = String::new();
+
+        if let Some(ref sc) = scope {
+            if !sc.meeting_ids.is_empty() {
+                scope_label = format!("Ausgewählte Meetings ({})", sc.meeting_ids.len());
+                for mid in sc.meeting_ids.iter().take(12) {
+                    if let Some(det) = storage.get_meeting_detail(mid)? {
+                        scoped_meetings.push(det);
+                    }
+                }
+            } else if let Some(ref fid) = sc.folder_id {
+                let folder_name = storage
+                    .list_meeting_folders()?
+                    .into_iter()
+                    .find(|f| f.id == *fid)
+                    .map(|f| f.name)
+                    .unwrap_or_else(|| fid.clone());
+                scope_label = format!("Ordner „{folder_name}“");
+                for m in all_meetings
+                    .iter()
+                    .filter(|m| m.folder_ids.iter().any(|x| x == fid))
+                    .take(12)
+                {
+                    if let Some(det) = storage.get_meeting_detail(&m.id)? {
+                        scoped_meetings.push(det);
+                    }
+                }
+            } else if let Some(ref pid) = sc.person_id {
+                let person_name = storage
+                    .list_persons()?
+                    .into_iter()
+                    .find(|p| p.id == *pid)
+                    .map(|p| p.full_name)
+                    .unwrap_or_else(|| pid.clone());
+                scope_label = format!("Person „{person_name}“");
+                for m in all_meetings
+                    .iter()
+                    .filter(|m| {
+                        m.participants.iter().any(|p| {
+                            p.person_id.as_deref() == Some(pid.as_str())
+                                || p.display_name.eq_ignore_ascii_case(&person_name)
+                        })
+                    })
+                    .take(12)
+                {
+                    if let Some(det) = storage.get_meeting_detail(&m.id)? {
+                        scoped_meetings.push(det);
+                    }
+                }
+            }
+        }
+
+        let meeting_detail = if scope_is_multi {
+            scoped_meetings.first().cloned()
+        } else {
+            match meeting_id {
+                Some(mid) => storage.get_meeting_detail(mid)?,
+                None => all_meetings
+                    .iter()
+                    .find(|m| m.status == MeetingStatus::Completed)
+                    .and_then(|m| storage.get_meeting_detail(&m.id).ok().flatten()),
+            }
         };
 
         let episodes = storage.list_context_episodes(6)?;
         let clipboard = storage.list_clipboard_items(5)?;
         let search_hits = storage.search_hybrid(trimmed, 5, None, None, None)?;
 
-        if let Some(ref md) = meeting_detail {
-            sources.push(ChatSourceRef {
-                kind: "meeting".into(),
-                ref_id: md.meeting.id.clone(),
-                label: md.meeting.title.clone(),
-                snippet: md.meeting.executive_summary.chars().take(160).collect(),
-            });
-            if let Some(slide) = md.screenshares.first() {
+        if scope_is_multi {
+            for det in &scoped_meetings {
                 sources.push(ChatSourceRef {
-                    kind: "screenshare".into(),
-                    ref_id: slide.id.clone(),
-                    label: slide.slide_title.clone(),
-                    snippet: slide.ocr_text.chars().take(150).collect(),
+                    kind: "meeting".into(),
+                    ref_id: det.meeting.id.clone(),
+                    label: det.meeting.title.clone(),
+                    snippet: det.meeting.executive_summary.chars().take(160).collect(),
                 });
             }
-        }
-        for ep in episodes.iter().take(2) {
-            sources.push(ChatSourceRef {
-                kind: "episode".into(),
-                ref_id: ep.id.clone(),
-                label: ep.title.clone(),
-                snippet: ep.summary.chars().take(150).collect(),
-            });
-        }
-        for hit in search_hits.iter().take(2) {
-            if !sources.iter().any(|s| s.label == hit.title) {
+        } else {
+            if let Some(ref md) = meeting_detail {
                 sources.push(ChatSourceRef {
-                    kind: hit.source_kind.clone(),
-                    ref_id: hit.id.clone(),
-                    label: hit.title.clone(),
-                    snippet: hit.snippet.chars().take(150).collect(),
+                    kind: "meeting".into(),
+                    ref_id: md.meeting.id.clone(),
+                    label: md.meeting.title.clone(),
+                    snippet: md.meeting.executive_summary.chars().take(160).collect(),
                 });
+                if let Some(slide) = md.screenshares.first() {
+                    sources.push(ChatSourceRef {
+                        kind: "screenshare".into(),
+                        ref_id: slide.id.clone(),
+                        label: slide.slide_title.clone(),
+                        snippet: slide.ocr_text.chars().take(150).collect(),
+                    });
+                }
+            }
+            for ep in episodes.iter().take(2) {
+                sources.push(ChatSourceRef {
+                    kind: "episode".into(),
+                    ref_id: ep.id.clone(),
+                    label: ep.title.clone(),
+                    snippet: ep.summary.chars().take(150).collect(),
+                });
+            }
+            for hit in search_hits.iter().take(2) {
+                if !sources.iter().any(|s| s.label == hit.title) {
+                    sources.push(ChatSourceRef {
+                        kind: hit.source_kind.clone(),
+                        ref_id: hit.id.clone(),
+                        label: hit.title.clone(),
+                        snippet: hit.snippet.chars().take(150).collect(),
+                    });
+                }
             }
         }
 
         let dossier = render_personalization_dossier(&profile, &vocab, &prefs);
-        let rendered_prompt = render_recipe_or_query(
-            matched_recipe.as_ref(),
-            trimmed,
-            &profile,
-            meeting_detail.as_ref(),
-            &episodes,
-            &clipboard,
-            &dossier,
-        );
+        let rendered_prompt = if scope_is_multi {
+            let multi_ctx = scoped_meetings
+                .iter()
+                .map(|det| {
+                    let date_s = det.meeting.started_at.format("%d.%m.%Y").to_string();
+                    let actions_s = det
+                        .meeting
+                        .action_items
+                        .iter()
+                        .map(|a| format!("  - [{}] {}: {}", if a.completed { "x" } else { " " }, a.owner, a.task))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let segs_s = det
+                        .transcript
+                        .iter()
+                        .take(12)
+                        .map(|s| format!("  [{:02}:{:02}] {}: {}", s.start_ms / 60_000, (s.start_ms % 60_000) / 1000, s.speaker_name, s.text))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "## Meeting: {} ({})\nZusammenfassung: {}\nNotizen:\n{}\nAction Items:\n{}\nTranskript-Auszug:\n{}",
+                        det.meeting.title,
+                        date_s,
+                        det.meeting.executive_summary,
+                        det.meeting.enhanced_markdown,
+                        actions_s,
+                        segs_s
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+            format!(
+                "MULTI-MEETING-SCOPE: {scope_label} ({} Meetings)\nFrage / Auftrag: {trimmed}\n\nBeziehe dich präzise auf die einzelnen Meetings (nenne jeweils den Meeting-Titel) und fasse Muster, Entscheidungen sowie offene Zusagen zusammen.\n\n{multi_ctx}",
+                scoped_meetings.len()
+            )
+        } else {
+            render_recipe_or_query(
+                matched_recipe.as_ref(),
+                trimmed,
+                &profile,
+                meeting_detail.as_ref(),
+                &episodes,
+                &clipboard,
+                &dossier,
+            )
+        };
 
         let assistant_msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let stream_ctx = events.map(|bus| (bus, thread_id.as_str(), assistant_msg_id.as_str()));
@@ -402,15 +823,47 @@ impl HybridAiEngine {
         let reply_markdown = if let Some((ext_reply, _provider)) = outcome.result {
             ext_reply
         } else {
-            let mut local = synthesize_local_assistant_reply(
-                matched_recipe.as_ref(),
-                trimmed,
-                &profile,
-                meeting_detail.as_ref(),
-                &episodes,
-                &clipboard,
-                &search_hits,
-            );
+            let mut local = if scope_is_multi {
+                let mut out = format!(
+                    "### Multi-Meeting-Analyse: {scope_label} ({} Meetings)\n\n",
+                    scoped_meetings.len()
+                );
+                if scoped_meetings.is_empty() {
+                    out.push_str("In diesem Bereich wurden noch keine passenden Meetings gefunden.");
+                } else {
+                    for det in &scoped_meetings {
+                        let date_s = det.meeting.started_at.format("%d.%m.%Y").to_string();
+                        let summary = if !det.meeting.executive_summary.is_empty() {
+                            det.meeting.executive_summary.as_str()
+                        } else if !det.meeting.raw_user_notes.is_empty() {
+                            det.meeting.raw_user_notes.as_str()
+                        } else {
+                            "Geplantes oder noch nicht zusammengefasstes Meeting."
+                        };
+                        out.push_str(&format!(
+                            "- **{}** (`{}`): {}\n",
+                            det.meeting.title, date_s, summary
+                        ));
+                        for act in det.meeting.action_items.iter().filter(|a| !a.completed).take(2) {
+                            out.push_str(&format!(
+                                "  - *Offen ({}):* {}\n",
+                                act.owner, act.task
+                            ));
+                        }
+                    }
+                }
+                out
+            } else {
+                synthesize_local_assistant_reply(
+                    matched_recipe.as_ref(),
+                    trimmed,
+                    &profile,
+                    meeting_detail.as_ref(),
+                    &episodes,
+                    &clipboard,
+                    &search_hits,
+                )
+            };
             if let Some(err) = outcome.last_error {
                 local = format!(
                     "*KI-Provider Hinweis ({err}) — lokaler Offline-Assistent genutzt.*\n\n{local}"
@@ -430,7 +883,7 @@ impl HybridAiEngine {
         let assistant_msg = ChatMessage {
             id: assistant_msg_id,
             thread_id,
-            meeting_id: meeting_id.map(|s| s.to_string()),
+            meeting_id: if scope_is_multi { None } else { meeting_id.map(|s| s.to_string()) },
             role: "assistant".into(),
             content: reply_markdown,
             recipe_slug: matched_recipe.map(|r| r.slug),
@@ -1092,5 +1545,58 @@ mod tests {
         assert_eq!(explicit[0].due_hint.as_deref(), Some("Heute"));
         assert_eq!(explicit[1].owner, "Clara");
         assert_eq!(explicit[1].task, "Slides versenden");
+    }
+
+    #[tokio::test]
+    async fn scoped_multi_meeting_chat_and_rewrite_notes_work() {
+        let store = StorageEngine::open_in_memory().unwrap();
+        let bus = EventBus::default();
+        let engine = HybridAiEngine::new();
+
+        // 1. /rewrite directly updates meeting enhanced_markdown
+        let rewrite_reply = engine
+            .run_chat_or_recipe_scoped_streaming(
+                &store,
+                Some(&bus),
+                Some("mtg_arch_sync"),
+                "/rewrite Kürze auf maximal 5 Stichpunkte",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(rewrite_reply.content.contains("aktualisiert"));
+        let updated = store.get_meeting_detail("mtg_arch_sync").unwrap().unwrap();
+        assert!(updated.meeting.enhanced_markdown.contains("Überarbeitet"));
+
+        // 2. Folder-scoped Multi-Meeting Chat returns clickable meeting sources
+        let scoped_reply = engine
+            .run_chat_or_recipe_scoped_streaming(
+                &store,
+                Some(&bus),
+                None,
+                "Was wurde in diesem Ordner entschieden?",
+                None,
+                Some(ChatScope {
+                    folder_id: Some("fld_product".into()),
+                    person_id: None,
+                    meeting_ids: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped_reply.role, "assistant");
+        assert!(
+            scoped_reply.sources.iter().any(|s| s.kind == "meeting"),
+            "Expected clickable meeting source refs in scoped multi-meeting reply"
+        );
+
+        // 3. Offline dictation polishing removes fillers & preserves custom dictionary terms
+        let cleaned = engine
+            .polish_dictation_text(&store, "ähm wir testen heute screencapturekit im meeting", "Slack")
+            .await
+            .unwrap();
+        assert!(!cleaned.to_lowercase().contains("ähm"));
+        assert!(cleaned.contains("ScreenCaptureKit"));
     }
 }

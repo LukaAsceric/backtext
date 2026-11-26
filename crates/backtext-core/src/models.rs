@@ -283,6 +283,104 @@ pub struct Meeting {
     pub participants: Vec<MeetingParticipant>,
     pub transcript_count: usize,
     pub screenshare_count: usize,
+    #[serde(default)]
+    pub folder_ids: Vec<String>,
+    #[serde(default)]
+    pub series_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTemplate {
+    pub id: String,
+    pub name_de: String,
+    pub name_en: String,
+    pub description_de: String,
+    pub description_en: String,
+    pub icon_key: String,
+    pub sections_prompt: String,
+    pub is_builtin: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingFolder {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub description: String,
+    #[serde(default)]
+    pub auto_series_keys: Vec<String>,
+    #[serde(default)]
+    pub meeting_count: usize,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatScope {
+    #[serde(default)]
+    pub meeting_ids: Vec<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub person_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictationEntry {
+    pub id: String,
+    pub raw_text: String,
+    pub cleaned_text: String,
+    pub target_app: String,
+    pub duration_ms: u64,
+    pub pasted: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Computes a normalized recurring-series key from a meeting title by stripping
+/// date/time/iteration suffixes (e.g. "Weekly Sync (14:30)" / "Weekly Sync - 25.11." -> "weekly sync").
+pub fn compute_series_key(title: &str) -> Option<String> {
+    let mut s = title.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    // Strip trailing parenthetical time/date tags like "(14:30)" or "(25.11.2026)"
+    if let Some(idx) = s.rfind('(') {
+        if s.ends_with(')') {
+            let inner = &s[idx + 1..s.len() - 1];
+            if inner.chars().any(|c| c.is_ascii_digit()) {
+                s = s[..idx].trim().to_string();
+            }
+        }
+    }
+    // Remove standalone date / week / episode tokens
+    let tokens: Vec<String> = s
+        .split(|c: char| !c.is_alphanumeric() && c != ':')
+        .filter(|tok| {
+            if tok.is_empty() {
+                return false;
+            }
+            // Drop pure numbers, dates, KW48, #12, 14:30
+            if tok.chars().all(|c| c.is_ascii_digit() || c == ':') {
+                return false;
+            }
+            if (tok.starts_with("kw") || tok.starts_with('w'))
+                && tok.len() <= 4
+                && tok[tok.len() - 1..].chars().all(|c| c.is_ascii_digit())
+            {
+                return false;
+            }
+            true
+        })
+        .map(|t| t.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let key = tokens.join(" ");
+    if key == "neues meeting" || key == "new meeting" || key == "meeting" {
+        return None;
+    }
+    Some(key)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,6 +577,8 @@ pub struct AiProviderSettings {
     pub stt_model: String,
     #[serde(default = "default_whisper_model_id")]
     pub whisper_model_id: String,
+    #[serde(default = "default_stt_max_chunk_secs")]
+    pub stt_max_chunk_secs: u32,
     pub llm_provider: String,
     pub llm_model: String,
     #[serde(default = "default_embedding_provider")]
@@ -488,6 +588,12 @@ pub struct AiProviderSettings {
     pub ollama_url: String,
     #[serde(default = "default_hover_shortcut")]
     pub hover_shortcut: String,
+    #[serde(default = "default_voice_typing_enabled")]
+    pub voice_typing_enabled: bool,
+    #[serde(default = "default_voice_typing_shortcut")]
+    pub voice_typing_shortcut: String,
+    #[serde(default = "default_voice_typing_polish")]
+    pub voice_typing_ai_polish: bool,
     pub openai_api_key_set: bool,
     pub anthropic_api_key_set: bool,
     pub gemini_api_key_set: bool,
@@ -504,6 +610,10 @@ fn default_whisper_model_id() -> String {
     "ggml-large-v3-turbo-q5_0".to_string()
 }
 
+fn default_stt_max_chunk_secs() -> u32 {
+    4
+}
+
 fn default_embedding_provider() -> String {
     "local_hybrid".to_string()
 }
@@ -516,18 +626,34 @@ fn default_hover_shortcut() -> String {
     "Alt+Space".to_string()
 }
 
+fn default_voice_typing_enabled() -> bool {
+    true
+}
+
+fn default_voice_typing_shortcut() -> String {
+    "Alt+Shift+D".to_string()
+}
+
+fn default_voice_typing_polish() -> bool {
+    true
+}
+
 impl Default for AiProviderSettings {
     fn default() -> Self {
         Self {
             stt_provider: "local_whisper".to_string(),
             stt_model: "whisper-large-v3-turbo (Apple Metal)".to_string(),
             whisper_model_id: default_whisper_model_id(),
+            stt_max_chunk_secs: default_stt_max_chunk_secs(),
             llm_provider: "hybrid_auto".to_string(),
             llm_model: "claude-sonnet-4-20250514".to_string(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             hover_shortcut: default_hover_shortcut(),
+            voice_typing_enabled: default_voice_typing_enabled(),
+            voice_typing_shortcut: default_voice_typing_shortcut(),
+            voice_typing_ai_polish: default_voice_typing_polish(),
             openai_api_key_set: false,
             anthropic_api_key_set: false,
             gemini_api_key_set: false,
@@ -588,6 +714,8 @@ pub struct DaemonTelemetry {
     pub keychain_backend: String,
     pub autostart_enabled: bool,
     pub global_shortcut: String,
+    #[serde(default)]
+    pub voice_typing_shortcut: String,
     pub demo_data_present: bool,
     pub whisper_cli_detected: bool,
 }

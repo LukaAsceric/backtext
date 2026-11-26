@@ -54,6 +54,17 @@ pub enum BacktextEvent {
         stt_status: String,
         warning: Option<String>,
     },
+    VoiceTypingStateChanged {
+        active: bool,
+        mode: String,
+        status: String,
+        text: Option<String>,
+        target_app: Option<String>,
+    },
+    MeetingNotesUpdated {
+        meeting_id: String,
+        enhanced_markdown: String,
+    },
 }
 
 #[derive(Clone)]

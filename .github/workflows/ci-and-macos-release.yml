@@ -191,18 +191,18 @@ jobs:
             'echo "Entferne macOS Quarantäne-Attribut für backtext.app..."' \
             'xattr -cr /Applications/backtext.app' \
             'open /Applications/backtext.app' \
-            'echo "backtext v0.4.0 wurde erfolgreich gestartet!"' \
+            'echo "backtext v0.5.0 wurde erfolgreich gestartet!"' \
             > "$HELPER"
           chmod 755 "$HELPER"
 
           hdiutil create -volname "backtext" \
             -srcfolder dist-macos/dmg-staging \
             -ov -format UDZO \
-            dist-macos/backtext_0.4.0_macos_arm64.dmg
+            dist-macos/backtext_0.5.0_macos_arm64.dmg
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$APP_DIR" \
-            dist-macos/backtext_0.4.0_macos_arm64.app.zip
+            dist-macos/backtext_0.5.0_macos_arm64.app.zip
 
           cp target/aarch64-apple-darwin/release/backtext-mcp dist-macos/backtext-mcp-macos-arm64
           chmod 755 dist-macos/backtext-mcp-macos-arm64
@@ -210,49 +210,47 @@ jobs:
       - name: Upload macOS Apple Silicon Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtext-macos-apple-silicon-arm64-v0.4.0
+          name: backtext-macos-apple-silicon-arm64-v0.5.0
           path: |
-            dist-macos/backtext_0.4.0_macos_arm64.dmg
-            dist-macos/backtext_0.4.0_macos_arm64.app.zip
+            dist-macos/backtext_0.5.0_macos_arm64.dmg
+            dist-macos/backtext_0.5.0_macos_arm64.app.zip
             dist-macos/backtext-mcp-macos-arm64
 
-      - name: Publish / Update GitHub Release v0.4.0
+      - name: Publish / Update GitHub Release v0.5.0
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NOTES=$(printf '%s\n' \
-            '## backtext v0.4.0 — Granola Citations, Teams Auto-Erkennung & UX-Feinschliff (`arm64` · M1–M5 Pro/Max)' \
+            '## backtext v0.5.0 — Granola Parity Wave: Templates, Folders, Multi-Meeting Chat, Low-Latency STT & Voice Typing (`arm64` · M1–M5 Pro/Max)' \
             '' \
-            '### Neu in v0.4.0' \
-            '- **Saubere LLM Action Items (Fix):** Action Items aus der LLM-Antwort (`- [ ] Owner — Aufgabe (Frist)` / `- [ ] Owner: Aufgabe`) werden jetzt automatisch in echte interaktive Checkbox-Items geparst und ohne doppelte `• [ ]`-Zeilen dargestellt; fehlerhafte Heuristik-Items aus eigenen Notizen sind behoben.' \
-            '- **Granola-artige Transkript-Referenzen (`[MM:SS]`):** KI-Zusammenfassungen und Meeting-Chat enthalten klickbare `[MM:SS]`-Quellen-Pills mit Zitat-Hover-Vorschau — ein Klick springt direkt ins Transkript und hebt das exakte Segment hervor.' \
-            '- **Meeting-Teilnehmer- & Kontakt-Verwaltung:** Teilnehmer direkt im Meeting hinzufügen (inkl. 1-Klick aus bekannten Kontakten), umbenennen/Stimme lernen oder entfernen; vollständiges Kontakt-CRUD (Erstellen, Bearbeiten, Löschen) unter *Personen & Stimmen*.' \
-            '- **Überarbeiteter KI-Chat mit `Tab`-Vervollständigung:** Moderne Pill-Composer-Leiste, `↑`/`↓`-Navigation, **`Tab`**-Autovervollständigung für `/`-Recipes, `Enter`-Ausführung, `Esc`-Schließen und 1-Klick-Kopieren für Antworten.' \
-            '- **Hover-Assistent mit garantiertem Eingabefokus:** Öffnet sich jetzt immer direkt mit Fokus im Chat-Eingabefeld (inkl. nativem `backtext://hover-shown`-Event & `Esc` zum Schließen).' \
-            '- **Sidebar aufgeräumt:** *Einstellungen* sitzt jetzt sauber ganz unten in der linken Navigationsleiste (an Stelle des Hover-Buttons).' \
-            '- **Zuverlässige Hintergrund-Kontexterfassung:** Kalibrierter 3-Stufen-Filter (verwirft normale 4-Sekunden-Fenster nicht mehr), sofortige Episoden-Verdichtung, optimierte Vision-OCR-Fensterauswahl und Live-Daemon-Statusleiste unter *Kontext-Gedächtnis*.' \
-            '- **Automatische Meeting-Erkennung für Microsoft Teams (Desktop & Browser):** Multi-Device CoreAudio-Mikrofonerkennung (inkl. AirPods/USB-Headsets), Scan aller sichtbaren Fenster, laufenden Apps (`com.microsoft.teams2`/`com.microsoft.teams`) und offenen Browser-Tabs (`teams.microsoft.com`, `teams.live.com`, `teams.cloud.microsoft`, Google Meet, Zoom) sowie manueller Stop-Cooldown.' \
+            '### Neu in v0.5.0' \
+            '- **1.1 Custom Meeting-Templates & 1-Klick-Neu-Generierung:** 7 integrierte Templates (*Allgemein*, *Architektur & Technik*, *1:1 Check-in*, *Sales Discovery*, *User Interview*, *Standup*, *Recruiting*) plus eigenes Template-Studio (Erstellen, Bearbeiten, Löschen) und direkter Template-Wechsel inkl. sofortiger Neu-Synthese in den *KI-Notizen*.' \
+            '- **1.2 Direkt editierbare `KI-Notizen` & Umschreiben per Chat:** Markdown-Direktbearbeitung mit Auto-Save in *KI-Notizen*, Vergleichsansicht für eigene Stichpunkte, direktes Umschreiben per `/rewrite …` im Meeting-Chat sowie 1-Klick-Button **„In KI-Notizen“** an jeder KI-Antwort.' \
+            '- **1.3 Ordner & Scoped Multi-Meeting-Chat:** Farbcodierte Meeting-Ordner mit Filter-Pills, Mehrfachauswahl in der Meeting-Liste (Sammel-Zuordnung & *Mit X Meetings chatten*), *Ordner-Chat* sowie 1-Klick-Chat über alle Meetings einer Person unter *Personen & Stimmen* — inklusive klickbarer Meeting-Quellen-Pills.' \
+            '- **1.5 Low-Latency Streaming-STT & Multi-Speaker Remote-Diarisierung:** VAD-Pausen-Erkennung im macOS Audio-Sensor flusht gesprochene Sätze automatisch nach 0,7 s Pause (~1,5–2 s Latenz statt 8 s) und extrahiert pro einzelner Äußerung einen eigenen 256-dim Voiceprint zur zuverlässigen Sprechertrennung auf System-Audio.' \
+            '- **2.7 Systemweites Voice Typing & Chat-Mikrofon:** Globaler Shortcut (`⌥⇧ D`, konfigurierbar in *Einstellungen → Shortcuts, Voice & Kalender*) diktiert in jeder macOS-App mit Fachwörterbuch + KI-Feinschliff und fügt direkt am Cursor ein (inkl. Zwischenablage-Wiederherstellung & Diktat-Verlauf); zusätzlich Mikrofon-Diktier-Button direkt im KI-Chat.' \
+            '- **2.9 Suche, Chronologische Gruppierung & Serien-Verknüpfung:** Live-Suche in der Meeting-Sidebar, automatische Gruppierung (*Live*, *Heute*, *Gestern*, *Diese Woche*, *Älter*), Kontext-Karte *„Vorheriges Meeting dieser Serie“* und 1-Klick-Regel *„Serie automatisch in Ordner legen“*.' \
             '' \
             '### Installation / Update auf macOS (M1–M5 Pro)' \
-            '1. Lade **`backtext_0.4.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
+            '1. Lade **`backtext_0.5.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
             '2. Entferne einmalig die Browser-Quarantäne im Terminal:' \
             '```bash' \
             'xattr -cr /Applications/backtext.app && open /Applications/backtext.app' \
             '```' \
-            '3. Falls du von `v0.3.0` updatest: In macOS *Systemeinstellungen → Datenschutz → Bedienungshilfen / Bildschirmaufnahme* `backtext` ggf. einmal aus- und wieder einschalten (wegen ad-hoc Signatur-Wechsel).')
-          if gh release view v0.4.0 >/dev/null 2>&1; then
-            gh release upload v0.4.0 \
-              dist-macos/backtext_0.4.0_macos_arm64.dmg \
-              dist-macos/backtext_0.4.0_macos_arm64.app.zip \
+            '3. Falls du von `v0.4.0` updatest: In macOS *Systemeinstellungen → Datenschutz → Bedienungshilfen / Bildschirmaufnahme* `backtext` ggf. einmal aus- und wieder einschalten (wegen ad-hoc Signatur-Wechsel).')
+          if gh release view v0.5.0 >/dev/null 2>&1; then
+            gh release upload v0.5.0 \
+              dist-macos/backtext_0.5.0_macos_arm64.dmg \
+              dist-macos/backtext_0.5.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
               --clobber
-            gh release edit v0.4.0 --notes "$NOTES"
+            gh release edit v0.5.0 --notes "$NOTES"
           else
-            gh release create v0.4.0 \
-              dist-macos/backtext_0.4.0_macos_arm64.dmg \
-              dist-macos/backtext_0.4.0_macos_arm64.app.zip \
+            gh release create v0.5.0 \
+              dist-macos/backtext_0.5.0_macos_arm64.dmg \
+              dist-macos/backtext_0.5.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
-              --title "backtext v0.4.0 — Granola Citations, Teams Auto-Detection & UX Polish" \
+              --title "backtext v0.5.0 — Templates, Folders, Multi-Meeting Chat, Low-Latency STT & Voice Typing" \
               --notes "$NOTES"
           fi
