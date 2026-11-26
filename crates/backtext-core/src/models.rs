@@ -579,6 +579,8 @@ pub struct AiProviderSettings {
     pub whisper_model_id: String,
     #[serde(default = "default_stt_max_chunk_secs")]
     pub stt_max_chunk_secs: u32,
+    #[serde(default = "default_meeting_template_id")]
+    pub default_meeting_template_id: String,
     pub llm_provider: String,
     pub llm_model: String,
     #[serde(default = "default_embedding_provider")]
@@ -594,6 +596,14 @@ pub struct AiProviderSettings {
     pub voice_typing_shortcut: String,
     #[serde(default = "default_voice_typing_polish")]
     pub voice_typing_ai_polish: bool,
+    #[serde(default = "default_voice_typing_polish_mode")]
+    pub voice_typing_polish_mode: String,
+    #[serde(default = "default_voice_typing_ollama_model")]
+    pub voice_typing_ollama_model: String,
+    #[serde(default = "default_voice_typing_polish_style")]
+    pub voice_typing_polish_style: String,
+    #[serde(default)]
+    pub voice_typing_custom_prompt: String,
     pub openai_api_key_set: bool,
     pub anthropic_api_key_set: bool,
     pub gemini_api_key_set: bool,
@@ -611,7 +621,11 @@ fn default_whisper_model_id() -> String {
 }
 
 fn default_stt_max_chunk_secs() -> u32 {
-    4
+    5
+}
+
+fn default_meeting_template_id() -> String {
+    "general".to_string()
 }
 
 fn default_embedding_provider() -> String {
@@ -638,6 +652,18 @@ fn default_voice_typing_polish() -> bool {
     true
 }
 
+fn default_voice_typing_polish_mode() -> String {
+    "router".to_string()
+}
+
+fn default_voice_typing_ollama_model() -> String {
+    "qwen3:4b".to_string()
+}
+
+fn default_voice_typing_polish_style() -> String {
+    "minimal".to_string()
+}
+
 impl Default for AiProviderSettings {
     fn default() -> Self {
         Self {
@@ -645,6 +671,7 @@ impl Default for AiProviderSettings {
             stt_model: "whisper-large-v3-turbo (Apple Metal)".to_string(),
             whisper_model_id: default_whisper_model_id(),
             stt_max_chunk_secs: default_stt_max_chunk_secs(),
+            default_meeting_template_id: default_meeting_template_id(),
             llm_provider: "hybrid_auto".to_string(),
             llm_model: "claude-sonnet-4-20250514".to_string(),
             embedding_provider: default_embedding_provider(),
@@ -654,6 +681,10 @@ impl Default for AiProviderSettings {
             voice_typing_enabled: default_voice_typing_enabled(),
             voice_typing_shortcut: default_voice_typing_shortcut(),
             voice_typing_ai_polish: default_voice_typing_polish(),
+            voice_typing_polish_mode: default_voice_typing_polish_mode(),
+            voice_typing_ollama_model: default_voice_typing_ollama_model(),
+            voice_typing_polish_style: default_voice_typing_polish_style(),
+            voice_typing_custom_prompt: String::new(),
             openai_api_key_set: false,
             anthropic_api_key_set: false,
             gemini_api_key_set: false,
@@ -718,6 +749,10 @@ pub struct DaemonTelemetry {
     pub voice_typing_shortcut: String,
     pub demo_data_present: bool,
     pub whisper_cli_detected: bool,
+    #[serde(default)]
+    pub whisper_server_detected: bool,
+    #[serde(default)]
+    pub persistent_signing_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,5 +762,9 @@ pub struct UpdateCheckResult {
     pub update_available: bool,
     pub release_url: String,
     pub release_notes: String,
+    #[serde(default)]
+    pub download_url: Option<String>,
+    #[serde(default)]
+    pub asset_name: Option<String>,
 }
 

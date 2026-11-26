@@ -24,6 +24,7 @@ import type {
   PermissionStatus,
   ProviderTestResult,
   UpdateCheckResult,
+  UpdateInstallProgressPayload,
   UserProfile,
   WhisperModelInfo,
 } from '../types';
@@ -39,6 +40,8 @@ interface SettingsViewProps {
   calendarFeeds: CalendarFeedConfig[];
   dictations: DictationEntry[];
   voiceTypingActive: boolean;
+  updateInfo: UpdateCheckResult | null;
+  updateProgress: UpdateInstallProgressPayload | null;
   onSaveProfile: (profile: UserProfile) => Promise<void>;
   onSaveAiSettings: (settings: AiProviderSettings) => Promise<void>;
   onSetApiKey: (provider: string, apiKey: string) => Promise<void>;
@@ -54,6 +57,8 @@ interface SettingsViewProps {
   onSyncCalendars: () => Promise<void>;
   onToggleAutostart: (enabled: boolean) => Promise<void>;
   onCheckUpdates: () => Promise<UpdateCheckResult>;
+  onInstallUpdate: (downloadUrl: string, assetName?: string | null) => Promise<void>;
+  onSetupPersistentSigning: () => Promise<{ ok: boolean; ready: boolean; message: string }>;
   onRequestPermission: (kind: string) => Promise<void>;
   onRefreshPermissions: () => Promise<void>;
   onClearDemoData: () => Promise<void>;
@@ -168,6 +173,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   calendarFeeds,
   dictations,
   voiceTypingActive,
+  updateInfo: externalUpdateInfo,
+  updateProgress,
   onSaveProfile,
   onSaveAiSettings,
   onSetApiKey,
@@ -183,6 +190,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onSyncCalendars,
   onToggleAutostart,
   onCheckUpdates,
+  onInstallUpdate,
+  onSetupPersistentSigning,
   onRequestPermission,
   onRefreshPermissions,
   onClearDemoData,
@@ -203,14 +212,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     aiSettings.voice_typing_shortcut || 'Alt+Shift+D',
   );
   const [vtFeedback, setVtFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [vtCustomSaved, setVtCustomSaved] = useState(false);
 
   const [feedName, setFeedName] = useState('');
   const [feedUrl, setFeedUrl] = useState('');
   const [syncingCal, setSyncingCal] = useState(false);
 
-  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [localUpdateInfo, setLocalUpdateInfo] = useState<UpdateCheckResult | null>(
+    externalUpdateInfo,
+  );
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [signingBusy, setSigningBusy] = useState(false);
+  const [signingFeedback, setSigningFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
   const [refreshingPerms, setRefreshingPerms] = useState(false);
+
+  const updateInfo = localUpdateInfo ?? externalUpdateInfo;
+
+  useEffect(() => {
+    if (externalUpdateInfo) {
+      setLocalUpdateInfo(externalUpdateInfo);
+    }
+  }, [externalUpdateInfo]);
 
   useEffect(() => {
     setAiForm(aiSettings);
@@ -547,14 +570,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <Sparkles size={15} />
                 Lokale Whisper-Modelle (Apple Metal)
               </span>
-              <span className={`pill ${telemetry.whisper_cli_detected ? 'pill-sage' : 'pill-ochre'}`}>
-                {telemetry.whisper_cli_detected ? 'whisper-cli bereit' : 'whisper-cli fehlt'}
+              <span
+                className={`pill ${
+                  telemetry.whisper_server_detected || telemetry.whisper_cli_detected
+                    ? 'pill-sage'
+                    : 'pill-ochre'
+                }`}
+              >
+                {telemetry.whisper_server_detected
+                  ? 'Warm-Server bereit (kühl)'
+                  : telemetry.whisper_cli_detected
+                    ? 'whisper-cli bereit'
+                    : 'whisper-cli fehlt'}
               </span>
             </h2>
             <p style={{ margin: 0, fontSize: 12.5, color: 'var(--text-secondary)' }}>
-              {telemetry.whisper_cli_detected
-                ? 'Lokale Apple-Silicon-Transkription ist startklar. Lade ein Modell herunter und aktiviere es für 100% lokale Meeting-Transkripte.'
-                : 'Installiere whisper-cpp (brew install whisper-cpp) oder nutze Deepgram/OpenAI/Groq unter KI-Router & API-Keys.'}
+              {telemetry.whisper_server_detected
+                ? 'Persistenter whisper-server (Apple Metal) gebündelt: Modell wird pro Meeting nur einmal geladen (statt 30×/Min) — deutlich kühler & schneller inkl. 3-stufiger Lautsprecher-Echo-Unterdrückung.'
+                : telemetry.whisper_cli_detected
+                  ? 'Lokale Apple-Silicon-Transkription ist startklar. Lade ein Modell herunter und aktiviere es für 100% lokale Meeting-Transkripte.'
+                  : 'Installiere whisper-cpp (brew install whisper-cpp) oder nutze Deepgram/OpenAI/Groq unter KI-Router & API-Keys.'}
             </p>
             {whisperModels.map((m) => {
               const isSelected = aiForm.whisper_model_id === m.id;
@@ -629,30 +664,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="transcript-meta">
                 <strong style={{ fontSize: 12.8 }}>
                   {lang === 'de'
-                    ? 'Live-STT Latenz (VAD-Pausen-Flush)'
-                    : 'Live STT Latency (VAD Pause Flush)'}
+                    ? 'Live-STT Latenz & Energiebilanz (VAD-Pausen-Flush)'
+                    : 'Live STT Latency & Thermal Balance (VAD Pause Flush)'}
                 </strong>
                 <span className="pill pill-sage">
-                  {lang === 'de' ? 'Max.' : 'Max'} {aiForm.stt_max_chunk_secs || 4}s
+                  {lang === 'de' ? 'Max.' : 'Max'} {aiForm.stt_max_chunk_secs || 5}s
                 </span>
               </div>
               <p style={{ margin: 0, fontSize: 12, color: 'var(--text-secondary)' }}>
                 {lang === 'de'
-                  ? 'backtext flusht gesprochene Sätze automatisch nach 0,7 s Sprechpause (1,5–2 s Latenz) oder spätestens nach dem gewählten Maximal-Intervall und trennt Remote-Sprecher pro Satz per 256-dim Voiceprint.'
-                  : 'backtext flushes speech automatically after a 0.7s pause (~1.5–2s latency) or at most after the selected interval, separating remote speakers per utterance via 256-dim voiceprints.'}
+                  ? 'backtext flusht gesprochene Sätze nach 0,7 s Sprechpause oder spätestens nach dem gewählten Intervall. 5 s bietet optimale Balance aus Echtzeit-Gefühl und kühler MacBook-Temperatur.'
+                  : 'backtext flushes speech after a 0.7s pause or at most after the selected interval. 5s balances responsiveness with cool MacBook thermals.'}
               </p>
               <div style={{ display: 'flex', gap: 6 }}>
-                {[3, 4, 6].map((sec) => (
+                {[4, 5, 8].map((sec) => (
                   <button
                     key={sec}
                     type="button"
                     id={`stt-chunk-btn-${sec}`}
-                    className={`mini-btn ${(aiForm.stt_max_chunk_secs || 4) === sec ? 'active-choice' : ''}`}
+                    className={`mini-btn ${(aiForm.stt_max_chunk_secs || 5) === sec ? 'active-choice' : ''}`}
                     onClick={() =>
                       onSaveAiSettings({ ...aiForm, stt_max_chunk_secs: sec })
                     }
                   >
-                    {sec}s {sec === 4 ? (lang === 'de' ? '(Empfohlen)' : '(Recommended)') : ''}
+                    {sec}s {sec === 5 ? (lang === 'de' ? '(Empfohlen)' : '(Recommended)') : ''}
                   </button>
                 ))}
               </div>
@@ -861,18 +896,186 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               )}
 
-              <label style={{ display: 'flex', gap: 9, alignItems: 'center', fontSize: 12.8, cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={aiForm.voice_typing_ai_polish !== false}
-                  onChange={(e) =>
-                    onSaveAiSettings({ ...aiForm, voice_typing_ai_polish: e.target.checked })
-                  }
-                />
-                {lang === 'de'
-                  ? 'KI-Feinschliff (Zeichensetzung, Füllwörter entfernen & Wörterbuch anwenden)'
-                  : 'AI polish (punctuation, filler removal & custom dictionary)'}
-              </label>
+              {/* Granular Voice Typing AI Polish Control (v0.6.0) */}
+              <div
+                className="transcript-row"
+                id="voice-typing-polish-controls"
+                style={{ gap: 9, background: 'var(--bg-surface-subtle)' }}
+              >
+                <div className="transcript-meta">
+                  <strong style={{ fontSize: 12.5 }}>
+                    {lang === 'de' ? 'KI-Feinschliff-Engine' : 'AI Polish Engine'}
+                  </strong>
+                  <span className="pill pill-neutral">
+                    {(aiForm.voice_typing_polish_mode || (aiForm.voice_typing_ai_polish ? 'router' : 'off')) === 'off'
+                      ? 'Nur Wörterbuch'
+                      : aiForm.voice_typing_polish_mode === 'local_ollama'
+                        ? `Lokal (${aiForm.voice_typing_ollama_model || 'qwen3:4b'})`
+                        : 'Standard KI-Router'}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {(
+                    [
+                      ['off', lang === 'de' ? 'Aus (nur Wörterbuch)' : 'Off (Dictionary only)'],
+                      ['local_ollama', lang === 'de' ? 'Lokal via Ollama (schnell & offline)' : 'Local via Ollama'],
+                      ['router', lang === 'de' ? 'Standard KI-Router' : 'Default AI Router'],
+                    ] as const
+                  ).map(([modeKey, label]) => {
+                    const currentMode =
+                      aiForm.voice_typing_polish_mode ||
+                      (aiForm.voice_typing_ai_polish === false ? 'off' : 'router');
+                    return (
+                      <button
+                        key={modeKey}
+                        type="button"
+                        id={`vt-polish-mode-${modeKey}`}
+                        className={`mini-btn ${currentMode === modeKey ? 'active-choice' : ''}`}
+                        onClick={() =>
+                          onSaveAiSettings({
+                            ...aiForm,
+                            voice_typing_ai_polish: modeKey !== 'off',
+                            voice_typing_polish_mode: modeKey,
+                          })
+                        }
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {aiForm.voice_typing_polish_mode === 'local_ollama' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <label style={{ fontSize: 12, fontWeight: 600 }}>
+                      {lang === 'de'
+                        ? 'Lokales Ollama-Modell für Diktat (leichtgewichtige 3B–4B Modelle empfohlen)'
+                        : 'Local Ollama Model for Dictation (3B–4B recommended)'}
+                      <input
+                        id="vt-ollama-model-input"
+                        className="input-field"
+                        style={{ marginTop: 4, fontFamily: 'var(--font-mono)', fontSize: 12 }}
+                        value={aiForm.voice_typing_ollama_model ?? 'qwen3:4b'}
+                        onChange={(e) =>
+                          setAiForm({ ...aiForm, voice_typing_ollama_model: e.target.value })
+                        }
+                        onBlur={() => onSaveAiSettings(aiForm)}
+                        placeholder="qwen3:4b"
+                      />
+                    </label>
+                    <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                      {Array.from(
+                        new Set([...ollamaModels.slice(0, 4), 'qwen3:4b', 'gemma3:4b', 'llama3.2:3b']),
+                      ).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          className={`mini-btn ${(aiForm.voice_typing_ollama_model ?? 'qwen3:4b') === m ? 'active-choice' : ''}`}
+                          onClick={() =>
+                            onSaveAiSettings({ ...aiForm, voice_typing_ollama_model: m })
+                          }
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {(aiForm.voice_typing_polish_mode || (aiForm.voice_typing_ai_polish === false ? 'off' : 'router')) !== 'off' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>
+                      {lang === 'de' ? 'Feinschliff-Stil' : 'Polish Style'}
+                    </div>
+                    <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                      {(
+                        [
+                          ['minimal', lang === 'de' ? 'Minimal (nur Zeichensetzung & Füllwörter)' : 'Minimal'],
+                          ['clean', lang === 'de' ? 'Klar & Professionell' : 'Clean & Pro'],
+                          ['bullets', lang === 'de' ? 'Stichpunkte' : 'Bullet Points'],
+                          ['custom', lang === 'de' ? 'Eigener Prompt' : 'Custom Prompt'],
+                        ] as const
+                      ).map(([styleKey, label]) => {
+                        const curStyle = aiForm.voice_typing_polish_style || 'minimal';
+                        return (
+                          <button
+                            key={styleKey}
+                            type="button"
+                            id={`vt-polish-style-${styleKey}`}
+                            className={`mini-btn ${curStyle === styleKey ? 'active-choice' : ''}`}
+                            onClick={() =>
+                              onSaveAiSettings({ ...aiForm, voice_typing_polish_style: styleKey })
+                            }
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {aiForm.voice_typing_polish_style === 'custom' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <textarea
+                          id="vt-custom-prompt-input"
+                          className="textarea-field"
+                          rows={3}
+                          style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}
+                          value={aiForm.voice_typing_custom_prompt ?? ''}
+                          onChange={(e) =>
+                            setAiForm({ ...aiForm, voice_typing_custom_prompt: e.target.value })
+                          }
+                          placeholder={
+                            lang === 'de'
+                              ? 'z. B. Formuliere das Diktat als kurze, freundliche Slack-Nachricht auf Deutsch ohne Füllwörter.'
+                              : 'e.g. Rewrite as a concise Slack message without fillers.'
+                          }
+                        />
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <button
+                            type="button"
+                            id="save-vt-custom-prompt-btn"
+                            className="mini-btn active-choice"
+                            onClick={async () => {
+                              await onSaveAiSettings(aiForm);
+                              setVtCustomSaved(true);
+                              window.setTimeout(() => setVtCustomSaved(false), 1800);
+                            }}
+                          >
+                            {lang === 'de' ? 'Prompt speichern' : 'Save Prompt'}
+                          </button>
+                          {vtCustomSaved && <span className="pill pill-sage">Gespeichert</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {!permissions.accessibility_granted && (
+                <div
+                  className="transcript-row"
+                  style={{
+                    flexDirection: 'row',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    background: 'var(--accent-ochre-soft)',
+                  }}
+                >
+                  <span style={{ fontSize: 12 }}>
+                    {lang === 'de'
+                      ? 'Für automatisches Einfügen in Word, Safari & externe Apps wird „Bedienungshilfen“ benötigt (In-Process ⌘V).'
+                      : 'Accessibility permission is required to auto-paste into Word, Safari & external apps.'}
+                  </span>
+                  <button
+                    type="button"
+                    className="mini-btn active-choice"
+                    onClick={() => onRequestPermission('accessibility')}
+                  >
+                    Freigeben
+                  </button>
+                </div>
+              )}
 
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
@@ -1017,7 +1220,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       )}
 
-      {/* TAB 4: System, Permissions & Updates */}
+      {/* TAB 4: System, Permissions & 1-Click In-App Updater */}
       {activeTab === 'system' && (
         <div className="two-col-grid">
           <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 11 }}>
@@ -1047,7 +1250,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             {(
               [
-                ['accessibility', 'Bedienungshilfen (Fenstertitel & Text)', permissions.accessibility_granted],
+                ['accessibility', 'Bedienungshilfen (Fenstertitel, Text & Voice-Paste)', permissions.accessibility_granted],
                 ['screen', 'Bildschirmaufnahme (System-Audio & OCR)', permissions.screen_capture_granted],
                 ['microphone', 'Mikrofon (Eigene Stimme im Meeting)', permissions.microphone_granted],
                 ['calendar', 'Kalender (EventKit Termin-Abgleich)', permissions.calendar_granted],
@@ -1078,18 +1281,79 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             ))}
 
-            <p style={{ margin: 0, fontSize: 12, color: 'var(--text-tertiary)' }}>
-              Hinweis nach einem App-Update (ad-hoc signiert): Falls eine bereits aktivierte Berechtigung als „Ausstehend“ erscheint, entferne backtext in den macOS Systemeinstellungen kurz mit „−“ und füge es mit „+“ erneut hinzu.
-            </p>
+            {/* Persistent Local Code-Signing Card (Preserves macOS TCC permissions across all future updates!) */}
+            <div
+              className="transcript-row"
+              id="persistent-signing-card"
+              style={{ marginTop: 4, gap: 8, background: 'var(--bg-surface-subtle)' }}
+            >
+              <div className="transcript-meta">
+                <strong style={{ fontSize: 12.8 }}>
+                  Dauerhafte Berechtigungen bei Updates (Lokale Signatur)
+                </strong>
+                <span
+                  className={`pill ${telemetry.persistent_signing_ready ? 'pill-sage' : 'pill-ochre'}`}
+                >
+                  {telemetry.persistent_signing_ready
+                    ? 'Zertifikat aktiv'
+                    : 'Noch nicht eingerichtet'}
+                </span>
+              </div>
+              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-secondary)' }}>
+                {telemetry.persistent_signing_ready
+                  ? 'Das lokale Code-Signing-Zertifikat „backtext Local Signer“ ist im macOS-Schlüsselbund aktiv. Künftige In-App-Updates behalten automatisch alle Berechtigungen (Bedienungshilfen, Bildschirmaufnahme, Mikrofon).'
+                  : 'Erstelle einmalig ein lokales Code-Signing-Zertifikat („backtext Local Signer“) in deinem macOS-Schlüsselbund. Künftige In-App-Updates signieren damit automatisch — du musst Berechtigungen danach nie wieder neu erteilen!'}
+              </p>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  id="setup-persistent-signing-btn"
+                  className="btn"
+                  disabled={signingBusy}
+                  onClick={async () => {
+                    setSigningBusy(true);
+                    setSigningFeedback(null);
+                    try {
+                      const res = await onSetupPersistentSigning();
+                      setSigningFeedback({ ok: res.ok, msg: res.message });
+                    } catch (err) {
+                      setSigningFeedback({
+                        ok: false,
+                        msg: err instanceof Error ? err.message : String(err),
+                      });
+                    } finally {
+                      setSigningBusy(false);
+                    }
+                  }}
+                >
+                  <ShieldCheck size={13} />
+                  {signingBusy
+                    ? 'Richte ein…'
+                    : telemetry.persistent_signing_ready
+                      ? 'App jetzt neu signieren'
+                      : 'Lokales Signatur-Zertifikat einrichten'}
+                </button>
+              </div>
+              {signingFeedback && (
+                <div
+                  className="mono-ts"
+                  style={{
+                    color: signingFeedback.ok ? 'var(--accent-sage)' : 'var(--accent-terracotta)',
+                  }}
+                >
+                  {signingFeedback.msg}
+                </div>
+              )}
+            </div>
           </section>
 
           <section className="surface-sheet" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <h2 className="section-heading">
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                 <Lock size={15} />
-                Sicherheit, Autostart & Updates
+                Sicherheit, Autostart & In-App-Updates
               </span>
-              <span className="pill pill-sage">v0.5.0</span>
+              <span className="pill pill-sage">v0.6.0</span>
             </h2>
 
             <div className="transcript-row">
@@ -1124,31 +1388,97 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               />
             </label>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <button
-                type="button"
-                id="check-updates-btn"
-                className="btn"
-                disabled={checkingUpdate}
-                onClick={async () => {
-                  setCheckingUpdate(true);
-                  try {
-                    const res = await onCheckUpdates();
-                    setUpdateInfo(res);
-                  } finally {
-                    setCheckingUpdate(false);
-                  }
-                }}
-              >
-                <RefreshCw size={13} />
-                {checkingUpdate ? 'Prüfe Releases…' : 'Nach Updates suchen'}
-              </button>
-              {updateInfo && (
-                <span className={`pill ${updateInfo.update_available ? 'pill-terracotta' : 'pill-sage'}`}>
-                  {updateInfo.update_available
-                    ? `Update v${updateInfo.latest_version} verfügbar`
-                    : `Aktuell (v${updateInfo.current_version})`}
-                </span>
+            {/* 1-Click In-App Auto-Updater Card */}
+            <div
+              className="transcript-row"
+              id="in-app-updater-card"
+              style={{ gap: 9, background: 'var(--bg-surface-subtle)' }}
+            >
+              <div className="transcript-meta">
+                <strong style={{ fontSize: 12.8 }}>In-App Auto-Updater (GitHub Releases)</strong>
+                {updateInfo && (
+                  <span
+                    className={`pill ${updateInfo.update_available ? 'pill-terracotta' : 'pill-sage'}`}
+                  >
+                    {updateInfo.update_available
+                      ? `Neu: v${updateInfo.latest_version}`
+                      : `Aktuell (v${updateInfo.current_version})`}
+                  </span>
+                )}
+              </div>
+              <p style={{ margin: 0, fontSize: 12, color: 'var(--text-secondary)' }}>
+                Lädt neue macOS-Versionen direkt herunter, entfernt das Quarantine-Flag, signiert mit deinem lokalen Zertifikat, aktualisiert <code>/Applications/backtext.app</code> und startet automatisch neu.
+              </p>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  id="check-updates-btn"
+                  className="btn"
+                  disabled={checkingUpdate || installingUpdate}
+                  onClick={async () => {
+                    setCheckingUpdate(true);
+                    try {
+                      const res = await onCheckUpdates();
+                      setLocalUpdateInfo(res);
+                    } finally {
+                      setCheckingUpdate(false);
+                    }
+                  }}
+                >
+                  <RefreshCw size={13} />
+                  {checkingUpdate ? 'Prüfe Releases…' : 'Nach Updates suchen'}
+                </button>
+
+                {updateInfo?.update_available && updateInfo.download_url && (
+                  <button
+                    type="button"
+                    id="install-update-btn"
+                    className="btn btn-primary"
+                    disabled={installingUpdate}
+                    onClick={async () => {
+                      if (!updateInfo.download_url) return;
+                      setInstallingUpdate(true);
+                      try {
+                        await onInstallUpdate(updateInfo.download_url, updateInfo.asset_name);
+                      } finally {
+                        setInstallingUpdate(false);
+                      }
+                    }}
+                  >
+                    <Download size={13} />
+                    {installingUpdate
+                      ? 'Installiere Update…'
+                      : `v${updateInfo.latest_version} jetzt installieren & neu starten`}
+                  </button>
+                )}
+              </div>
+
+              {updateProgress && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <div className="update-progress-track">
+                    <div
+                      className="update-progress-fill"
+                      style={{ width: `${Math.min(100, Math.max(4, updateProgress.progress_pct))}%` }}
+                    />
+                  </div>
+                  <div
+                    className="mono-ts"
+                    style={{
+                      color: updateProgress.error
+                        ? 'var(--accent-terracotta)'
+                        : 'var(--accent-sage)',
+                    }}
+                  >
+                    {updateProgress.progress_pct}% · {updateProgress.message}
+                  </div>
+                </div>
+              )}
+
+              {updateInfo && updateInfo.release_notes && !updateProgress && (
+                <div style={{ fontSize: 11.8, color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap' }}>
+                  {updateInfo.release_notes.slice(0, 260)}
+                </div>
               )}
             </div>
 

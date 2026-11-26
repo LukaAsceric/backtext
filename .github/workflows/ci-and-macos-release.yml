@@ -47,7 +47,7 @@ jobs:
         run: cargo test --workspace
 
   build-macos-bundle:
-    name: Build Signed Apple Silicon (M1–M5) v0.4.0 .dmg & .app.zip
+    name: Build Signed Apple Silicon (M1–M5) v0.6.0 .dmg & .app.zip
     runs-on: macos-15
     needs: verify-rust-and-ui
     steps:
@@ -73,7 +73,7 @@ jobs:
           pnpm install
           pnpm run build
 
-      - name: Compile Native Swift macOS Sensor (ScreenCaptureKit Stream, Vision OCR, AX, EventKit)
+      - name: Compile Native Swift macOS Sensor (ScreenCaptureKit Stream, Hardware AEC, Vision OCR, AX, EventKit)
         run: |
           mkdir -p macos-sensor/build
           swiftc -O \
@@ -83,6 +83,7 @@ jobs:
             -framework ApplicationServices \
             -framework CoreGraphics \
             -framework CoreAudio \
+            -framework CoreMedia \
             -framework AVFoundation \
             -framework Vision \
             -framework EventKit \
@@ -92,7 +93,7 @@ jobs:
           file macos-sensor/build/backtext-macos-sensor
           ./macos-sensor/build/backtext-macos-sensor permissions
 
-      - name: Build Self-Contained Apple Silicon Metal whisper-cli (Static, Embedded Metal)
+      - name: Build Self-Contained Apple Silicon Metal whisper-cli & whisper-server (Static, Embedded Metal)
         run: |
           git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp
           cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
@@ -103,51 +104,60 @@ jobs:
             -DGGML_METAL=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_EXAMPLES=ON
-          cmake --build /tmp/whisper.cpp/build --target whisper-cli -j
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON
+          cmake --build /tmp/whisper.cpp/build --target whisper-cli whisper-server -j
           mkdir -p macos-sensor/build
           cp /tmp/whisper.cpp/build/bin/whisper-cli macos-sensor/build/whisper-cli
-          chmod 755 macos-sensor/build/whisper-cli
-          file macos-sensor/build/whisper-cli
+          cp /tmp/whisper.cpp/build/bin/whisper-server macos-sensor/build/whisper-server
+          chmod 755 macos-sensor/build/whisper-cli macos-sensor/build/whisper-server
+          file macos-sensor/build/whisper-cli macos-sensor/build/whisper-server
           otool -L macos-sensor/build/whisper-cli
+          otool -L macos-sensor/build/whisper-server
           ./macos-sensor/build/whisper-cli --help | head -n 5
+          ./macos-sensor/build/whisper-server --help | head -n 5
 
       - name: Build Apple Silicon (arm64) backtext-mcp & Tauri .app bundle
         run: |
           cargo build --release --target aarch64-apple-darwin -p backtext-mcp --bin backtext-mcp
           pnpm tauri build --target aarch64-apple-darwin --bundles app
 
-      - name: Bundle macOS Helpers + Metal whisper-cli, Deep Sign & Smoke-Test on Apple Silicon
+      - name: Bundle macOS Helpers + Metal whisper-cli & whisper-server, Deep Sign & Smoke-Test on Apple Silicon
         run: |
           APP_DIR="target/aarch64-apple-darwin/release/bundle/macos/backtext.app"
           MCP_BIN="target/aarch64-apple-darwin/release/backtext-mcp"
           SENSOR_BIN="macos-sensor/build/backtext-macos-sensor"
           WHISPER_BIN="macos-sensor/build/whisper-cli"
+          WHISPER_SRV="macos-sensor/build/whisper-server"
 
           cp "$MCP_BIN" "$APP_DIR/Contents/MacOS/backtext-mcp"
           cp "$SENSOR_BIN" "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
           cp "$WHISPER_BIN" "$APP_DIR/Contents/MacOS/whisper-cli"
+          cp "$WHISPER_SRV" "$APP_DIR/Contents/MacOS/whisper-server"
           chmod 755 \
             "$APP_DIR/Contents/MacOS/backtext-desktop" \
             "$APP_DIR/Contents/MacOS/backtext-mcp" \
             "$APP_DIR/Contents/MacOS/backtext-macos-sensor" \
-            "$APP_DIR/Contents/MacOS/whisper-cli"
+            "$APP_DIR/Contents/MacOS/whisper-cli" \
+            "$APP_DIR/Contents/MacOS/whisper-server"
 
           echo "=== Verifying arm64 Mach-O architectures ==="
           file "$APP_DIR/Contents/MacOS/backtext-desktop"
           file "$APP_DIR/Contents/MacOS/backtext-mcp"
           file "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
           file "$APP_DIR/Contents/MacOS/whisper-cli"
+          file "$APP_DIR/Contents/MacOS/whisper-server"
 
           echo "=== Applying deep ad-hoc code signature for Apple Silicon AMFI ==="
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-mcp"
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-macos-sensor"
           codesign --force --sign - "$APP_DIR/Contents/MacOS/whisper-cli"
+          codesign --force --sign - "$APP_DIR/Contents/MacOS/whisper-server"
           codesign --force --sign - "$APP_DIR/Contents/MacOS/backtext-desktop"
           codesign --force --deep --sign - "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
-          echo "=== Smoke-testing live app startup, SQLCipher encryption & bundled whisper-cli on arm64 ==="
+          echo "=== Smoke-testing live app startup, SQLCipher encryption & bundled Metal whisper-server on arm64 ==="
           CI=true "$APP_DIR/Contents/MacOS/backtext-desktop" &
           APP_PID=$!
           HEALTH_OK=0
@@ -158,7 +168,8 @@ jobs:
               TEL=$(curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:39421/api/invoke/get_daemon_telemetry)
               echo "Telemetry: $TEL"
               echo "$TEL" | grep -q '"whisper_cli_detected":true'
-              echo "macOS arm64 startup + SQLCipher + bundled Metal whisper-cli smoke-test PASSED!"
+              echo "$TEL" | grep -q '"whisper_server_detected":true'
+              echo "macOS arm64 startup + SQLCipher + bundled Metal whisper-server smoke-test PASSED!"
               HEALTH_OK=1
               break
             fi
@@ -191,18 +202,18 @@ jobs:
             'echo "Entferne macOS Quarantäne-Attribut für backtext.app..."' \
             'xattr -cr /Applications/backtext.app' \
             'open /Applications/backtext.app' \
-            'echo "backtext v0.5.0 wurde erfolgreich gestartet!"' \
+            'echo "backtext v0.6.0 wurde erfolgreich gestartet!"' \
             > "$HELPER"
           chmod 755 "$HELPER"
 
           hdiutil create -volname "backtext" \
             -srcfolder dist-macos/dmg-staging \
             -ov -format UDZO \
-            dist-macos/backtext_0.5.0_macos_arm64.dmg
+            dist-macos/backtext_0.6.0_macos_arm64.dmg
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$APP_DIR" \
-            dist-macos/backtext_0.5.0_macos_arm64.app.zip
+            dist-macos/backtext_0.6.0_macos_arm64.app.zip
 
           cp target/aarch64-apple-darwin/release/backtext-mcp dist-macos/backtext-mcp-macos-arm64
           chmod 755 dist-macos/backtext-mcp-macos-arm64
@@ -210,47 +221,48 @@ jobs:
       - name: Upload macOS Apple Silicon Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtext-macos-apple-silicon-arm64-v0.5.0
+          name: backtext-macos-apple-silicon-arm64-v0.6.0
           path: |
-            dist-macos/backtext_0.5.0_macos_arm64.dmg
-            dist-macos/backtext_0.5.0_macos_arm64.app.zip
+            dist-macos/backtext_0.6.0_macos_arm64.dmg
+            dist-macos/backtext_0.6.0_macos_arm64.app.zip
             dist-macos/backtext-mcp-macos-arm64
 
-      - name: Publish / Update GitHub Release v0.5.0
+      - name: Publish / Update GitHub Release v0.6.0
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NOTES=$(printf '%s\n' \
-            '## backtext v0.5.0 — Granola Parity Wave: Templates, Folders, Multi-Meeting Chat, Low-Latency STT & Voice Typing (`arm64` · M1–M5 Pro/Max)' \
+            '## backtext v0.6.0 — Kühles MacBook (Warm-Whisper-Server), 3-Stufen-Echo-Filter, 1-Klick In-App-Updater, Globaler Diktat-HUD & Fokus-Modus (`arm64` · M1–M5 Pro/Max)' \
             '' \
-            '### Neu in v0.5.0' \
-            '- **1.1 Custom Meeting-Templates & 1-Klick-Neu-Generierung:** 7 integrierte Templates (*Allgemein*, *Architektur & Technik*, *1:1 Check-in*, *Sales Discovery*, *User Interview*, *Standup*, *Recruiting*) plus eigenes Template-Studio (Erstellen, Bearbeiten, Löschen) und direkter Template-Wechsel inkl. sofortiger Neu-Synthese in den *KI-Notizen*.' \
-            '- **1.2 Direkt editierbare `KI-Notizen` & Umschreiben per Chat:** Markdown-Direktbearbeitung mit Auto-Save in *KI-Notizen*, Vergleichsansicht für eigene Stichpunkte, direktes Umschreiben per `/rewrite …` im Meeting-Chat sowie 1-Klick-Button **„In KI-Notizen“** an jeder KI-Antwort.' \
-            '- **1.3 Ordner & Scoped Multi-Meeting-Chat:** Farbcodierte Meeting-Ordner mit Filter-Pills, Mehrfachauswahl in der Meeting-Liste (Sammel-Zuordnung & *Mit X Meetings chatten*), *Ordner-Chat* sowie 1-Klick-Chat über alle Meetings einer Person unter *Personen & Stimmen* — inklusive klickbarer Meeting-Quellen-Pills.' \
-            '- **1.5 Low-Latency Streaming-STT & Multi-Speaker Remote-Diarisierung:** VAD-Pausen-Erkennung im macOS Audio-Sensor flusht gesprochene Sätze automatisch nach 0,7 s Pause (~1,5–2 s Latenz statt 8 s) und extrahiert pro einzelner Äußerung einen eigenen 256-dim Voiceprint zur zuverlässigen Sprechertrennung auf System-Audio.' \
-            '- **2.7 Systemweites Voice Typing & Chat-Mikrofon:** Globaler Shortcut (`⌥⇧ D`, konfigurierbar in *Einstellungen → Shortcuts, Voice & Kalender*) diktiert in jeder macOS-App mit Fachwörterbuch + KI-Feinschliff und fügt direkt am Cursor ein (inkl. Zwischenablage-Wiederherstellung & Diktat-Verlauf); zusätzlich Mikrofon-Diktier-Button direkt im KI-Chat.' \
-            '- **2.9 Suche, Chronologische Gruppierung & Serien-Verknüpfung:** Live-Suche in der Meeting-Sidebar, automatische Gruppierung (*Live*, *Heute*, *Gestern*, *Diese Woche*, *Älter*), Kontext-Karte *„Vorheriges Meeting dieser Serie“* und 1-Klick-Regel *„Serie automatisch in Ordner legen“*.' \
+            '### Neu in v0.6.0' \
+            '- **1-Klick In-App Auto-Updater & Dauerhafte macOS-Berechtigungen:** Unter *Einstellungen → System & Updates* lädt backtext neue Releases direkt von GitHub herunter, entfernt automatisch das Quarantine-Flag, signiert mit deinem einmalig lokal angelegten Zertifikat (`backtext Local Signer` im Login-Schlüsselbund — damit bleiben *Bedienungshilfen*, *Bildschirmaufnahme* & *Mikrofon* über alle künftigen Updates hinweg erhalten!), aktualisiert `/Applications/backtext.app` und startet neu.' \
+            '- **MacBook bleibt bei Meetings deutlich kühler (~85–90 % weniger GPU-/CPU-Last):** Gebündelter persistenter `whisper-server` (Apple Metal, `-t 4`) lädt das Whisper-Modell nur noch **1× pro Meeting** statt bis zu 30×/Min neu; ScreenCaptureKit Video-Stream auf 0,2 FPS gedrosselt; Hintergrund-Daemon pausiert während laufender Meetings unnötige EventKit-/Browser-Polls.' \
+            '- **3-stufige Lautsprecher-Echo-Unterdrückung (kein falsches „Ich“ mehr):** Hardware Voice-Processing AEC im macOS-Audio-Sensor + Dual-Channel-Echo-Gate vor Whisper + Post-STT Text-Deduplizierung verhindern zuverlässig, dass System-Audio aus den MacBook-Lautsprechern als eigenes Mikrofon transkribiert wird.' \
+            '- **Kompakteres „Allgemeines Meeting“ & eigenes Templates Studio:** Das Standard-Template liefert jetzt prägnante, kurze Zusammenfassungen (max. 150–220 Wörter). Alle Templates (inkl. eingebauter Vorlagen) sind jetzt unter **Recipes & Templates → Meeting-Templates** frei bearbeitbar, als Standard festlegbar und jederzeit zurücksetzbar.' \
+            '- **Globaler Diktat-HUD & Fix für Word / Safari:** Neues transparentes, nicht-fokussierendes Floating-HUD schwebt beim Diktieren systemweit über jeder macOS-App. Das Einfügen (`⌘V`) läuft jetzt direkt im Hauptprozess (`backtext-desktop` CoreGraphics FFI) mit 450 ms Pasteboard-Puffer — damit klappt Voice Typing zuverlässig in Microsoft Word, Safari und Electron-Apps.' \
+            '- **Volle Kontrolle über Diktat-KI-Feinschliff:** Unter *Einstellungen → Shortcuts, Voice & Kalender* jetzt wählbar zwischen **Aus (nur Wörterbuch)**, **Lokal via Ollama** (z. B. `qwen3:4b`, `gemma3:4b`, `llama3.2:3b`) und **Standard KI-Router** sowie Stil-Auswahl (*Minimal*, *Klar & Professionell*, *Stichpunkte*, *Eigener Prompt*).' \
+            '- **Half-Screen Layout Fix & Meeting-Fokus-Modus:** Horizontales Layout mit kompakter Icon-Rail (58 px) und Slide-Over-Meeting-Drawer bei halber Bildschirmbreite. Beim Start eines Live-Meetings werden Hauptmenü und Meeting-Liste automatisch für maximale Konzentration eingeklappt (1-Klick-Button „Fokus“).' \
             '' \
-            '### Installation / Update auf macOS (M1–M5 Pro)' \
-            '1. Lade **`backtext_0.5.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
+            '### Erstmalige Installation von v0.6.0 (danach Updates direkt in der App!)' \
+            '1. Lade **`backtext_0.6.0_macos_arm64.dmg`** herunter und ziehe `backtext.app` nach `/Applications`.' \
             '2. Entferne einmalig die Browser-Quarantäne im Terminal:' \
             '```bash' \
             'xattr -cr /Applications/backtext.app && open /Applications/backtext.app' \
             '```' \
-            '3. Falls du von `v0.4.0` updatest: In macOS *Systemeinstellungen → Datenschutz → Bedienungshilfen / Bildschirmaufnahme* `backtext` ggf. einmal aus- und wieder einschalten (wegen ad-hoc Signatur-Wechsel).')
-          if gh release view v0.5.0 >/dev/null 2>&1; then
-            gh release upload v0.5.0 \
-              dist-macos/backtext_0.5.0_macos_arm64.dmg \
-              dist-macos/backtext_0.5.0_macos_arm64.app.zip \
+            '3. Öffne in backtext *Einstellungen → System & Updates* und klicke einmalig auf **„Lokales Signatur-Zertifikat einrichten“** — ab dem nächsten Release laufen Updates komplett mit 1 Klick in der App ohne Verlust von macOS-Berechtigungen.')
+          if gh release view v0.6.0 >/dev/null 2>&1; then
+            gh release upload v0.6.0 \
+              dist-macos/backtext_0.6.0_macos_arm64.dmg \
+              dist-macos/backtext_0.6.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
               --clobber
-            gh release edit v0.5.0 --notes "$NOTES"
+            gh release edit v0.6.0 --notes "$NOTES"
           else
-            gh release create v0.5.0 \
-              dist-macos/backtext_0.5.0_macos_arm64.dmg \
-              dist-macos/backtext_0.5.0_macos_arm64.app.zip \
+            gh release create v0.6.0 \
+              dist-macos/backtext_0.6.0_macos_arm64.dmg \
+              dist-macos/backtext_0.6.0_macos_arm64.app.zip \
               dist-macos/backtext-mcp-macos-arm64 \
-              --title "backtext v0.5.0 — Templates, Folders, Multi-Meeting Chat, Low-Latency STT & Voice Typing" \
+              --title "backtext v0.6.0 — Warm-Whisper-Server, Echo-Filter, 1-Klick-Updater, Globaler Diktat-HUD & Fokus-Modus" \
               --notes "$NOTES"
           fi

@@ -3,6 +3,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import CoreAudio
+import CoreMedia
 import AVFoundation
 import Vision
 import EventKit
@@ -636,29 +637,46 @@ func computeRmsNormalized(_ samples: [Int16]) -> Double {
 }
 
 final class ContinuousMicRecorder {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private let lock = NSLock()
     private var buffer: [Int16] = []
     private var latestRms: Double = 0.0
     private(set) var isRunning: Bool = false
     private(set) var errorMessage: String? = nil
 
-    func start() {
+    func start(enableVoiceProcessing: Bool = false) {
         let auth = AVCaptureDevice.authorizationStatus(for: .audio)
         if auth == .denied || auth == .restricted {
             errorMessage = "Mikrofon-Berechtigung in macOS Systemeinstellungen nicht erteilt."
             return
         }
+        if enableVoiceProcessing {
+            if startInternal(voiceProcessing: true) {
+                return
+            }
+            // Safe fallback if the active audio interface/Bluetooth device does not support Voice Processing AEC
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            engine = AVAudioEngine()
+            errorMessage = nil
+        }
+        _ = startInternal(voiceProcessing: false)
+    }
+
+    private func startInternal(voiceProcessing: Bool) -> Bool {
         let input = engine.inputNode
+        if voiceProcessing {
+            try? input.setVoiceProcessingEnabled(true)
+        }
         let inputFmt = input.outputFormat(forBus: 0)
         if inputFmt.sampleRate <= 0 || inputFmt.channelCount == 0 {
             errorMessage = "Kein aktives Mikrofon-Eingabegerät gefunden."
-            return
+            return false
         }
         guard let targetFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
               let converter = AVAudioConverter(from: inputFmt, to: targetFmt) else {
             errorMessage = "Audio-Konverter konnte nicht initialisiert werden."
-            return
+            return false
         }
 
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFmt) { [weak self] pcmBuf, _ in
@@ -691,9 +709,12 @@ final class ContinuousMicRecorder {
         do {
             try engine.start()
             isRunning = true
+            errorMessage = nil
+            return true
         } catch {
             errorMessage = "Mikrofon-Start fehlgeschlagen: \(error.localizedDescription)"
             isRunning = false
+            return false
         }
     }
 
@@ -793,9 +814,9 @@ final class SystemAudioCollector: NSObject, SCStreamOutput {
     }
 }
 
-func recordMicrophoneSamples(durationSecs: Double) -> [Int16] {
+func recordMicrophoneSamples(durationSecs: Double, enableVoiceProcessing: Bool = false) -> [Int16] {
     let rec = ContinuousMicRecorder()
-    rec.start()
+    rec.start(enableVoiceProcessing: enableVoiceProcessing)
     guard rec.isRunning else { return [] }
     Thread.sleep(forTimeInterval: durationSecs)
     rec.stop()
@@ -813,7 +834,7 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
 
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
-        micSamples = recordMicrophoneSamples(durationSecs: seconds)
+        micSamples = recordMicrophoneSamples(durationSecs: seconds, enableVoiceProcessing: true)
         group.leave()
     }
 
@@ -831,6 +852,9 @@ func handleRecordDualAudio(outDir: String, seconds: Double) {
                     cfg.channelCount = 1
                     cfg.width = 2
                     cfg.height = 2
+                    cfg.minimumFrameInterval = CMTime(value: 5, timescale: 1)
+                    cfg.showsCursor = false
+                    cfg.queueDepth = 3
                     let collector = SystemAudioCollector()
                     let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
                     try stream.addStreamOutput(collector, type: .audio, sampleHandlerQueue: DispatchQueue(label: "ai.backtext.sck.audio"))
@@ -899,7 +923,7 @@ func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
     sigTermSrc.resume()
 
     let micRec = ContinuousMicRecorder()
-    micRec.start()
+    micRec.start(enableVoiceProcessing: true)
 
     var sysCollector: AnyObject? = nil
     var sysStream: AnyObject? = nil
@@ -921,6 +945,9 @@ func handleStreamDualAudio(outDir: String, chunkSecs: Double) {
                         cfg.channelCount = 1
                         cfg.width = 2
                         cfg.height = 2
+                        cfg.minimumFrameInterval = CMTime(value: 5, timescale: 1)
+                        cfg.showsCursor = false
+                        cfg.queueDepth = 3
                         let collector = SystemAudioCollector()
                         let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
                         try stream.addStreamOutput(collector, type: .audio, sampleHandlerQueue: DispatchQueue(label: "ai.backtext.sck.stream"))

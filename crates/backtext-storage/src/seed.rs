@@ -13,10 +13,10 @@ pub fn builtin_meeting_templates() -> Vec<MeetingTemplate> {
             id: "general".into(),
             name_de: "Allgemeines Meeting".into(),
             name_en: "General Meeting".into(),
-            description_de: "Ausgewogene Struktur aus Kernergebnissen, Entscheidungen, Diskussion und offenen Punkten.".into(),
-            description_en: "Balanced structure of key outcomes, decisions, discussion highlights, and open items.".into(),
+            description_de: "Ultrakompakte Zusammenfassung: 2-Satz-Überblick, 3–5 knappe Kernpunkte und konkrete Entscheidungen.".into(),
+            description_en: "Ultra-compact summary: 2-sentence overview, 3–5 concise takeaways, and concrete decisions.".into(),
             icon_key: "file-text".into(),
-            sections_prompt: "Gliedere die Notizen klar in:\n### Kernergebnisse & Entscheidungen\n### Besprochene Themen\n### Offene Fragen & Risiken\n### Action Items".into(),
+            sections_prompt: "Fasse das Meeting KOMPAKT und ohne Füllsätze zusammen (max. 150–220 Wörter gesamt, keine langen Absätze, keine Wiederholungen):\n### Kurzüberblick\nMaximal 2 kurze Sätze zum Anlass und Gesamtergebnis.\n### Wichtigste Punkte\nMaximal 3–5 prägnante Einzeiler-Bullets mit [MM:SS]-Zeitstempel.\n### Entscheidungen\nNur echte Beschlüsse (kurze Bullets; Abschnitt weglassen, falls nichts beschlossen wurde).\n### Action Items\nNur verbindlich vereinbarte Aufgaben mit Owner & Frist (Abschnitt weglassen, falls keine Aufgaben vereinbart wurden).".into(),
             is_builtin: true,
             created_at: now,
         },
@@ -95,7 +95,7 @@ pub fn builtin_meeting_folders() -> Vec<MeetingFolder> {
         MeetingFolder {
             id: "fld_product".into(),
             name: "Produkt & Architektur".into(),
-            color: "sage".into(),
+            color: "#2F6B53".into(),
             description: "Technische Syncs, Architektur-Entscheidungen und Design-Reviews.".into(),
             auto_series_keys: vec![
                 "architektur sync kontexterfassung screencapturekit mcp latenz".into(),
@@ -106,7 +106,7 @@ pub fn builtin_meeting_folders() -> Vec<MeetingFolder> {
         MeetingFolder {
             id: "fld_customers".into(),
             name: "Kunden & Partner".into(),
-            color: "ochre".into(),
+            color: "#B87C2E".into(),
             description: "Discovery-Calls, Pilot-Feedback und Partner-Check-ins.".into(),
             auto_series_keys: vec![],
             meeting_count: 0,

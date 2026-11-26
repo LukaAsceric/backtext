@@ -6,8 +6,9 @@ pub use providers::{
     ProviderTestResult,
 };
 pub use stt::{
-    detect_whisper_cli_path, download_whisper_model, list_whisper_models, stt_readiness_status,
-    transcribe_wav_file, TranscribedUtterance,
+    detect_whisper_cli_path, detect_whisper_server_path, download_whisper_model,
+    list_whisper_models, stop_whisper_server, stt_readiness_status, transcribe_wav_file,
+    TranscribedUtterance,
 };
 
 use anyhow::Result;
@@ -230,10 +231,7 @@ impl HybridAiEngine {
             .unwrap_or_default();
 
         let mut md = provider_error_banner.unwrap_or_default();
-        md.push_str(&format!(
-            "*Template: **{}***\n\n",
-            template_name
-        ));
+        md.push_str(&format!("*Template: {}*\n\n", template_name));
         if !user_bullets.is_empty() {
             let first_h = template_headings.first().cloned().unwrap_or_else(|| {
                 if is_de {
@@ -446,7 +444,8 @@ impl HybridAiEngine {
     }
 
     /// Cleans up dictated voice-typing text using the user's custom dictionary,
-    /// removing filler words and applying punctuation matching `target_app`.
+    /// honoring `voice_typing_polish_mode` (`off` | `local_ollama` | `router`),
+    /// local Ollama model selection, and polish style (`minimal` | `clean` | `bullets` | `custom`).
     pub async fn polish_dictation_text(
         &self,
         storage: &StorageEngine,
@@ -461,16 +460,54 @@ impl HybridAiEngine {
         let vocab = storage.list_vocabulary()?;
         let profile = storage.get_user_profile()?;
 
-        if ai_settings.voice_typing_ai_polish {
+        let effective_mode = if !ai_settings.voice_typing_ai_polish
+            || ai_settings.voice_typing_polish_mode == "off"
+        {
+            "off"
+        } else if ai_settings.voice_typing_polish_mode == "local_ollama" {
+            "local_ollama"
+        } else {
+            "router"
+        };
+
+        if effective_mode != "off" {
             let vocab_terms: Vec<String> = vocab.iter().map(|v| v.term.clone()).collect();
+            let style_directive = match ai_settings.voice_typing_polish_style.as_str() {
+                "clean" => {
+                    "Glätte Satzbau leicht für klare, professionelle Formulierungen, entferne Füllwörter (äh, ähm, halt), korrigiere Zeichensetzung und wende das Fachwörterbuch an."
+                }
+                "bullets" => {
+                    "Formatiere das Diktat als knappe, saubere Stichpunkte (- …), entferne Füllwörter und wende das Fachwörterbuch an."
+                }
+                "custom" if !ai_settings.voice_typing_custom_prompt.trim().is_empty() => {
+                    ai_settings.voice_typing_custom_prompt.trim()
+                }
+                _ => {
+                    "Korrigiere ausschließlich Zeichensetzung, Groß-/Kleinschreibung, entferne Füllwörter (äh, ähm, halt) und wende Fachbegriffe aus dem Wörterbuch an. Verändere niemals die Wortwahl oder Bedeutung."
+                }
+            };
             let sys_prompt = format!(
-                "Du bist ein ultraschneller Diktat-Korrektor (Voice Typing). Korrigiere ausschließlich Zeichensetzung, Groß-/Kleinschreibung, entferne Füllwörter (äh, ähm, halt) und wende Fachbegriffe aus dem Wörterbuch an. Verändere niemals die Bedeutung und antworte NUR mit dem fertigen Text ohne Anführungszeichen.\nZiel-App: {target_app}\nWörterbuch: {}\nSprache: {}",
+                "Du bist ein ultraschneller Diktat-Korrektor (Voice Typing). {style_directive}\n\
+                 Antworte NUR mit dem fertigen Text ohne Anführungszeichen und ohne Erklärungen.\n\
+                 Ziel-App: {target_app}\nWörterbuch: {}\nSprache: {}",
                 vocab_terms.join(", "),
                 profile.preferred_output_language.as_code()
             );
+
+            let mut routed_settings = ai_settings.clone();
+            if effective_mode == "local_ollama" {
+                routed_settings.llm_provider = "local_ollama".to_string();
+                let m = ai_settings.voice_typing_ollama_model.trim();
+                routed_settings.llm_model = if m.is_empty() {
+                    "qwen3:4b".to_string()
+                } else {
+                    m.to_string()
+                };
+            }
+
             let outcome = providers::stream_completion(
                 &self.http,
-                &ai_settings,
+                &routed_settings,
                 storage.secrets(),
                 &sys_prompt,
                 trimmed,
@@ -478,11 +515,7 @@ impl HybridAiEngine {
             )
             .await;
             if let Some((polished, _)) = outcome.result {
-                let clean = polished
-                    .trim()
-                    .trim_matches('"')
-                    .trim()
-                    .to_string();
+                let clean = polished.trim().trim_matches('"').trim().to_string();
                 if !clean.is_empty() {
                     return Ok(clean);
                 }
@@ -500,7 +533,6 @@ impl HybridAiEngine {
         for v in &vocab {
             let low_term = v.term.to_lowercase();
             if low_term.len() >= 3 && out.to_lowercase().contains(&low_term) {
-                // Case-insensitive word replacement preserving user dictionary spelling
                 let re_pat = format!("(?i)\\b{}\\b", regex::escape(&v.term));
                 if let Ok(re) = regex::Regex::new(&re_pat) {
                     out = re.replace_all(&out, v.term.as_str()).to_string();

@@ -26,6 +26,9 @@ import {
   Repeat,
   LayoutTemplate,
   ListChecks,
+  Maximize2,
+  Minimize2,
+  RotateCcw,
 } from 'lucide-react';
 import type {
   ChatScope,
@@ -57,6 +60,7 @@ interface MeetingWorkspaceProps {
   platform: string;
   meetings: Meeting[];
   templates: MeetingTemplate[];
+  defaultTemplateId: string;
   folders: MeetingFolder[];
   persons: Person[];
   selectedDetail: MeetingDetail | null;
@@ -64,6 +68,8 @@ interface MeetingWorkspaceProps {
   recipes: Recipe[];
   streamingText?: string | null;
   busy: boolean;
+  navCollapsed: boolean;
+  onSetNavCollapsed: (collapsed: boolean) => void;
   onSelectMeeting: (id: string) => Promise<void>;
   onStartAdhocMeeting: () => Promise<void>;
   onStartScheduledMeeting: (meetingId: string) => Promise<void>;
@@ -77,6 +83,9 @@ interface MeetingWorkspaceProps {
   onSetMeetingTemplate: (meetingId: string, templateId: string, regenerate: boolean) => Promise<void>;
   onSaveTemplate: (tpl: MeetingTemplateDraft) => Promise<void>;
   onDeleteTemplate: (id: string) => Promise<void>;
+  onResetTemplate: (id: string) => Promise<void>;
+  onSetDefaultTemplate: (id: string) => Promise<void>;
+  onOpenTemplateManager: () => void;
   onSaveFolder: (folder: { id?: string; name: string; color: string; description?: string }) => Promise<void>;
   onDeleteFolder: (id: string) => Promise<void>;
   onSetMeetingFolders: (meetingId: string, folderIds: string[]) => Promise<void>;
@@ -129,6 +138,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   platform,
   meetings,
   templates,
+  defaultTemplateId,
   folders,
   persons,
   selectedDetail,
@@ -136,6 +146,8 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   recipes,
   streamingText,
   busy,
+  navCollapsed,
+  onSetNavCollapsed,
   onSelectMeeting,
   onStartAdhocMeeting,
   onStartScheduledMeeting,
@@ -149,6 +161,9 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   onSetMeetingTemplate,
   onSaveTemplate,
   onDeleteTemplate,
+  onResetTemplate,
+  onSetDefaultTemplate,
+  onOpenTemplateManager,
   onSaveFolder,
   onDeleteFolder,
   onSetMeetingFolders,
@@ -165,7 +180,12 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   const current = selectedDetail?.meeting ?? null;
   const isLive = current?.status === 'live';
 
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isNarrow, setIsNarrow] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 1060 : false,
+  );
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth > 1060 && !isLive : true,
+  );
   const [activeTab, setActiveTab] = useState<'notes' | 'enhanced' | 'transcript' | 'slides'>('notes');
   const [draftNotes, setDraftNotes] = useState('');
   const [draftEnhanced, setDraftEnhanced] = useState('');
@@ -194,7 +214,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
     name_de: '',
     description_de: '',
     sections_prompt:
-      '### Kontext & Ziel\n### Wichtigste Erkenntnisse\n### Offene Risiken\n### Action Items',
+      '### Kurzüberblick\n### Kernpunkte\n### Entscheidungen & Action Items',
   });
 
   const [renamingLabel, setRenamingLabel] = useState<string | null>(null);
@@ -207,6 +227,43 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
   const enhancedSaveTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
   const lastMeetingIdRef = useRef<string | null>(null);
+  const autoFocusedLiveIdRef = useRef<string | null>(null);
+
+  // Track narrow/half-screen viewports so the meeting list automatically becomes a slide-over drawer
+  useEffect(() => {
+    const onResize = () => {
+      const narrow = window.innerWidth <= 1060;
+      setIsNarrow((prev) => {
+        if (prev !== narrow) {
+          setSidebarOpen(!narrow && !isLive);
+        }
+        return narrow;
+      });
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [isLive]);
+
+  // Meeting Focus Mode: automatically collapse BOTH main navigation & meeting list when a live meeting starts
+  useEffect(() => {
+    if (isLive && current?.id && autoFocusedLiveIdRef.current !== current.id) {
+      autoFocusedLiveIdRef.current = current.id;
+      setSidebarOpen(false);
+      onSetNavCollapsed(true);
+    }
+  }, [isLive, current?.id, onSetNavCollapsed]);
+
+  const isFocusMode = !sidebarOpen && navCollapsed;
+
+  const toggleFocusMode = () => {
+    if (isFocusMode) {
+      onSetNavCollapsed(false);
+      setSidebarOpen(!isNarrow);
+    } else {
+      onSetNavCollapsed(true);
+      setSidebarOpen(false);
+    }
+  };
 
   // Sync editor state and pick the most helpful default tab when switching meetings
   useEffect(() => {
@@ -394,15 +451,33 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
 
   return (
     <div className="granola-shell">
-      <div className={`granola-layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+      <div
+        className={`granola-layout ${!sidebarOpen || isNarrow ? 'sidebar-collapsed' : ''}`}
+      >
+        {sidebarOpen && isNarrow && (
+          <div
+            className="granola-drawer-backdrop"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
         {/* Collapsible Meeting List with Search, Folders, Grouping & Multi-Select */}
         {sidebarOpen && (
-          <aside className="granola-list-pane">
+          <aside className={`granola-list-pane ${isNarrow ? 'overlay-drawer' : ''}`}>
             <div className="granola-list-header">
               <span style={{ fontWeight: 600, fontSize: 13 }}>
                 {lang === 'de' ? 'Meetings' : 'Meetings'}
               </span>
               <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                {isNarrow && (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    title={lang === 'de' ? 'Schließen' : 'Close'}
+                    onClick={() => setSidebarOpen(false)}
+                  >
+                    <X size={12} />
+                  </button>
+                )}
                 <button
                   type="button"
                   id="toggle-multiselect-btn"
@@ -684,6 +759,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                             toggleSelectedId(m.id);
                           } else {
                             onSelectMeeting(m.id);
+                            if (isNarrow) setSidebarOpen(false);
                           }
                         }}
                         role="button"
@@ -692,7 +768,10 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
                             if (multiSelectMode) toggleSelectedId(m.id);
-                            else onSelectMeeting(m.id);
+                            else {
+                              onSelectMeeting(m.id);
+                              if (isNarrow) setSidebarOpen(false);
+                            }
                           }
                         }}
                       >
@@ -772,16 +851,43 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
           <section className="granola-canvas">
             {/* Minimal Document Top Bar */}
             <div className="granola-topbar">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <button
                   type="button"
+                  id="toggle-meeting-list-btn"
                   className="mini-btn"
-                  title={sidebarOpen ? 'Liste ausblenden (Fokus-Modus)' : 'Liste einblenden'}
+                  title={sidebarOpen ? 'Meeting-Liste ausblenden' : 'Meeting-Liste einblenden'}
                   onClick={() => setSidebarOpen((v) => !v)}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
                 >
                   <PanelLeft size={13} />
                   {!sidebarOpen && (lang === 'de' ? 'Liste' : 'List')}
+                </button>
+
+                <button
+                  type="button"
+                  id="meeting-focus-mode-btn"
+                  className={`mini-btn ${isFocusMode ? 'active-choice' : ''}`}
+                  title={
+                    isFocusMode
+                      ? lang === 'de'
+                        ? 'Fokus-Modus beenden (Menü & Liste wieder anzeigen)'
+                        : 'Exit Focus Mode'
+                      : lang === 'de'
+                        ? 'Meeting-Fokus-Modus (Hauptmenü & Liste einklappen)'
+                        : 'Meeting Focus Mode (collapse navigation & list)'
+                  }
+                  onClick={toggleFocusMode}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                >
+                  {isFocusMode ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                  {isFocusMode
+                    ? lang === 'de'
+                      ? 'Fokus'
+                      : 'Focus'
+                    : lang === 'de'
+                      ? 'Fokus'
+                      : 'Focus'}
                 </button>
 
                 {/* Clean 4-pill view switcher */}
@@ -1672,7 +1778,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
         )}
       </div>
 
-      {/* Custom Meeting Template Studio Modal (Feature 1.1) */}
+      {/* Custom & Built-In Meeting Template Studio Modal */}
       {templateModalOpen && (
         <div
           className="hover-backdrop"
@@ -1688,15 +1794,34 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
             <div className="section-heading" style={{ marginBottom: 8 }}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                 <LayoutTemplate size={15} style={{ color: 'var(--accent-sage)' }} />
-                {lang === 'de' ? 'Custom Meeting-Templates' : 'Custom Meeting Templates'}
+                {tplDraft.id
+                  ? lang === 'de'
+                    ? `Template bearbeiten: ${tplDraft.name_de}`
+                    : `Edit Template: ${tplDraft.name_de}`
+                  : lang === 'de'
+                    ? 'Meeting-Templates verwalten'
+                    : 'Manage Meeting Templates'}
               </span>
-              <button
-                type="button"
-                className="mini-btn"
-                onClick={() => setTemplateModalOpen(false)}
-              >
-                <X size={12} />
-              </button>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button
+                  type="button"
+                  id="open-template-studio-link"
+                  className="mini-btn"
+                  onClick={() => {
+                    setTemplateModalOpen(false);
+                    onOpenTemplateManager();
+                  }}
+                >
+                  {lang === 'de' ? 'Im Studio öffnen →' : 'Open Studio →'}
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => setTemplateModalOpen(false)}
+                >
+                  <X size={12} />
+                </button>
+              </div>
             </div>
 
             <form
@@ -1709,7 +1834,7 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                   name_de: '',
                   description_de: '',
                   sections_prompt:
-                    '### Kontext & Ziel\n### Wichtigste Entscheidungen\n### Action Items',
+                    '### Kurzüberblick\n### Kernpunkte\n### Entscheidungen & Action Items',
                 });
               }}
             >
@@ -1750,15 +1875,37 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
                   onChange={(e) => setTplDraft({ ...tplDraft, sections_prompt: e.target.value })}
                 />
               </label>
-              <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button
                   type="submit"
                   id="save-custom-template-btn"
                   className="btn btn-primary"
                   disabled={!tplDraft.name_de.trim()}
                 >
-                  {lang === 'de' ? 'Template speichern' : 'Save Template'}
+                  {tplDraft.id
+                    ? lang === 'de'
+                      ? 'Änderungen speichern'
+                      : 'Save Changes'
+                    : lang === 'de'
+                      ? 'Template speichern'
+                      : 'Save Template'}
                 </button>
+                {tplDraft.id && (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() =>
+                      setTplDraft({
+                        name_de: '',
+                        description_de: '',
+                        sections_prompt:
+                          '### Kurzüberblick\n### Kernpunkte\n### Entscheidungen & Action Items',
+                      })
+                    }
+                  >
+                    {lang === 'de' ? 'Neu anlegen' : 'New Template'}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn"
@@ -1771,39 +1918,79 @@ export const MeetingWorkspace: React.FC<MeetingWorkspaceProps> = ({
 
             <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border-subtle)' }}>
               <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 6 }}>
-                {lang === 'de' ? 'Verfügbare Templates' : 'Available Templates'} ({templates.length})
+                {lang === 'de' ? 'Verfügbare Templates (alle bearbeitbar)' : 'Available Templates (all editable)'} ({templates.length})
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 170, overflowY: 'auto' }}>
-                {templates.map((tpl) => (
-                  <div
-                    key={tpl.id}
-                    className="transcript-row"
-                    style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: '7px 10px' }}
-                  >
-                    <div>
-                      <strong style={{ fontSize: 12.5 }}>
-                        {lang === 'de' ? tpl.name_de : tpl.name_en}
-                      </strong>
-                      <div style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }}>
-                        {lang === 'de' ? tpl.description_de : tpl.description_en}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflowY: 'auto' }}>
+                {templates.map((tpl) => {
+                  const isDef = defaultTemplateId === tpl.id;
+                  return (
+                    <div
+                      key={tpl.id}
+                      className="transcript-row"
+                      style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: '7px 10px' }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          <strong style={{ fontSize: 12.5 }}>
+                            {lang === 'de' ? tpl.name_de : tpl.name_en}
+                          </strong>
+                          {isDef && <span className="pill pill-sage">Standard</span>}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }}>
+                          {lang === 'de' ? tpl.description_de : tpl.description_en}
+                        </div>
                       </div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
-                      {tpl.is_builtin ? (
-                        <span className="pill pill-neutral">Standard</span>
-                      ) : (
+                      <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
                         <button
                           type="button"
                           className="mini-btn"
-                          onClick={() => onDeleteTemplate(tpl.id)}
-                          title={lang === 'de' ? 'Löschen' : 'Delete'}
+                          onClick={() =>
+                            setTplDraft({
+                              id: tpl.id,
+                              name_de: tpl.name_de,
+                              name_en: tpl.name_en,
+                              description_de: tpl.description_de,
+                              description_en: tpl.description_en,
+                              icon_key: tpl.icon_key,
+                              sections_prompt: tpl.sections_prompt,
+                            })
+                          }
+                          title={lang === 'de' ? 'Bearbeiten' : 'Edit'}
                         >
-                          <Trash2 size={11} />
+                          <Pencil size={11} />
                         </button>
-                      )}
+                        {!isDef && (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => onSetDefaultTemplate(tpl.id)}
+                          >
+                            {lang === 'de' ? 'Standard' : 'Default'}
+                          </button>
+                        )}
+                        {tpl.is_builtin ? (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => onResetTemplate(tpl.id)}
+                            title={lang === 'de' ? 'Auf Standard zurücksetzen' : 'Reset'}
+                          >
+                            <RotateCcw size={11} />
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => onDeleteTemplate(tpl.id)}
+                            title={lang === 'de' ? 'Löschen' : 'Delete'}
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>

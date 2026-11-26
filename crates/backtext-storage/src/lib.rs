@@ -170,6 +170,19 @@ impl StorageEngine {
             for tpl in seed::builtin_meeting_templates() {
                 self.upsert_meeting_template(&tpl)?;
             }
+        } else {
+            // Upgrade unmodified v0.5.0 'general' template to the compact v0.6.0 prompt
+            let legacy_general = "Gliedere die Notizen klar in:\n### Kernergebnisse & Entscheidungen\n### Besprochene Themen\n### Offene Fragen & Risiken\n### Action Items";
+            if let Some(existing_general) = self.get_meeting_template("general")? {
+                if existing_general.sections_prompt.trim() == legacy_general {
+                    if let Some(fresh) = seed::builtin_meeting_templates()
+                        .into_iter()
+                        .find(|t| t.id == "general")
+                    {
+                        self.upsert_meeting_template(&fresh)?;
+                    }
+                }
+            }
         }
 
         let has_profile: bool = {
@@ -2184,6 +2197,16 @@ impl StorageEngine {
             params![template_id],
         )?;
         Ok(affected > 0)
+    }
+
+    pub fn reset_meeting_template(&self, template_id: &str) -> Result<Vec<MeetingTemplate>> {
+        if let Some(builtin) = seed::builtin_meeting_templates()
+            .into_iter()
+            .find(|t| t.id == template_id)
+        {
+            self.upsert_meeting_template(&builtin)?;
+        }
+        self.list_meeting_templates()
     }
 
     // -------------------------------------------------------------------------

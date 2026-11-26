@@ -12,6 +12,8 @@ import {
   Moon,
   Mic,
   Square,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 import type {
   AiProviderSettings,
@@ -40,6 +42,7 @@ import type {
   ScrubberPreview,
   TranscriptSegment,
   UpdateCheckResult,
+  UpdateInstallProgressPayload,
   UserProfile,
   VocabularyEntry,
   VoiceTypingStatePayload,
@@ -63,6 +66,7 @@ import { McpAndPrivacyView } from './views/McpAndPrivacyView';
 import { PersonalizationView } from './views/PersonalizationView';
 import { SettingsView } from './views/SettingsView';
 import { HoverModal } from './components/HoverModal';
+import { DictationHud } from './components/DictationHud';
 
 type NavKey =
   | 'today'
@@ -75,13 +79,32 @@ type NavKey =
   | 'settings';
 
 export const App: React.FC = () => {
+  const winParam =
+    typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('window')
+      : null;
+
+  if (winParam === 'dictation') {
+    return <DictationHud />;
+  }
+
+  return <MainApp isHoverStandalone={winParam === 'hover'} />;
+};
+
+const MainApp: React.FC<{ isHoverStandalone: boolean }> = ({ isHoverStandalone }) => {
   const [data, setData] = useState<BootstrapPayload | null>(null);
   const [activeNav, setActiveNav] = useState<NavKey>('today');
+  const [recipesInitialTab, setRecipesInitialTab] = useState<'recipes' | 'templates'>('recipes');
+  const [navCollapsed, setNavCollapsed] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 1080 : false,
+  );
   const [selectedMeeting, setSelectedMeeting] = useState<MeetingDetail | null>(null);
   const [recordingLevel, setRecordingLevel] = useState<RecordingAudioLevel | null>(null);
   const [globalMessages, setGlobalMessages] = useState<ChatMessage[]>([]);
   const [chatScope, setChatScope] = useState<{ scope: ChatScope; label: string } | null>(null);
   const [voiceTypingState, setVoiceTypingState] = useState<VoiceTypingStatePayload | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateInstallProgressPayload | null>(null);
   const [streamingByThread, setStreamingByThread] = useState<Record<string, string>>({});
   const [hoverOpen, setHoverOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -90,14 +113,35 @@ export const App: React.FC = () => {
     (localStorage.getItem('backtext-theme') as 'light' | 'dark') || 'light',
   );
 
-  const isHoverStandalone =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('window') === 'hover';
-
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('backtext-theme', theme);
   }, [theme]);
+
+  // Auto-adapt main navigation rail on half-screen / narrow desktop windows
+  useEffect(() => {
+    let lastCompact = window.innerWidth <= 1080;
+    const onResize = () => {
+      const compact = window.innerWidth <= 1080;
+      if (compact !== lastCompact) {
+        lastCompact = compact;
+        setNavCollapsed(compact);
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Silent non-blocking check for GitHub Releases shortly after startup
+  useEffect(() => {
+    if (isHoverStandalone) return;
+    const timer = window.setTimeout(() => {
+      callRpc<UpdateCheckResult>('check_for_updates')
+        .then((res) => setUpdateInfo(res))
+        .catch(() => {});
+    }, 5500);
+    return () => window.clearTimeout(timer);
+  }, [isHoverStandalone]);
 
   const refreshPermissions = useCallback(async () => {
     try {
@@ -275,6 +319,8 @@ export const App: React.FC = () => {
           setRecordingLevel(null);
         }
         setData((prev) => (prev ? { ...prev, capture_status: nextStatus } : prev));
+      } else if (ev.event === 'update_install_progress') {
+        setUpdateProgress(ev.payload as UpdateInstallProgressPayload);
       } else if (ev.event === 'model_download_progress') {
         const p = ev.payload as {
           model_id: string;
@@ -343,6 +389,7 @@ export const App: React.FC = () => {
   const meetingStreamText = selectedMeeting
     ? (streamingByThread[`meeting:${selectedMeeting.meeting.id}`] ?? null)
     : null;
+  const defaultTemplateId = data.ai_settings.default_meeting_template_id || 'general';
 
   const handlePause = async (minutes: number | null) => {
     const next = await callRpc<CaptureStatus>('set_capture_pause', { minutes });
@@ -362,6 +409,7 @@ export const App: React.FC = () => {
       });
       setSelectedMeeting(detail);
       setActiveNav('meetings');
+      setNavCollapsed(true);
       await refreshBootstrap(detail.meeting.id);
     } finally {
       setBusy(false);
@@ -376,10 +424,23 @@ export const App: React.FC = () => {
       });
       setSelectedMeeting(detail);
       setActiveNav('meetings');
+      setNavCollapsed(true);
       await refreshBootstrap(detail.meeting.id);
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleSetDefaultTemplate = async (templateId: string) => {
+    const ai_settings = await callRpc<AiProviderSettings>('save_ai_settings', {
+      settings: { ...data.ai_settings, default_meeting_template_id: templateId },
+    });
+    setData((prev) => (prev ? { ...prev, ai_settings } : prev));
+  };
+
+  const handleResetTemplate = async (id: string) => {
+    const templates = await callRpc<MeetingTemplate[]>('reset_meeting_template', { id });
+    setData((prev) => (prev ? { ...prev, templates } : prev));
   };
 
   const handleRunGlobalChat = async (input: string, recipeSlug?: string) => {
@@ -450,24 +511,69 @@ export const App: React.FC = () => {
   }
 
   return (
-    <div className="app-shell">
-      {/* Left Navigation Rail */}
-      <aside className="sidebar">
+    <div className={`app-shell ${navCollapsed ? 'nav-collapsed' : ''}`}>
+      {/* Left Navigation Rail (Collapsible to 58px Icon-Rail on Half-Screen & Live Meetings) */}
+      <aside className={`sidebar ${navCollapsed ? 'collapsed' : ''}`}>
         <div className="brand-row">
-          <div className="brand-mark">
+          <div className="brand-mark" title="backtext">
             <span className="brand-glyph">bt</span>
-            <span>backtext</span>
+            <span className="brand-text">backtext</span>
           </div>
-          <button
-            type="button"
-            id="theme-toggle-btn"
-            className="mini-btn"
-            onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
-            title="Theme wechseln"
-          >
-            {theme === 'light' ? <Moon size={12} /> : <Sun size={12} />}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <button
+              type="button"
+              id="toggle-main-sidebar-btn"
+              className="mini-btn"
+              onClick={() => setNavCollapsed((v) => !v)}
+              title={
+                navCollapsed
+                  ? lang === 'de'
+                    ? 'Hauptmenü ausklappen'
+                    : 'Expand sidebar'
+                  : lang === 'de'
+                    ? 'Hauptmenü einklappen'
+                    : 'Collapse sidebar'
+              }
+            >
+              {navCollapsed ? <PanelLeftOpen size={12} /> : <PanelLeftClose size={12} />}
+            </button>
+            {!navCollapsed && (
+              <button
+                type="button"
+                id="theme-toggle-btn"
+                className="mini-btn"
+                onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
+                title="Theme wechseln"
+              >
+                {theme === 'light' ? <Moon size={12} /> : <Sun size={12} />}
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Compact Status Dot when Sidebar is Collapsed to Icon-Rail */}
+        <button
+          type="button"
+          className="sidebar-collapsed-status"
+          onClick={() => setNavCollapsed(false)}
+          title={
+            status.mode === 'recording_meeting'
+              ? `${t(lang, 'statusRecording')} — Klicken zum Aufklappen`
+              : status.mode === 'paused'
+                ? `${t(lang, 'statusPaused')} — Klicken zum Aufklappen`
+                : `${t(lang, 'statusActive')} (MCP :${data.mcp_policy.http_port})`
+          }
+        >
+          <span
+            className={`status-dot ${
+              status.mode === 'recording_meeting'
+                ? 'recording'
+                : status.mode === 'paused'
+                  ? 'paused'
+                  : 'active'
+            }`}
+          />
+        </button>
 
         {/* Littlebird-inspired Live Context & Pause Control Pill */}
         <div className="status-box">
@@ -524,24 +630,26 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-today"
+            title={t(lang, 'today')}
             className={`nav-item ${activeNav === 'today' ? 'selected' : ''}`}
             onClick={() => setActiveNav('today')}
           >
             <span className="nav-item-left">
               <Calendar size={15} />
-              {t(lang, 'today')}
+              <span className="nav-label-text">{t(lang, 'today')}</span>
             </span>
           </button>
 
           <button
             type="button"
             id="nav-meetings"
+            title={t(lang, 'meetings')}
             className={`nav-item ${activeNav === 'meetings' ? 'selected' : ''}`}
             onClick={() => setActiveNav('meetings')}
           >
             <span className="nav-item-left">
               <FileText size={15} />
-              {t(lang, 'meetings')}
+              <span className="nav-label-text">{t(lang, 'meetings')}</span>
             </span>
             <span className="nav-badge">{data.meetings.length}</span>
           </button>
@@ -549,12 +657,13 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-context"
+            title={t(lang, 'context')}
             className={`nav-item ${activeNav === 'context' ? 'selected' : ''}`}
             onClick={() => setActiveNav('context')}
           >
             <span className="nav-item-left">
               <Layers size={15} />
-              {t(lang, 'context')}
+              <span className="nav-label-text">{t(lang, 'context')}</span>
             </span>
             <span className="nav-badge">{data.episodes.length}</span>
           </button>
@@ -562,12 +671,13 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-people"
+            title={t(lang, 'people')}
             className={`nav-item ${activeNav === 'people' ? 'selected' : ''}`}
             onClick={() => setActiveNav('people')}
           >
             <span className="nav-item-left">
               <Users size={15} />
-              {t(lang, 'people')}
+              <span className="nav-label-text">{t(lang, 'people')}</span>
             </span>
             <span className="nav-badge">{data.persons.length}</span>
           </button>
@@ -578,25 +688,30 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-recipes"
+            title={t(lang, 'recipes')}
             className={`nav-item ${activeNav === 'recipes' ? 'selected' : ''}`}
-            onClick={() => setActiveNav('recipes')}
+            onClick={() => {
+              setRecipesInitialTab('recipes');
+              setActiveNav('recipes');
+            }}
           >
             <span className="nav-item-left">
               <Sparkles size={15} />
-              {t(lang, 'recipes')}
+              <span className="nav-label-text">{t(lang, 'recipes')}</span>
             </span>
-            <span className="nav-badge">{data.recipes.length}</span>
+            <span className="nav-badge">{data.recipes.length + (data.templates?.length ?? 0)}</span>
           </button>
 
           <button
             type="button"
             id="nav-mcp"
+            title={t(lang, 'mcpPrivacy')}
             className={`nav-item ${activeNav === 'mcp' ? 'selected' : ''}`}
             onClick={() => setActiveNav('mcp')}
           >
             <span className="nav-item-left">
               <ShieldCheck size={15} />
-              {t(lang, 'mcpPrivacy')}
+              <span className="nav-label-text">{t(lang, 'mcpPrivacy')}</span>
             </span>
             <span className="nav-badge">10</span>
           </button>
@@ -604,12 +719,13 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-personalization"
+            title={t(lang, 'personalization')}
             className={`nav-item ${activeNav === 'personalization' ? 'selected' : ''}`}
             onClick={() => setActiveNav('personalization')}
           >
             <span className="nav-item-left">
               <Sliders size={15} />
-              {t(lang, 'personalization')}
+              <span className="nav-label-text">{t(lang, 'personalization')}</span>
             </span>
             <span className="nav-badge">{lang.toUpperCase()}</span>
           </button>
@@ -619,13 +735,23 @@ export const App: React.FC = () => {
           <button
             type="button"
             id="nav-settings"
+            title={
+              updateInfo?.update_available
+                ? `${t(lang, 'settings')} · Update v${updateInfo.latest_version} verfügbar`
+                : t(lang, 'settings')
+            }
             className={`nav-item sidebar-settings-btn ${activeNav === 'settings' ? 'selected' : ''}`}
             onClick={() => setActiveNav('settings')}
           >
             <span className="nav-item-left">
               <Settings size={15} />
-              {t(lang, 'settings')}
+              <span className="nav-label-text">{t(lang, 'settings')}</span>
             </span>
+            {updateInfo?.update_available && (
+              <span className="nav-badge" style={{ background: 'var(--accent-sage)', color: '#fff' }}>
+                v{updateInfo.latest_version}
+              </span>
+            )}
           </button>
         </div>
       </aside>
@@ -680,6 +806,7 @@ export const App: React.FC = () => {
             platform={data.permissions.platform}
             meetings={data.meetings}
             templates={data.templates ?? []}
+            defaultTemplateId={defaultTemplateId}
             folders={data.folders ?? []}
             persons={data.persons}
             selectedDetail={selectedMeeting}
@@ -687,6 +814,8 @@ export const App: React.FC = () => {
             recipes={data.recipes}
             streamingText={meetingStreamText}
             busy={busy}
+            navCollapsed={navCollapsed}
+            onSetNavCollapsed={setNavCollapsed}
             onSelectMeeting={async (id) => {
               const detail = await callRpc<MeetingDetail | null>('get_meeting_detail', {
                 meetingId: id,
@@ -815,6 +944,12 @@ export const App: React.FC = () => {
             onDeleteTemplate={async (id) => {
               const templates = await callRpc<MeetingTemplate[]>('delete_meeting_template', { id });
               setData((prev) => (prev ? { ...prev, templates } : prev));
+            }}
+            onResetTemplate={handleResetTemplate}
+            onSetDefaultTemplate={handleSetDefaultTemplate}
+            onOpenTemplateManager={() => {
+              setRecipesInitialTab('templates');
+              setActiveNav('recipes');
             }}
             onSaveFolder={async (folder) => {
               const folders = await callRpc<MeetingFolder[]>('save_meeting_folder', { folder });
@@ -991,7 +1126,10 @@ export const App: React.FC = () => {
         {activeNav === 'recipes' && (
           <RecipesStudioView
             lang={lang}
+            initialTab={recipesInitialTab}
             recipes={data.recipes}
+            templates={data.templates ?? []}
+            defaultTemplateId={defaultTemplateId}
             onSaveRecipe={async (recipe: Recipe) => {
               const recipes = await callRpc<Recipe[]>('save_recipe', { recipe });
               setData((prev) => (prev ? { ...prev, recipes } : prev));
@@ -1004,6 +1142,18 @@ export const App: React.FC = () => {
               setActiveNav('today');
               await handleRunGlobalChat(slug, slug);
             }}
+            onSaveTemplate={async (template) => {
+              const templates = await callRpc<MeetingTemplate[]>('save_meeting_template', {
+                template,
+              });
+              setData((prev) => (prev ? { ...prev, templates } : prev));
+            }}
+            onDeleteTemplate={async (id) => {
+              const templates = await callRpc<MeetingTemplate[]>('delete_meeting_template', { id });
+              setData((prev) => (prev ? { ...prev, templates } : prev));
+            }}
+            onResetTemplate={handleResetTemplate}
+            onSetDefaultTemplate={handleSetDefaultTemplate}
           />
         )}
 
@@ -1097,6 +1247,8 @@ export const App: React.FC = () => {
             calendarFeeds={data.calendar_feeds}
             dictations={data.dictations ?? []}
             voiceTypingActive={Boolean(voiceTypingState?.active)}
+            updateInfo={updateInfo}
+            updateProgress={updateProgress}
             onSaveProfile={async (profile: UserProfile) => {
               const saved = await callRpc<UserProfile>('save_user_profile', { profile });
               setData((prev) => (prev ? { ...prev, profile: saved } : prev));
@@ -1188,7 +1340,30 @@ export const App: React.FC = () => {
                 prev ? { ...prev, telemetry: { ...prev.telemetry, autostart_enabled: active } } : prev,
               );
             }}
-            onCheckUpdates={() => callRpc<UpdateCheckResult>('check_for_updates')}
+            onCheckUpdates={async () => {
+              const res = await callRpc<UpdateCheckResult>('check_for_updates');
+              setUpdateInfo(res);
+              return res;
+            }}
+            onInstallUpdate={async (downloadUrl, assetName) => {
+              setUpdateProgress({
+                stage: 'downloading',
+                progress_pct: 2,
+                message: 'Starte Update-Download…',
+                error: null,
+              });
+              await callRpc('install_update', { downloadUrl, assetName });
+            }}
+            onSetupPersistentSigning={async () => {
+              const resp = await callRpc<{
+                result: { ok: boolean; ready: boolean; message: string };
+                telemetry: BootstrapPayload['telemetry'];
+              }>('setup_persistent_signing');
+              if (resp.telemetry) {
+                setData((prev) => (prev ? { ...prev, telemetry: resp.telemetry } : prev));
+              }
+              return resp.result;
+            }}
             onRequestPermission={async (kind) => {
               const updated = await callRpc<PermissionStatus>('request_permission', { kind });
               setData((prev) => (prev ? { ...prev, permissions: updated } : prev));

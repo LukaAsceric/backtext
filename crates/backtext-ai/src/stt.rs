@@ -4,8 +4,24 @@ use backtext_storage::secrets::{SecretVault, KEY_DEEPGRAM, KEY_GROQ, KEY_OPENAI}
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex as AsyncMutex;
+
+const WHISPER_SERVER_PORT: u16 = 39422;
+
+struct WhisperServerProc {
+    model_path: PathBuf,
+    child: Child,
+}
+
+static WHISPER_SERVER_STATE: OnceLock<AsyncMutex<Option<WhisperServerProc>>> = OnceLock::new();
+
+fn whisper_server_lock() -> &'static AsyncMutex<Option<WhisperServerProc>> {
+    WHISPER_SERVER_STATE.get_or_init(|| AsyncMutex::new(None))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscribedUtterance {
@@ -22,6 +38,38 @@ pub fn models_directory() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".backtext-data").join("models")
+}
+
+pub fn detect_whisper_server_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("whisper-server");
+            if bundled.exists() {
+                return Some(bundled);
+            }
+        }
+    }
+    let candidates = [
+        "/Applications/backtext.app/Contents/MacOS/whisper-server",
+        "/opt/homebrew/bin/whisper-server",
+        "/usr/local/bin/whisper-server",
+        "/usr/bin/whisper-server",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("whisper-server");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 pub fn detect_whisper_cli_path() -> Option<PathBuf> {
@@ -61,6 +109,86 @@ pub fn detect_whisper_cli_path() -> Option<PathBuf> {
     None
 }
 
+/// Gracefully shuts down the persistent local `whisper-server` (e.g. when a meeting finishes)
+/// so zero GPU/RAM is consumed while idle.
+pub async fn stop_whisper_server() {
+    let mut guard = whisper_server_lock().lock().await;
+    if let Some(mut proc) = guard.take() {
+        let _ = proc.child.kill().await;
+    }
+}
+
+/// Ensures `whisper-server` is running warm in Apple Metal for `model_path`.
+/// Keeps the 574MB GGML model resident across chunks instead of cold-loading 30x/minute.
+async fn ensure_whisper_server_running(
+    http: &reqwest::Client,
+    server_bin: &Path,
+    model_path: &Path,
+) -> Result<String> {
+    let mut guard = whisper_server_lock().lock().await;
+    let base_url = format!("http://127.0.0.1:{WHISPER_SERVER_PORT}");
+    let inference_url = format!("{base_url}/inference");
+
+    if let Some(ref mut proc) = *guard {
+        let alive = matches!(proc.child.try_wait(), Ok(None));
+        if alive && proc.model_path == model_path {
+            return Ok(inference_url);
+        }
+        let _ = proc.child.kill().await;
+        *guard = None;
+    }
+
+    let child = Command::new(server_bin)
+        .args([
+            "-m",
+            &model_path.display().to_string(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &WHISPER_SERVER_PORT.to_string(),
+            "-t",
+            "4",
+            "-l",
+            "auto",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    *guard = Some(WhisperServerProc {
+        model_path: model_path.to_path_buf(),
+        child,
+    });
+
+    // Wait up to 9s for Metal model load to complete
+    for _ in 0..36 {
+        if let Ok(resp) = http
+            .get(&base_url)
+            .timeout(std::time::Duration::from_millis(450))
+            .send()
+            .await
+        {
+            if resp.status().as_u16() < 500 {
+                return Ok(inference_url);
+            }
+        }
+        if let Some(ref mut proc) = *guard {
+            if !matches!(proc.child.try_wait(), Ok(None)) {
+                *guard = None;
+                bail!("whisper-server exited unexpectedly during model load");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    if let Some(mut proc) = guard.take() {
+        let _ = proc.child.kill().await;
+    }
+    bail!("Timed out waiting for whisper-server to load model")
+}
+
 /// Returns `(ready, human_status)` describing which live STT engine will transcribe recorded audio.
 pub fn stt_readiness_status(settings: &AiProviderSettings, vault: &SecretVault) -> (bool, String) {
     match settings.stt_provider.as_str() {
@@ -76,7 +204,8 @@ pub fn stt_readiness_status(settings: &AiProviderSettings, vault: &SecretVault) 
         _ => {}
     }
 
-    let cli_ok = detect_whisper_cli_path().is_some();
+    let server_ok = detect_whisper_server_path().is_some();
+    let cli_ok = server_ok || detect_whisper_cli_path().is_some();
     let model_path = models_directory().join(format!("{}.bin", settings.whisper_model_id));
     let model_ok = model_path.exists()
         && std::fs::metadata(&model_path)
@@ -86,7 +215,11 @@ pub fn stt_readiness_status(settings: &AiProviderSettings, vault: &SecretVault) 
     if cli_ok && model_ok {
         return (
             true,
-            format!("Lokal: {} (Apple Metal)", settings.whisper_model_id),
+            format!(
+                "Lokal: {} (Apple Metal{})",
+                settings.whisper_model_id,
+                if server_ok { " · Warm-Server" } else { "" }
+            ),
         );
     }
 
@@ -281,10 +414,21 @@ pub async fn transcribe_wav_file(
         _ => {}
     }
 
-    // Local Apple Metal whisper-cli path
-    if let Some(cli) = detect_whisper_cli_path() {
-        let model_path = models_directory().join(format!("{}.bin", settings.whisper_model_id));
-        if model_path.exists() {
+    // Local Apple Metal Whisper: prefer persistent warm whisper-server (zero 574MB GPU reloads!)
+    let model_path = models_directory().join(format!("{}.bin", settings.whisper_model_id));
+    if model_path.exists() {
+        if let Some(server_bin) = detect_whisper_server_path() {
+            if let Ok(endpoint) = ensure_whisper_server_running(http, &server_bin, &model_path).await
+            {
+                if let Ok(utts) =
+                    transcribe_via_whisper_server(http, &endpoint, wav_path, vocabulary_prompt)
+                        .await
+                {
+                    return Ok(utts);
+                }
+            }
+        }
+        if let Some(cli) = detect_whisper_cli_path() {
             return transcribe_local_whisper_cli(&cli, &model_path, wav_path, vocabulary_prompt)
                 .await;
         }
@@ -309,6 +453,64 @@ pub async fn transcribe_wav_file(
     Ok(Vec::new())
 }
 
+async fn transcribe_via_whisper_server(
+    http: &reqwest::Client,
+    endpoint: &str,
+    wav_path: &Path,
+    vocabulary_prompt: &str,
+) -> Result<Vec<TranscribedUtterance>> {
+    let bytes = tokio::fs::read(wav_path).await?;
+    let file_part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("chunk.wav")
+        .mime_str("audio/wav")?;
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("temperature", "0.0")
+        .text("response_format", "verbose_json")
+        .text("prompt", vocabulary_prompt.to_string());
+
+    let resp = http
+        .post(endpoint)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let v: serde_json::Value = resp.json().await?;
+    let mut out = Vec::new();
+    if let Some(segs) = v["segments"].as_array() {
+        for seg in segs {
+            let text = seg["text"].as_str().unwrap_or("").trim().to_string();
+            if text.is_empty() || (text.starts_with('[') && text.ends_with(']')) {
+                continue;
+            }
+            let start_ms = (seg["start"].as_f64().unwrap_or(0.0) * 1000.0) as u64;
+            let end_ms = (seg["end"].as_f64().unwrap_or(0.0) * 1000.0) as u64;
+            out.push(TranscribedUtterance {
+                start_ms,
+                end_ms: end_ms.max(start_ms + 500),
+                text,
+                speaker_hint: None,
+                confidence: 0.94,
+            });
+        }
+    } else if let Some(text) = v["text"].as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() && !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+            out.push(TranscribedUtterance {
+                start_ms: 0,
+                end_ms: 4000,
+                text: trimmed.to_string(),
+                speaker_hint: None,
+                confidence: 0.93,
+            });
+        }
+    }
+    Ok(out)
+}
+
 async fn transcribe_local_whisper_cli(
     cli_path: &Path,
     model_path: &Path,
@@ -322,6 +524,8 @@ async fn transcribe_local_whisper_cli(
             &model_path.display().to_string(),
             "-f",
             &wav_path.display().to_string(),
+            "-t",
+            "4",
             "-l",
             "auto",
             "--prompt",

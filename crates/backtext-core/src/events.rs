@@ -65,6 +65,12 @@ pub enum BacktextEvent {
         meeting_id: String,
         enhanced_markdown: String,
     },
+    UpdateInstallProgress {
+        stage: String,
+        progress_pct: u8,
+        message: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone)]

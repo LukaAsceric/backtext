@@ -34,7 +34,7 @@ tower-http.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 

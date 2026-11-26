@@ -32,6 +32,8 @@ export interface DaemonTelemetry {
   voice_typing_shortcut: string;
   demo_data_present: boolean;
   whisper_cli_detected: boolean;
+  whisper_server_detected: boolean;
+  persistent_signing_ready: boolean;
 }
 
 export interface CalendarFeedConfig {
@@ -67,6 +69,15 @@ export interface UpdateCheckResult {
   update_available: boolean;
   release_url: string;
   release_notes: string;
+  download_url?: string | null;
+  asset_name?: string | null;
+}
+
+export interface UpdateInstallProgressPayload {
+  stage: string;
+  progress_pct: number;
+  message: string;
+  error: string | null;
 }
 
 export interface UserProfile {
@@ -372,6 +383,11 @@ export interface AiProviderSettings {
   voice_typing_enabled: boolean;
   voice_typing_shortcut: string;
   voice_typing_ai_polish: boolean;
+  voice_typing_polish_mode?: 'off' | 'local_ollama' | 'router' | string;
+  voice_typing_ollama_model?: string;
+  voice_typing_polish_style?: 'minimal' | 'clean' | 'bullets' | 'custom' | string;
+  voice_typing_custom_prompt?: string;
+  default_meeting_template_id?: string;
   openai_api_key_set: boolean;
   anthropic_api_key_set: boolean;
   gemini_api_key_set: boolean;
@@ -449,6 +465,7 @@ export type BacktextRealtimeEvent =
       event: 'model_download_progress';
       payload: { model_id: string; progress_pct: number; installed: boolean; error: string | null };
     }
+  | { event: 'update_install_progress'; payload: UpdateInstallProgressPayload }
   | { event: 'calendar_synced'; payload: { imported_count: number } }
   | { event: 'capture_status_changed'; payload: CaptureStatus }
   | { event: 'recording_audio_level'; payload: RecordingAudioLevel }

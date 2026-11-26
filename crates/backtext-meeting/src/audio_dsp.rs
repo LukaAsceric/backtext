@@ -370,6 +370,123 @@ pub fn extract_voiceprint_from_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, 
     Ok((vp, spans))
 }
 
+/// Writes normalized `[-1.0, 1.0]` f32 mono samples as a standard 16-bit PCM WAV file.
+pub fn write_wav_pcm16(path: impl AsRef<Path>, sample_rate: u32, samples: &[f32]) -> Result<()> {
+    let data_len = (samples.len() * 2) as u32;
+    let riff_size = 36u32.saturating_add(data_len);
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+/// Pure-Rust Dual-Channel Acoustic Echo / Speaker-Bleed Gate.
+/// Compares 100ms microphone frames against synchronized System-Audio frames across
+/// acoustic room delays (0–64 ms). Mutes frames where the microphone signal is
+/// predominantly speaker bleed rather than the local user speaking.
+/// Returns `(cleaned_mic_samples, has_remaining_self_speech)`.
+pub fn suppress_speaker_echo_in_mic(
+    mic_samples: &[f32],
+    sys_samples: &[f32],
+    sample_rate: u32,
+) -> (Vec<f32>, bool) {
+    if mic_samples.is_empty() || sample_rate == 0 {
+        return (Vec::new(), false);
+    }
+    if sys_samples.is_empty() {
+        let spans = detect_speech_spans(mic_samples, sample_rate, 0.014, 200, 260);
+        return (mic_samples.to_vec(), !spans.is_empty());
+    }
+
+    let mut cleaned = mic_samples.to_vec();
+    let frame_len = ((sample_rate as usize) / 10).max(320); // 100ms
+    let max_lag = ((sample_rate as usize) * 64) / 1000; // 64ms acoustic path
+    let lag_step = (((sample_rate as usize) * 2) / 1000).max(1); // 2ms step
+
+    let mut offset = 0usize;
+    while offset < mic_samples.len() {
+        let end = (offset + frame_len).min(mic_samples.len());
+        let win_len = end - offset;
+        if win_len < 160 {
+            break;
+        }
+        let mic_slice = &mic_samples[offset..end];
+        let mic_energy: f32 = mic_slice.iter().map(|x| x * x).sum();
+        let mic_rms = (mic_energy / win_len as f32).sqrt();
+
+        let sys_end = end.min(sys_samples.len());
+        let sys_start = offset.min(sys_end);
+        let sys_len = sys_end - sys_start;
+
+        if sys_len >= 160 && mic_rms >= 0.008 {
+            let sys_slice = &sys_samples[sys_start..sys_end];
+            let sys_energy: f32 = sys_slice.iter().map(|x| x * x).sum();
+            let sys_rms = (sys_energy / sys_len as f32).sqrt();
+
+            if sys_rms >= 0.015 {
+                let mut best_abs_corr = 0.0_f32;
+                let mut lag = 0usize;
+                while lag <= max_lag {
+                    let s_start = offset.saturating_sub(lag);
+                    let avail = (sys_samples.len().saturating_sub(s_start)).min(win_len);
+                    if avail >= 160 {
+                        let mut dot = 0.0_f32;
+                        let mut e_m = 0.0_f32;
+                        let mut e_s = 0.0_f32;
+                        let mut i = 0;
+                        while i < avail {
+                            let m = mic_slice[i];
+                            let s = sys_samples[s_start + i];
+                            dot += m * s;
+                            e_m += m * m;
+                            e_s += s * s;
+                            i += 2;
+                        }
+                        let denom = (e_m * e_s).sqrt();
+                        if denom > 1e-6 {
+                            let corr = (dot / denom).abs();
+                            if corr > best_abs_corr {
+                                best_abs_corr = corr;
+                            }
+                        }
+                    }
+                    lag += lag_step;
+                }
+
+                let is_correlated_bleed = best_abs_corr >= 0.34 && mic_rms < sys_rms * 1.45;
+                let is_quiet_leak_under_loud_speaker =
+                    sys_rms >= 0.025 && mic_rms < sys_rms * 0.48;
+
+                if is_correlated_bleed || is_quiet_leak_under_loud_speaker {
+                    for s in &mut cleaned[offset..end] {
+                        *s = 0.0;
+                    }
+                }
+            }
+        }
+        offset += frame_len;
+    }
+
+    let remaining_spans = detect_speech_spans(&cleaned, sample_rate, 0.014, 220, 260);
+    (cleaned, !remaining_spans.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +538,32 @@ mod tests {
         let sim_cross = cosine_similarity(&vp_first, &vp_second);
         assert!(sim_same > 0.85, "Expected first utterance to match speaker 1, got {sim_same}");
         assert!(sim_same > sim_cross + 0.15, "Expected sub-chunk speakers separated: {sim_same} vs {sim_cross}");
+    }
+
+    #[test]
+    fn echo_gate_suppresses_delayed_speaker_bleed_but_preserves_self_speech() {
+        let sr = 16_000u32;
+        let remote = synth_voice(195.0, sr, 1.5);
+        // Simulate acoustic speaker-to-mic bleed delayed by 18ms (288 samples) at 0.45x gain
+        let delay = 288usize;
+        let mut mic_bleed = vec![0.0_f32; remote.len()];
+        for i in delay..remote.len() {
+            mic_bleed[i] = remote[i - delay] * 0.45;
+        }
+        let (_cleaned_bleed, has_speech_bleed) =
+            suppress_speaker_echo_in_mic(&mic_bleed, &remote, sr);
+        assert!(
+            !has_speech_bleed,
+            "Delayed speaker bleed should be suppressed completely"
+        );
+
+        let self_voice = synth_voice(118.0, sr, 1.2);
+        let silent_sys = vec![0.0_f32; self_voice.len()];
+        let (_cleaned_self, has_speech_self) =
+            suppress_speaker_echo_in_mic(&self_voice, &silent_sys, sr);
+        assert!(
+            has_speech_self,
+            "Genuine self speech must be preserved when system audio is quiet"
+        );
     }
 }

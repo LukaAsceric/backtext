@@ -1,11 +1,16 @@
 pub mod controller;
 pub mod daemon_loop;
 pub mod http_server;
+pub mod updater;
 
 use backtext_core::BacktextEvent;
 use controller::{format_shortcut_display, AppController};
 use serde_json::Value;
 use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -337,9 +342,14 @@ pub fn run() {
         .manage(controller)
         .manage(ShortcutBindings::default())
         .setup(move |app| {
-            // Protect Hover assistant from screen capture / screen sharing
+            // Protect Hover assistant and global Dictation HUD from screen capture / screen sharing
             if let Some(hover_win) = app.get_webview_window("hover") {
                 let _ = hover_win.set_content_protected(true);
+            }
+            if let Some(dict_win) = app.get_webview_window("dictation") {
+                let _ = dict_win.set_content_protected(true);
+                let _ = dict_win.set_focusable(false);
+                let _ = dict_win.set_always_on_top(true);
             }
 
             // Read initial autostart state cleanly
@@ -373,13 +383,83 @@ pub fn run() {
                 t.voice_typing_shortcut = display_vt.clone();
             });
 
-            // Forward Rust EventBus events directly into Tauri webview windows for live token & audio streaming
+            // Forward Rust EventBus events directly into Tauri webview windows for live token & audio streaming,
+            // and control the global non-activating Dictation HUD window over all apps (Word, Safari, etc.).
             let mut rx = setup_controller.events.subscribe();
             let app_handle_for_events = app.handle().clone();
+            let hud_gen = Arc::new(AtomicU64::new(0));
             tauri::async_runtime::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
+                            if let BacktextEvent::VoiceTypingStateChanged {
+                                active,
+                                ref mode,
+                                ref status,
+                                ..
+                            } = ev
+                            {
+                                if mode == "system" {
+                                    let next_gen = hud_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if let Some(hud) =
+                                        app_handle_for_events.get_webview_window("dictation")
+                                    {
+                                        let _ = hud.set_content_protected(true);
+                                        let _ = hud.set_focusable(false);
+                                        let _ = hud.set_always_on_top(true);
+                                        if let Ok(Some(mon)) = hud.primary_monitor() {
+                                            let m_pos = mon.position();
+                                            let m_size = mon.size();
+                                            let scale = mon.scale_factor();
+                                            let w_size = hud.outer_size().unwrap_or_else(|_| {
+                                                tauri::PhysicalSize::new(
+                                                    (360.0 * scale) as u32,
+                                                    (74.0 * scale) as u32,
+                                                )
+                                            });
+                                            let x = m_pos.x
+                                                + ((m_size.width as i32 - w_size.width as i32) / 2);
+                                            let y = m_pos.y + m_size.height as i32
+                                                - w_size.height as i32
+                                                - (92.0 * scale) as i32;
+                                            let _ = hud.set_position(tauri::Position::Physical(
+                                                tauri::PhysicalPosition::new(x, y),
+                                            ));
+                                        }
+                                        let _ = hud.show();
+                                    }
+                                    // Keep HUD visible while listening or transcribing; auto-hide 2.6s after final confirmation
+                                    if !active && !status.contains("Transkribiert & bereinigt") {
+                                        let handle_hide = app_handle_for_events.clone();
+                                        let gen_ref = hud_gen.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                2600,
+                                            ))
+                                            .await;
+                                            if gen_ref.load(Ordering::SeqCst) == next_gen {
+                                                if let Some(hud) =
+                                                    handle_hide.get_webview_window("dictation")
+                                                {
+                                                    let _ = hud.hide();
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
+                            if let BacktextEvent::UpdateInstallProgress { ref stage, .. } = ev {
+                                if stage == "restarting" {
+                                    let handle_exit = app_handle_for_events.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                        handle_exit.exit(0);
+                                    });
+                                }
+                            }
+
                             let _ = app_handle_for_events.emit("backtext://event", &ev);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

@@ -1,8 +1,9 @@
 use anyhow::Result;
 use backtext_ai::{
-    detect_whisper_cli_path, download_whisper_model, list_ollama_models, list_provider_models,
-    list_whisper_models, stt_readiness_status, test_provider_connection, transcribe_wav_file,
-    EnhancedMeetingResult, HybridAiEngine,
+    detect_whisper_cli_path, detect_whisper_server_path, download_whisper_model,
+    list_ollama_models, list_provider_models, list_whisper_models, stop_whisper_server,
+    stt_readiness_status, test_provider_connection, transcribe_wav_file, EnhancedMeetingResult,
+    HybridAiEngine,
 };
 use backtext_context::{
     compact_snapshots_to_episode, evaluate_clipboard_capture, evaluate_context_candidate,
@@ -12,7 +13,8 @@ use backtext_core::*;
 use backtext_mcp::{McpClientConfigSnippets, McpServer};
 use backtext_meeting::{
     extract_acoustic_voiceprint_256, extract_voiceprint_for_window, extract_voiceprint_from_wav,
-    read_wav_and_spans, ScreenShareDeduplicator, SpeakerAttributionSession,
+    read_wav_and_spans, suppress_speaker_echo_in_mic, write_wav_pcm16, ScreenShareDeduplicator,
+    SpeakerAttributionSession,
 };
 use backtext_platform::{
     default_platform_sensors, fetch_and_parse_ics_url, DictationCaptureSession,
@@ -139,6 +141,8 @@ impl AppController {
             voice_typing_shortcut: format_shortcut_display(&saved_vt_shortcut),
             demo_data_present: demo_present,
             whisper_cli_detected: detect_whisper_cli_path().is_some(),
+            whisper_server_detected: detect_whisper_server_path().is_some(),
+            persistent_signing_ready: crate::updater::is_persistent_signing_ready(),
         };
 
         Ok(Self {
@@ -174,6 +178,8 @@ impl AppController {
         let mut guard = self.telemetry.lock();
         guard.demo_data_present = self.storage.has_demo_data().unwrap_or(false);
         guard.whisper_cli_detected = detect_whisper_cli_path().is_some();
+        guard.whisper_server_detected = detect_whisper_server_path().is_some();
+        guard.persistent_signing_ready = crate::updater::is_persistent_signing_ready();
         guard.clone()
     }
 
@@ -251,6 +257,13 @@ impl AppController {
         detected_app: Option<String>,
     ) -> Result<MeetingDetail> {
         let profile = self.storage.get_user_profile()?;
+        let default_template_id = self
+            .storage
+            .get_ai_settings()
+            .ok()
+            .map(|s| s.default_meeting_template_id)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "general".into());
         let now = Utc::now();
 
         let mut meeting = if let Some(ref mid) = existing_meeting_id {
@@ -277,7 +290,7 @@ impl AppController {
                 started_at: now,
                 ended_at: None,
                 status: MeetingStatus::Live,
-                template_id: "general".into(),
+                template_id: default_template_id,
                 prep_brief: Some("Bot-freie Dual-Channel-Aufnahme aktiv (Kanal 0: Eigenes Mikrofon · Kanal 1: ScreenCaptureKit System-Audio).".into()),
                 raw_user_notes: String::new(),
                 executive_summary: String::new(),
@@ -579,79 +592,192 @@ impl AppController {
             .ok()
             .and_then(|w| w.detected_active_speaker_tile);
 
+        // Preload both WAV tracks so we can suppress loudspeaker bleed from the mic track BEFORE STT
+        let sys_loaded = system_wav_path
+            .as_ref()
+            .and_then(|p| read_wav_and_spans(&PathBuf::from(p)).ok().map(|d| (PathBuf::from(p), d)));
+        let mic_loaded = mic_wav_path
+            .as_ref()
+            .and_then(|p| read_wav_and_spans(&PathBuf::from(p)).ok().map(|d| (PathBuf::from(p), d)));
+
         let mut added = 0usize;
-        for (channel, maybe_wav) in [
-            (AudioChannel::Microphone, mic_wav_path),
-            (AudioChannel::System, system_wav_path),
-        ] {
-            let Some(wav_path_str) = maybe_wav else {
-                continue;
-            };
-            let wav_path = PathBuf::from(&wav_path_str);
-            let Ok((sr, samples, spans)) = read_wav_and_spans(&wav_path) else {
-                continue;
-            };
-            if spans.is_empty() {
-                continue;
-            }
-            let chunk_vp = extract_acoustic_voiceprint_256(&samples, sr);
-            let utterances = transcribe_wav_file(
-                self.ai.http_client(),
-                &wav_path,
-                &vocab_prompt,
-                &ai_settings,
-                self.storage.secrets(),
-            )
-            .await?;
+        let mut system_utterance_texts: Vec<String> = Vec::new();
 
-            for utt in utterances {
-                let seg_vp = extract_voiceprint_for_window(&samples, sr, utt.start_ms, utt.end_ms)
-                    .unwrap_or_else(|| chunk_vp.clone());
+        // 1. Always transcribe System Audio FIRST so we can deduplicate residual loudspeaker echo on the mic channel
+        if let Some((sys_path, (sr, samples, spans))) = sys_loaded.as_ref() {
+            if !spans.is_empty() {
+                let chunk_vp = extract_acoustic_voiceprint_256(samples, *sr);
+                let utterances = transcribe_wav_file(
+                    self.ai.http_client(),
+                    sys_path,
+                    &vocab_prompt,
+                    &ai_settings,
+                    self.storage.secrets(),
+                )
+                .await?;
 
-                let mut sessions = self.live_sessions.lock();
-                let rt = sessions
-                    .entry(meeting_id.to_string())
-                    .or_insert_with(|| LiveMeetingRuntime {
-                        attribution: SpeakerAttributionSession::new(
-                            meeting_id,
-                            &profile.display_name,
-                            vec![],
-                        ),
-                        screenshare_dedup: ScreenShareDeduplicator::default(),
-                        sim_step: 0,
-                        elapsed_ms: 0,
-                    });
+                for utt in utterances {
+                    if !utt.text.trim().is_empty() {
+                        system_utterance_texts.push(utt.text.clone());
+                    }
+                    let seg_vp =
+                        extract_voiceprint_for_window(samples, *sr, utt.start_ms, utt.end_ms)
+                            .unwrap_or_else(|| chunk_vp.clone());
 
-                let base_ms = rt.elapsed_ms;
-                let start_ms = base_ms + utt.start_ms;
-                let end_ms = base_ms + utt.end_ms.max(utt.start_ms + 1000);
-                rt.elapsed_ms = end_ms;
+                    let mut sessions = self.live_sessions.lock();
+                    let rt = sessions
+                        .entry(meeting_id.to_string())
+                        .or_insert_with(|| LiveMeetingRuntime {
+                            attribution: SpeakerAttributionSession::new(
+                                meeting_id,
+                                &profile.display_name,
+                                vec![],
+                            ),
+                            screenshare_dedup: ScreenShareDeduplicator::default(),
+                            sim_step: 0,
+                            elapsed_ms: 0,
+                        });
 
-                let hint = utt.speaker_hint.as_deref().or(visual_speaker_hint.as_deref());
-                let (seg, participant) = rt.attribution.attribute_segment(
-                    &self.storage,
-                    channel,
-                    start_ms,
-                    end_ms,
-                    &utt.text,
-                    &seg_vp,
-                    hint,
-                )?;
-                drop(sessions);
+                    let base_ms = rt.elapsed_ms;
+                    let start_ms = base_ms + utt.start_ms;
+                    let end_ms = base_ms + utt.end_ms.max(utt.start_ms + 1000);
+                    rt.elapsed_ms = end_ms;
 
-                self.storage.insert_transcript_segment(&seg)?;
-                self.events.publish(BacktextEvent::TranscriptSegmentAdded(seg));
-                added += 1;
-                if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
-                    upsert_participant_vec(&mut detail.meeting.participants, participant.clone());
-                    self.storage.save_meeting(&detail.meeting)?;
-                    self.events.publish(BacktextEvent::ParticipantUpdated {
-                        meeting_id: meeting_id.to_string(),
-                        participant,
-                    });
+                    let hint = utt.speaker_hint.as_deref().or(visual_speaker_hint.as_deref());
+                    let (seg, participant) = rt.attribution.attribute_segment(
+                        &self.storage,
+                        AudioChannel::System,
+                        start_ms,
+                        end_ms,
+                        &utt.text,
+                        &seg_vp,
+                        hint,
+                    )?;
+                    drop(sessions);
+
+                    self.storage.insert_transcript_segment(&seg)?;
+                    self.events.publish(BacktextEvent::TranscriptSegmentAdded(seg));
+                    added += 1;
+                    if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
+                        upsert_participant_vec(&mut detail.meeting.participants, participant.clone());
+                        self.storage.save_meeting(&detail.meeting)?;
+                        self.events.publish(BacktextEvent::ParticipantUpdated {
+                            meeting_id: meeting_id.to_string(),
+                            participant,
+                        });
+                    }
                 }
             }
         }
+
+        // 2. Transcribe Microphone channel AFTER Layer 2 Dual-Channel Echo Gate & Layer 3 Post-STT Echo Dedup
+        if let Some((mic_path, (sr, mic_samples, mic_spans))) = mic_loaded {
+            if !mic_spans.is_empty() {
+                let mut temp_clean_path: Option<PathBuf> = None;
+                let (effective_wav_path, effective_samples, should_transcribe_mic) =
+                    if let Some((_, (_, sys_samples, _))) = sys_loaded.as_ref() {
+                        if !sys_samples.is_empty() {
+                            let (cleaned, has_self_speech) =
+                                suppress_speaker_echo_in_mic(&mic_samples, sys_samples, sr);
+                            if !has_self_speech {
+                                // Entire mic chunk was loudspeaker bleed -> skip Whisper completely (cuts heat & kills false "Ich"!)
+                                (mic_path.clone(), cleaned, false)
+                            } else {
+                                let clean_p = mic_path.with_extension("clean.wav");
+                                if write_wav_pcm16(&clean_p, sr, &cleaned).is_ok() {
+                                    temp_clean_path = Some(clean_p.clone());
+                                    (clean_p, cleaned, true)
+                                } else {
+                                    (mic_path.clone(), mic_samples, true)
+                                }
+                            }
+                        } else {
+                            (mic_path.clone(), mic_samples, true)
+                        }
+                    } else {
+                        (mic_path.clone(), mic_samples, true)
+                    };
+
+                if should_transcribe_mic {
+                    let chunk_vp = extract_acoustic_voiceprint_256(&effective_samples, sr);
+                    let utterances = transcribe_wav_file(
+                        self.ai.http_client(),
+                        &effective_wav_path,
+                        &vocab_prompt,
+                        &ai_settings,
+                        self.storage.secrets(),
+                    )
+                    .await;
+                    if let Some(p) = temp_clean_path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    let utterances = utterances?;
+
+                    for utt in utterances {
+                        // Layer 3: Drop residual loudspeaker bleed duplicated from System Audio in the same chunk
+                        if is_echo_duplicate_of_system(&utt.text, &system_utterance_texts) {
+                            continue;
+                        }
+                        let seg_vp = extract_voiceprint_for_window(
+                            &effective_samples,
+                            sr,
+                            utt.start_ms,
+                            utt.end_ms,
+                        )
+                        .unwrap_or_else(|| chunk_vp.clone());
+
+                        let mut sessions = self.live_sessions.lock();
+                        let rt = sessions
+                            .entry(meeting_id.to_string())
+                            .or_insert_with(|| LiveMeetingRuntime {
+                                attribution: SpeakerAttributionSession::new(
+                                    meeting_id,
+                                    &profile.display_name,
+                                    vec![],
+                                ),
+                                screenshare_dedup: ScreenShareDeduplicator::default(),
+                                sim_step: 0,
+                                elapsed_ms: 0,
+                            });
+
+                        let base_ms = rt.elapsed_ms;
+                        let start_ms = base_ms + utt.start_ms;
+                        let end_ms = base_ms + utt.end_ms.max(utt.start_ms + 1000);
+                        rt.elapsed_ms = end_ms;
+
+                        let hint = utt.speaker_hint.as_deref().or(visual_speaker_hint.as_deref());
+                        let (seg, participant) = rt.attribution.attribute_segment(
+                            &self.storage,
+                            AudioChannel::Microphone,
+                            start_ms,
+                            end_ms,
+                            &utt.text,
+                            &seg_vp,
+                            hint,
+                        )?;
+                        drop(sessions);
+
+                        self.storage.insert_transcript_segment(&seg)?;
+                        self.events.publish(BacktextEvent::TranscriptSegmentAdded(seg));
+                        added += 1;
+                        if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
+                            upsert_participant_vec(
+                                &mut detail.meeting.participants,
+                                participant.clone(),
+                            );
+                            self.storage.save_meeting(&detail.meeting)?;
+                            self.events.publish(BacktextEvent::ParticipantUpdated {
+                                meeting_id: meeting_id.to_string(),
+                                participant,
+                            });
+                        }
+                    }
+                } else if let Some(p) = temp_clean_path {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+
         Ok(added)
     }
 
@@ -822,6 +948,8 @@ impl AppController {
             "Keine Sprache erkannt".to_string()
         } else if pasted {
             format!("In {target_app} eingefügt")
+        } else if mode == "system" {
+            "Kopiert (⌘V) · Bedienungshilfen für Auto-Einfügen prüfen".to_string()
         } else {
             "Transkribiert".to_string()
         };
@@ -1004,6 +1132,8 @@ impl AppController {
         // Stop continuous audio stream and allow brief graceful flush of the final audio chunk
         self.stop_recorder_for_meeting(meeting_id);
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        // Release warm whisper-server GPU/RAM immediately once live transcription ends
+        stop_whisper_server().await;
 
         self.live_sessions.lock().remove(meeting_id);
         if let Some(mut detail) = self.storage.get_meeting_detail(meeting_id)? {
@@ -1038,6 +1168,11 @@ impl AppController {
             *self.capture_status.lock() = CaptureStatus::Active;
             self.events
                 .publish(BacktextEvent::CaptureStatusChanged(CaptureStatus::Active));
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async {
+                    stop_whisper_server().await;
+                });
+            }
         }
         let rec_dir = self.meeting_recordings_dir(meeting_id);
         let _ = std::fs::remove_dir_all(&rec_dir);
@@ -1143,13 +1278,41 @@ impl AppController {
                         .unwrap_or("https://github.com/LukaAsceric/backtext/releases")
                         .to_string();
                     let notes = v["body"].as_str().unwrap_or("").to_string();
-                    let update_available = latest != current && !latest.is_empty();
+                    let (download_url, asset_name) = v["assets"]
+                        .as_array()
+                        .and_then(|arr| {
+                            arr.iter()
+                                .find(|a| {
+                                    a["name"]
+                                        .as_str()
+                                        .map(|n| n.ends_with("_macos_arm64.app.zip"))
+                                        .unwrap_or(false)
+                                })
+                                .or_else(|| {
+                                    arr.iter().find(|a| {
+                                        a["name"]
+                                            .as_str()
+                                            .map(|n| n.ends_with(".app.zip"))
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .map(|a| {
+                                    (
+                                        a["browser_download_url"].as_str().map(|s| s.to_string()),
+                                        a["name"].as_str().map(|s| s.to_string()),
+                                    )
+                                })
+                        })
+                        .unwrap_or((None, None));
+                    let update_available = is_newer_semver(&current, &latest);
                     return Ok(UpdateCheckResult {
                         current_version: current,
                         latest_version: latest,
                         update_available,
                         release_url: url,
                         release_notes: notes,
+                        download_url,
+                        asset_name,
                     });
                 }
             }
@@ -1160,7 +1323,10 @@ impl AppController {
             latest_version: current,
             update_available: false,
             release_url: "https://github.com/LukaAsceric/backtext/releases".into(),
-            release_notes: "Kein neueres Release gefunden (oder privates Repo ohne Token).".into(),
+            release_notes: "Kein neueres Release gefunden (oder GitHub-Repo noch nicht öffentlich)."
+                .into(),
+            download_url: None,
+            asset_name: None,
         })
     }
 
@@ -1443,6 +1609,11 @@ impl AppController {
             "delete_meeting_template" => {
                 let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 self.storage.delete_meeting_template(id)?;
+                Ok(serde_json::to_value(self.storage.list_meeting_templates()?)?)
+            }
+            "reset_meeting_template" => {
+                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                self.storage.reset_meeting_template(id)?;
                 Ok(serde_json::to_value(self.storage.list_meeting_templates()?)?)
             }
             "save_meeting_folder" => {
@@ -1892,6 +2063,32 @@ impl AppController {
                 Ok(serde_json::to_value(feeds)?)
             }
             "check_for_updates" => Ok(serde_json::to_value(self.check_for_updates().await?)?),
+            "install_update" => {
+                let download_url = args
+                    .get("downloadUrl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let asset_name = args.get("assetName").and_then(|v| v.as_str());
+                let res = crate::updater::download_and_install_update(
+                    self.ai.http_client(),
+                    &self.events,
+                    download_url,
+                    asset_name,
+                )
+                .await?;
+                Ok(res)
+            }
+            "setup_persistent_signing" => {
+                let res = crate::updater::ensure_persistent_signing_cert_and_sign_current().await?;
+                let ready = crate::updater::is_persistent_signing_ready();
+                let tel = self.update_telemetry(|t| t.persistent_signing_ready = ready);
+                self.events
+                    .publish(BacktextEvent::DaemonTelemetryUpdated(tel.clone()));
+                Ok(serde_json::json!({
+                    "result": res,
+                    "telemetry": tel
+                }))
+            }
             "upsert_vocabulary" => {
                 let term = args.get("term").and_then(|v| v.as_str()).unwrap_or("").trim();
                 let hint = args.get("phoneticHint").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
@@ -1996,5 +2193,84 @@ fn upsert_participant_vec(list: &mut Vec<MeetingParticipant>, next: MeetingParti
         *existing = next;
     } else {
         list.push(next);
+    }
+}
+
+fn tokenize_echo_words(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 2)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Layer 3 Post-STT Echo Deduplicator: detects when a Microphone utterance in the same
+/// chunk is a loudspeaker echo duplicate of a System Audio utterance (token overlap >= 0.55).
+fn is_echo_duplicate_of_system(mic_text: &str, system_texts: &[String]) -> bool {
+    if system_texts.is_empty() {
+        return false;
+    }
+    let mic_tokens = tokenize_echo_words(mic_text);
+    if mic_tokens.is_empty() {
+        return false;
+    }
+    for sys_text in system_texts {
+        let sys_tokens = tokenize_echo_words(sys_text);
+        if sys_tokens.is_empty() {
+            continue;
+        }
+        let overlap = mic_tokens.intersection(&sys_tokens).count();
+        let min_len = mic_tokens.len().min(sys_tokens.len());
+        let union_len = mic_tokens.union(&sys_tokens).count();
+        let containment = overlap as f32 / min_len.max(1) as f32;
+        let jaccard = overlap as f32 / union_len.max(1) as f32;
+        if jaccard >= 0.55 || (min_len >= 2 && containment >= 0.70) {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_semver_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let clean = v.trim().trim_start_matches('v').split('-').next()?;
+    let mut parts = clean.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+fn is_newer_semver(current: &str, candidate: &str) -> bool {
+    match (parse_semver_triple(current), parse_semver_triple(candidate)) {
+        (Some(c), Some(n)) => n > c,
+        _ => !candidate.is_empty() && candidate != current,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_stt_echo_dedup_drops_speaker_bleed_but_keeps_distinct_self_speech() {
+        let sys = vec![
+            "Wir sollten das Release am Freitag ausliefern und die Tests abschließen.".to_string(),
+        ];
+        assert!(is_echo_duplicate_of_system(
+            "Wir sollten das Release am Freitag ausliefern.",
+            &sys
+        ));
+        assert!(!is_echo_duplicate_of_system(
+            "Alles klar, ich übernehme das Deployment im Anschluss.",
+            &sys
+        ));
+    }
+
+    #[test]
+    fn semver_comparison_handles_upgrades_and_equal_versions() {
+        assert!(is_newer_semver("0.5.0", "0.6.0"));
+        assert!(is_newer_semver("0.6.0", "0.6.1"));
+        assert!(!is_newer_semver("0.6.0", "0.6.0"));
+        assert!(!is_newer_semver("0.6.0", "0.5.0"));
     }
 }

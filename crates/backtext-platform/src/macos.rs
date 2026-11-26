@@ -79,6 +79,46 @@ extern "C" {
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> u8;
     fn CGRequestScreenCaptureAccess() -> u8;
+    fn CGEventSourceCreate(state_id: i32) -> *const c_void;
+    fn CGEventCreateKeyboardEvent(
+        source: *const c_void,
+        virtual_key: u16,
+        key_down: u8,
+    ) -> *const c_void;
+    fn CGEventSetFlags(event: *const c_void, flags: u64);
+    fn CGEventPost(tap: u32, event: *const c_void);
+}
+
+const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
+const K_CG_HID_EVENT_TAP: u32 = 0;
+const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+const K_VK_ANSI_V: u16 = 9;
+
+fn in_process_post_cmd_v() -> bool {
+    unsafe {
+        let src = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE);
+        let key_down = CGEventCreateKeyboardEvent(src, K_VK_ANSI_V, 1);
+        let key_up = CGEventCreateKeyboardEvent(src, K_VK_ANSI_V, 0);
+        let mut ok = false;
+        if !key_down.is_null() && !key_up.is_null() {
+            CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventPost(K_CG_HID_EVENT_TAP, key_down);
+            std::thread::sleep(std::time::Duration::from_millis(14));
+            CGEventPost(K_CG_HID_EVENT_TAP, key_up);
+            ok = true;
+        }
+        if !key_down.is_null() {
+            CFRelease(key_down);
+        }
+        if !key_up.is_null() {
+            CFRelease(key_up);
+        }
+        if !src.is_null() {
+            CFRelease(src);
+        }
+        ok
+    }
 }
 
 fn in_process_ax_trusted() -> bool {
@@ -861,25 +901,70 @@ JSON.stringify({ bundleId, appName, pid, winTitle: appName });
     }
 
     async fn paste_text_at_cursor(&self, text: &str) -> Result<bool> {
-        let Some(bin) = self.sensor_bin.clone() else {
+        if text.is_empty() {
             return Ok(false);
-        };
-        let mut child = Command::new(bin)
-            .args(["paste-text"])
+        }
+
+        // Read existing clipboard text so we can restore it after pasting
+        let previous_clip = Command::new("/usr/bin/pbpaste")
+            .env("LANG", "en_US.UTF-8")
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout);
+
+        // Place dictated text into macOS pasteboard (UTF-8 safe for German umlauts)
+        let mut copy_child = Command::new("/usr/bin/pbcopy")
+            .env("LANG", "en_US.UTF-8")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes()).await;
-            let _ = stdin.shutdown().await;
+        if let Some(mut stdin) = copy_child.stdin.take() {
+            stdin.write_all(text.as_bytes()).await?;
+            stdin.shutdown().await?;
         }
-        let out = child.wait_with_output().await?;
-        if !out.status.success() {
+        let copy_status = copy_child.wait().await?;
+        if !copy_status.success() {
             return Ok(false);
         }
-        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-        Ok(parsed["ok"].as_bool().unwrap_or(false))
+
+        // macOS TCC only allows CGEventPost(kCGHIDEventTap) into external apps (Word, Safari, etc.)
+        // when the posting process itself holds Accessibility trust (`AXIsProcessTrusted()`).
+        // If not trusted yet, keep the dictated text in the clipboard so Cmd+V still works manually.
+        if !in_process_ax_trusted() {
+            return Ok(false);
+        }
+
+        // Wait briefly for clipboard propagation and any released global-hotkey modifiers
+        tokio::time::sleep(std::time::Duration::from_millis(65)).await;
+
+        let posted = tokio::task::spawn_blocking(in_process_post_cmd_v)
+            .await
+            .unwrap_or(false);
+
+        if posted {
+            // Microsoft Word, Safari, and Electron apps can take ~250-380ms to read NSPasteboard on Cmd+V
+            tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+            if let Some(prev_bytes) = previous_clip {
+                if let Ok(mut restore_child) = Command::new("/usr/bin/pbcopy")
+                    .env("LANG", "en_US.UTF-8")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = restore_child.stdin.take() {
+                        let _ = stdin.write_all(&prev_bytes).await;
+                        let _ = stdin.shutdown().await;
+                    }
+                    let _ = restore_child.wait().await;
+                }
+            }
+        }
+
+        Ok(posted)
     }
 
     async fn record_mic_wav(&self, out_path: &str, duration_secs: u64) -> Result<bool> {

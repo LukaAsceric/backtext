@@ -83,6 +83,8 @@ pub fn spawn_background_daemon(controller: AppController) {
                 continue;
             }
 
+            let is_recording_meeting = matches!(status, CaptureStatus::RecordingMeeting { .. });
+
             // 1. Active Window Observation & 3-Stage Ambient Context Filter
             if let Ok(obs) = controller.sensors.observe_active_window().await {
                 let is_self_app = obs.app_bundle_id.eq_ignore_ascii_case("ai.backtext.desktop")
@@ -100,12 +102,13 @@ pub fn spawn_background_daemon(controller: AppController) {
                         focus_dwell_ms = 4_000;
                     }
 
-                    // Only trigger heavy Vision OCR fallback when AX text is sparse and screen permission is granted
+                    // Only trigger heavy Vision OCR fallback when NOT in a live meeting (screenshare capture handles slides during meetings)
                     let mut visible_text = obs.visible_text.clone();
                     let mut extraction_method = obs.extraction_method;
                     let mut dhash_u64 = obs.dhash_u64;
 
-                    if visible_text.chars().count() < 40
+                    if !is_recording_meeting
+                        && visible_text.chars().count() < 40
                         && perms.screen_capture_granted
                         && !obs.is_private_browsing
                         && !obs.is_secure_field_focused
@@ -247,71 +250,90 @@ pub fn spawn_background_daemon(controller: AppController) {
                 detector.mark_manually_stopped(Utc::now(), 90);
             }
 
-            if let Ok(audio_sig) = controller.sensors.observe_audio_environment().await {
-                let profile = controller.storage.get_user_profile().unwrap_or_default();
-                let cal_events = controller
-                    .sensors
-                    .upcoming_calendar_events()
-                    .await
-                    .unwrap_or_default();
+            // During active meetings, throttle browser/window audio-env polling to every 12s (3 ticks)
+            // and skip 4s EventKit calendar queries to keep CPU/GPU cool.
+            let should_poll_audio_env = !is_recording_meeting || tick_count % 3 == 0;
+            if should_poll_audio_env {
+                if let Ok(audio_sig) = controller.sensors.observe_audio_environment().await {
+                    let profile = controller.storage.get_user_profile().unwrap_or_default();
+                    let cal_events = if is_recording_meeting {
+                        Vec::new()
+                    } else {
+                        controller
+                            .sensors
+                            .upcoming_calendar_events()
+                            .await
+                            .unwrap_or_default()
+                    };
 
-                // Sync detector with manually started meetings
-                if let CaptureStatus::RecordingMeeting {
-                    ref meeting_id,
-                    started_at,
-                    ..
-                } = status
-                {
-                    if matches!(detector.phase, DetectorPhase::Idle | DetectorPhase::Candidate { .. }) {
-                        detector.mark_active(meeting_id.clone(), started_at);
-                    }
-                    // Capture deduplicated Screen-Share slides during active macOS meetings every ~12s
-                    if cfg!(target_os = "macos") && tick_count % 3 == 0 && perms.screen_capture_granted {
-                        let _ = controller.capture_live_screenshare_if_changed(meeting_id).await;
-                    }
-                } else if matches!(detector.phase, DetectorPhase::Active { .. }) {
-                    detector.mark_idle();
-                }
-
-                let transition = detector.evaluate_tick(
-                    Utc::now(),
-                    &audio_sig,
-                    &cal_events,
-                    profile.auto_record_meetings,
-                );
-
-                match transition {
-                    DetectorTransition::StartMeeting {
-                        title,
-                        app,
-                        confidence,
+                    // Sync detector with manually started meetings
+                    if let CaptureStatus::RecordingMeeting {
+                        ref meeting_id,
+                        started_at,
                         ..
-                    } => {
-                        if let Ok(detail) =
-                            controller.start_live_meeting(None, Some(title.clone()), Some(app.clone()))
+                    } = status
+                    {
+                        if matches!(
+                            detector.phase,
+                            DetectorPhase::Idle | DetectorPhase::Candidate { .. }
+                        ) {
+                            detector.mark_active(meeting_id.clone(), started_at);
+                        }
+                        // Capture deduplicated Screen-Share slides during active macOS meetings every ~12s
+                        if cfg!(target_os = "macos")
+                            && tick_count % 3 == 0
+                            && perms.screen_capture_granted
                         {
-                            detector.mark_active(detail.meeting.id.clone(), detail.meeting.started_at);
-                            controller.events.publish(BacktextEvent::MeetingDetected {
-                                meeting_id: detail.meeting.id.clone(),
-                                title: title.clone(),
-                                detected_app: app,
-                                confidence,
-                            });
-                            if profile.consent_reminder_enabled {
-                                let _ = controller
-                                    .sensors
-                                    .send_native_notification(
-                                        &format!("Meeting erkannt: {title}"),
-                                        "Bot-freie Aufnahme gestartet. Bitte denke an die Einwilligung der Teilnehmer.",
-                                    )
-                                    .await;
+                            let _ = controller.capture_live_screenshare_if_changed(meeting_id).await;
+                        }
+                    } else if matches!(detector.phase, DetectorPhase::Active { .. }) {
+                        detector.mark_idle();
+                    }
+
+                    let transition = detector.evaluate_tick(
+                        Utc::now(),
+                        &audio_sig,
+                        &cal_events,
+                        profile.auto_record_meetings,
+                    );
+
+                    match transition {
+                        DetectorTransition::StartMeeting {
+                            title,
+                            app,
+                            confidence,
+                            ..
+                        } => {
+                            if let Ok(detail) = controller.start_live_meeting(
+                                None,
+                                Some(title.clone()),
+                                Some(app.clone()),
+                            ) {
+                                detector.mark_active(detail.meeting.id.clone(), detail.meeting.started_at);
+                                controller.events.publish(BacktextEvent::MeetingDetected {
+                                    meeting_id: detail.meeting.id.clone(),
+                                    title: title.clone(),
+                                    detected_app: app,
+                                    confidence,
+                                });
+                                if profile.consent_reminder_enabled {
+                                    let _ = controller
+                                        .sensors
+                                        .send_native_notification(
+                                            &format!("Meeting erkannt: {title}"),
+                                            "Bot-freie Aufnahme gestartet. Bitte denke an die Einwilligung der Teilnehmer.",
+                                        )
+                                        .await;
+                                }
                             }
                         }
+                        DetectorTransition::EndMeeting { meeting_id } => {
+                            let _ = controller
+                                .stop_and_summarize_meeting_internal(&meeting_id, false)
+                                .await;
+                        }
+                        _ => {}
                     }
-                    DetectorTransition::EndMeeting { meeting_id } => {
-                        let _ = controller.stop_and_summarize_meeting_internal(&meeting_id, false).await;
-                    }
-                    _ => {}
                 }
             }
 
